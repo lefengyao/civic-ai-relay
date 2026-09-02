@@ -1,0 +1,14 @@
+.venv/
+.codex/
+__pycache__/
+.pytest_cache/
+.env
+docs/
+*-codex-build-prompt.md
+*.ps1
+data/*.db
+data/*.db-*
+*.pem
+*.key
+bootstrap-admin-key.txt
+.superpowers/

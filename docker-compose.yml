@@ -1,0 +1,12 @@
+services:
+  civic-relay:
+    build: .
+    environment:
+      CIVIC_RELAY_CONFIG_FILE: /app/config/relay.env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Set CIVIC_RELAY_CONFIG_DIR to a host directory outside the repository.
+      - ${CIVIC_RELAY_CONFIG_DIR:?Set CIVIC_RELAY_CONFIG_DIR to an external host directory}:/app/config
+      - ./data:/app/data
+    restart: unless-stopped

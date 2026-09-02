@@ -1,0 +1,19 @@
+[Unit]
+Description=Civic Relay OpenAI-compatible API relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=civic-relay
+Group=civic-relay
+WorkingDirectory=/opt/civic-ai-relay
+Environment=CIVIC_RELAY_CONFIG_FILE=/etc/civic-relay/relay.env
+ExecStart=/opt/civic-ai-relay/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
