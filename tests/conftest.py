@@ -44,6 +44,7 @@ def build_settings(tmp_path, **overrides) -> Settings:
         token_limit_daily=10000,
         rpm_limit=30,
         global_concurrency_limit=2,
+        memory_limit_mb=200,
         max_output_tokens=64,
         max_body_bytes=1024 * 1024,
         max_stream_duration=30,

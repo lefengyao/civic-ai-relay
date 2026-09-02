@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+from ctypes import wintypes
 import json
 import logging
 import math
 import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -37,6 +40,89 @@ except Exception:
     # Windows installations may not ship the IANA database; Beijing has no DST.
     BJ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 logger = logging.getLogger("civic-relay")
+_WINDOWS_MEMORY_API: tuple[Any, Any] | None = None
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def process_memory_mb() -> float | None:
+    """Return the current process resident memory in megabytes when available."""
+    if os.name == "nt":
+        global _WINDOWS_MEMORY_API
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        try:
+            if _WINDOWS_MEMORY_API is None:
+                process = ctypes.windll.kernel32.GetCurrentProcess
+                process.restype = wintypes.HANDLE
+                get_memory_info = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+                get_memory_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessMemoryCounters), wintypes.DWORD]
+                get_memory_info.restype = wintypes.BOOL
+                _WINDOWS_MEMORY_API = process, get_memory_info
+            process, get_memory_info = _WINDOWS_MEMORY_API
+            ok = get_memory_info(process(), ctypes.byref(counters), counters.cb)
+        except (AttributeError, OSError):
+            return None
+        return counters.WorkingSetSize / (1024 * 1024) if ok else None
+
+    try:
+        # Linux exposes current RSS directly; unlike ru_maxrss this does not
+        # permanently trip the guard after a transient allocation.
+        with open("/proc/self/statm", encoding="ascii") as handle:
+            statm = handle.read().split()
+        if len(statm) >= 2:
+            return int(statm[1]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    try:
+        import resource
+
+        value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def memory_limit_exceeded(settings: Settings) -> bool:
+    current = process_memory_mb()
+    return current is not None and current > settings.memory_limit_mb
+
+
+def memory_error(request_id: str, limit_mb: int) -> JSONResponse:
+    response = openai_error(
+        f"process memory limit exceeded ({limit_mb} MB)",
+        503,
+        "server_error",
+        "memory_limit_exceeded",
+        request_id,
+    )
+    response.headers["Retry-After"] = "5"
+    return response
+
+
+def sse_memory_error(request_id: str, limit_mb: int) -> bytes:
+    payload = {
+        "error": {
+            "message": f"process memory limit exceeded ({limit_mb} MB)",
+            "type": "server_error",
+            "code": "memory_limit_exceeded",
+            "request_id": request_id,
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
 
 
 def utc_now() -> datetime:
@@ -56,16 +142,6 @@ def openai_error(message: str, status: int, error_type: str, code: str, request_
         status_code=status,
         headers={"X-Request-ID": request_id},
     )
-
-
-def _authorized(request: Request, settings: Settings) -> bool:
-    value = request.headers.get("Authorization", "")
-    if not value.startswith("Bearer "):
-        return False
-    supplied = value[7:].strip()
-    import hmac
-
-    return bool(supplied) and hmac.compare_digest(supplied.encode(), settings.public_api_key.encode())
 
 
 def _bearer(request: Request) -> str:
@@ -221,6 +297,10 @@ def create_app(
     async def request_middleware(request: Request, call_next):
         request.state.request_id = request_id_from(request)
         current_settings = runtime.settings
+        # Keep /admin reachable so an administrator can raise the limit after
+        # an overload. Public model endpoints fail fast before reading a body.
+        if request.url.path.startswith("/v1/") and memory_limit_exceeded(current_settings):
+            return memory_error(request.state.request_id, current_settings.memory_limit_mb)
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -239,6 +319,8 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz():
+        if memory_limit_exceeded(runtime.settings):
+            return memory_error("healthz", runtime.settings.memory_limit_mb)
         try:
             await ledger.healthcheck()
         except Exception:
@@ -439,6 +521,11 @@ def create_app(
         try:
             async with request_upstream.stream(payload) as response:
                 async for chunk in response.aiter_bytes():
+                    if memory_limit_exceeded(request_settings):
+                        status = "failed"
+                        http_status = 503
+                        yield sse_memory_error(rid, request_settings.memory_limit_mb)
+                        break
                     if await request.is_disconnected():
                         status = "aborted"
                         http_status = 499

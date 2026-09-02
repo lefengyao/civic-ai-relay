@@ -14,7 +14,7 @@ def test_deployment_defaults_to_one_uvicorn_worker():
 
 def test_env_example_contains_every_required_secret_and_limit():
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
-    for name in ("PUBLIC_API_KEY", "ADMIN_API_KEY", "UPSTREAM_API_KEY", "TOKEN_LIMIT_5H", "TOKEN_LIMIT_DAILY"):
+    for name in ("PUBLIC_API_KEY", "ADMIN_API_KEY", "UPSTREAM_API_KEY", "TOKEN_LIMIT_5H", "TOKEN_LIMIT_DAILY", "MEMORY_LIMIT_MB"):
         assert f"{name}=" in env
 
 
@@ -38,6 +38,15 @@ def test_dockerfile_runs_as_non_root_and_uses_uv_export():
     assert "--uid 10001" in dockerfile
     assert "requirements.txt" in dockerfile
     assert "tenant_store.py" in dockerfile
+
+
+def test_runtime_dependency_set_does_not_include_unused_uvicorn_extras():
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    assert "uvicorn[standard]" not in project
+    for package in ("httptools", "watchfiles", "websockets", "python-dotenv", "pyyaml", "uvloop"):
+        assert package not in requirements.lower()
 
 
 def test_container_application_port_is_loopback_only():

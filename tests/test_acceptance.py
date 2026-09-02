@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import httpx
 import pytest
 
 from app import create_app
+import app as app_module
 from tests.conftest import FakeUpstream, auth, build_settings, payload
+
+
+def test_process_memory_reader_is_available_on_windows():
+    value = app_module.process_memory_mb()
+
+    if os.name == "nt":
+        assert value is not None
+        assert value > 0
 
 
 @pytest.mark.asyncio
@@ -93,6 +103,34 @@ async def test_healthz_is_public_and_docs_are_disabled(app_client):
     client, _ = app_client
     assert (await client.get("/healthz")).json() == {"status": "ok"}
     assert (await client.get("/docs")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_requests_fail_with_explicit_error_when_process_memory_limit_is_exceeded(app_client, monkeypatch):
+    client, _ = app_client
+    monkeypatch.setattr(app_module, "process_memory_mb", lambda: 201.0)
+
+    response = await client.get("/v1/models", headers=auth())
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert response.json()["error"]["code"] == "memory_limit_exceeded"
+    assert "memory limit" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_stream_returns_sse_memory_error_when_limit_is_crossed_during_transfer(tmp_path, monkeypatch):
+    settings = build_settings(tmp_path)
+    application = create_app(settings, upstream=FakeUpstream(stream_chunks=[b'data: {"choices":[]}', b"\n\n"]))
+    memory_values = iter((100.0, 201.0))
+    monkeypatch.setattr(app_module, "process_memory_mb", lambda: next(memory_values, 201.0))
+    transport = httpx.ASGITransport(app=application)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/v1/chat/completions", json=payload(stream=True), headers=auth())
+
+    assert response.status_code == 200
+    assert b'memory_limit_exceeded' in response.content
 
 
 @pytest.mark.asyncio

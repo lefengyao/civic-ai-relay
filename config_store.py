@@ -46,6 +46,7 @@ def generate_initial_settings() -> Settings:
         "TOKEN_LIMIT_DAILY": "20000",
         "RPM_LIMIT": "30",
         "GLOBAL_CONCURRENCY_LIMIT": "8",
+        "MEMORY_LIMIT_MB": "200",
         "MAX_OUTPUT_TOKENS": "4096",
         "MAX_BODY_MB": "8",
         "MAX_STREAM_DURATION": "1800",

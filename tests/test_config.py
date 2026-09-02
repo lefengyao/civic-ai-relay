@@ -20,6 +20,7 @@ def required_values(tmp_path) -> dict[str, str]:
         "TOKEN_LIMIT_DAILY": "5000",
         "RPM_LIMIT": "30",
         "GLOBAL_CONCURRENCY_LIMIT": "2",
+        "MEMORY_LIMIT_MB": "200",
         "MAX_OUTPUT_TOKENS": "256",
         "MAX_BODY_MB": "3",
         "MAX_STREAM_DURATION": "42",
@@ -78,6 +79,7 @@ def test_settings_parse_all_defaults_and_types(monkeypatch):
     assert settings.token_limit_daily == 5000
     assert settings.rpm_limit == 30
     assert settings.global_concurrency_limit == 2
+    assert settings.memory_limit_mb == 200
     assert settings.max_output_tokens == 256
     assert settings.model_auto_sync is True
     assert settings.model_sync_interval == 30
@@ -164,6 +166,7 @@ def test_settings_reject_missing_required_limit(monkeypatch):
         ("TOKEN_LIMIT_DAILY", "-1"),
         ("RPM_LIMIT", "not-an-int"),
         ("GLOBAL_CONCURRENCY_LIMIT", "0"),
+        ("MEMORY_LIMIT_MB", "0"),
         ("MAX_OUTPUT_TOKENS", "0"),
         ("MAX_BODY_MB", "0"),
         ("MAX_STREAM_DURATION", "0"),
@@ -236,6 +239,7 @@ def test_settings_redacted_hides_all_secret_values(tmp_path):
         "TOKEN_LIMIT_DAILY": 5000,
         "RPM_LIMIT": 30,
         "GLOBAL_CONCURRENCY_LIMIT": 2,
+        "MEMORY_LIMIT_MB": 200,
         "MAX_OUTPUT_TOKENS": 256,
         "MAX_BODY_MB": 3,
         "MAX_STREAM_DURATION": 42,

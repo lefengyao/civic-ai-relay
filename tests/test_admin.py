@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from app import create_app
+import app as app_module
 from config_store import ConfigStore, parse_env_text, serialize_env_mapping
 from tests.conftest import FakeUpstream, admin_headers, auth, build_settings, payload
 
@@ -20,6 +21,17 @@ async def test_admin_endpoints_require_independent_admin_key(admin_client):
     assert response.status_code == 200
     assert response.json()["concurrency"] == {"active": 0, "limit": 2}
     assert response.json()["rpm"] == {"used": 0, "limit": 30}
+
+
+@pytest.mark.asyncio
+async def test_admin_configuration_remains_available_while_model_requests_are_memory_limited(admin_client, monkeypatch):
+    client, _, _ = admin_client
+    monkeypatch.setattr(app_module, "process_memory_mb", lambda: 201.0)
+
+    response = await client.get("/admin/api/config", headers=admin_headers())
+
+    assert response.status_code == 200
+    assert response.json()["settings"]["MEMORY_LIMIT_MB"] == 200
 
 
 @pytest.mark.asyncio
@@ -42,7 +54,7 @@ async def test_admin_config_and_request_history_are_redacted(admin_client):
 
 @pytest.mark.asyncio
 async def test_config_save_hot_reloads_public_key_model_and_restart_marker(admin_client):
-    client, _, env_path = admin_client
+    client, application, env_path = admin_client
     response = await client.put(
         "/admin/api/config",
         headers=admin_headers(),
@@ -50,6 +62,7 @@ async def test_config_save_hot_reloads_public_key_model_and_restart_marker(admin
             "PUBLIC_API_KEY": "new-public",
             "MODEL_WHITELIST": "new-chat",
             "MODEL_MAP_JSON": '{"new-chat":"provider-new"}',
+            "MEMORY_LIMIT_MB": "256",
         }},
     )
     assert response.status_code == 200
@@ -59,6 +72,7 @@ async def test_config_save_hot_reloads_public_key_model_and_restart_marker(admin
     models = await client.get("/v1/models", headers={"Authorization": "Bearer new-public"})
     assert models.status_code == 200
     assert models.json()["data"][0]["id"] == "new-chat"
+    assert application.state.runtime.settings.memory_limit_mb == 256
 
     deferred = await client.put(
         "/admin/api/config",

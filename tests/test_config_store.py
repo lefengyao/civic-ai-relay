@@ -148,6 +148,7 @@ def test_initial_managed_config_generates_persistent_admin_key_without_provider(
     assert first.upstream_base_url == ""
     assert first.upstream_api_key == ""
     assert first.model_whitelist == ()
+    assert first.memory_limit_mb == 200
     assert (target.parent / "bootstrap-admin-key.txt").read_text(encoding="utf-8").strip() == first.admin_api_key
 
 

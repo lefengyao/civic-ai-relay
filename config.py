@@ -147,6 +147,7 @@ class Settings:
     token_limit_daily: int
     rpm_limit: int
     global_concurrency_limit: int
+    memory_limit_mb: int
     max_output_tokens: int
     max_body_bytes: int
     max_stream_duration: int
@@ -190,6 +191,7 @@ class Settings:
             token_limit_daily=positive_int(values, "TOKEN_LIMIT_DAILY"),
             rpm_limit=positive_int(values, "RPM_LIMIT"),
             global_concurrency_limit=positive_int(values, "GLOBAL_CONCURRENCY_LIMIT"),
+            memory_limit_mb=positive_int(values, "MEMORY_LIMIT_MB", 200),
             max_output_tokens=positive_int(values, "MAX_OUTPUT_TOKENS"),
             max_body_bytes=positive_int(values, "MAX_BODY_MB", 8) * 1024 * 1024,
             max_stream_duration=positive_int(values, "MAX_STREAM_DURATION", 1800),
@@ -228,6 +230,7 @@ class Settings:
             "TOKEN_LIMIT_DAILY": str(self.token_limit_daily),
             "RPM_LIMIT": str(self.rpm_limit),
             "GLOBAL_CONCURRENCY_LIMIT": str(self.global_concurrency_limit),
+            "MEMORY_LIMIT_MB": str(self.memory_limit_mb),
             "MAX_OUTPUT_TOKENS": str(self.max_output_tokens),
             "MAX_BODY_MB": str(self.max_body_bytes // megabyte),
             "MAX_STREAM_DURATION": str(self.max_stream_duration),
@@ -258,6 +261,7 @@ class Settings:
             "TOKEN_LIMIT_DAILY": self.token_limit_daily,
             "RPM_LIMIT": self.rpm_limit,
             "GLOBAL_CONCURRENCY_LIMIT": self.global_concurrency_limit,
+            "MEMORY_LIMIT_MB": self.memory_limit_mb,
             "MAX_OUTPUT_TOKENS": self.max_output_tokens,
             "MAX_BODY_MB": self.max_body_bytes // (1024 * 1024),
             "MAX_STREAM_DURATION": self.max_stream_duration,
