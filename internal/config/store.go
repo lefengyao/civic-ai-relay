@@ -112,6 +112,9 @@ func parseSingleQuoted(value string) (string, error) {
 	}
 	var out strings.Builder
 	for i := 1; i < len(value)-1; i++ {
+		if value[i] == '\'' {
+			return "", errors.New("unescaped single quote")
+		}
 		if value[i] != '\\' {
 			out.WriteByte(value[i])
 			continue

@@ -66,7 +66,7 @@ func TestParseEnvTextSupportsCommentsQuotesAndDuplicateLastWins(t *testing.T) {
 }
 
 func TestParseEnvTextRejectsMalformedLinesAndQuotedTrailingText(t *testing.T) {
-	for _, text := range []string{"NO_EQUALS", "=value", "bad-key=value", "A=\"unterminated", "A=\"ok\" trailing", "A='unterminated", "A='bad\\q'"} {
+	for _, text := range []string{"NO_EQUALS", "=value", "bad-key=value", "A=\"unterminated", "A=\"ok\" trailing", "A='unterminated", "A='ok' trailing'", "A='bad\\q'"} {
 		if _, err := ParseEnvText(text); err == nil {
 			t.Errorf("malformed config was accepted: %q", text)
 		}
