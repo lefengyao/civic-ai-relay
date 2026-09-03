@@ -247,7 +247,7 @@ func (s *ConfigStore) Write(settings Settings) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryName, s.Path); err != nil {
+	if err := replaceFile(temporaryName, s.Path); err != nil {
 		return err
 	}
 	removeTemporary = false
@@ -357,6 +357,15 @@ func Ensure(path string) (settings Settings, bootstrapKey string, created bool, 
 		if parseErr != nil {
 			return Settings{}, "", false, parseErr
 		}
+		bootstrapPath := filepath.Join(filepath.Dir(store.Path), "bootstrap-admin-key.txt")
+		if _, bootstrapErr := os.Stat(bootstrapPath); errors.Is(bootstrapErr, os.ErrNotExist) {
+			if bootstrapErr = writeBootstrap(bootstrapPath, settings.AdminAPIKey); bootstrapErr != nil {
+				return Settings{}, "", false, fmt.Errorf("configuration exists but bootstrap-admin-key.txt could not be recovered: %w", bootstrapErr)
+			}
+			return settings, settings.AdminAPIKey, true, nil
+		} else if bootstrapErr != nil {
+			return Settings{}, "", false, fmt.Errorf("configuration exists but bootstrap-admin-key.txt is unavailable: %w", bootstrapErr)
+		}
 		return settings, "", false, nil
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return Settings{}, "", false, statErr
@@ -402,7 +411,7 @@ func writeBootstrap(path, credential string) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryName, path); err != nil {
+	if err := replaceFile(temporaryName, path); err != nil {
 		return err
 	}
 	removeTemporary = false

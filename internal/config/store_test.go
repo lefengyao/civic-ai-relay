@@ -52,6 +52,26 @@ func TestEnsureDoesNotCreateBootstrapUntilConfigWriteSucceeds(t *testing.T) {
 	}
 }
 
+func TestEnsureRecoversMissingBootstrapFileFromPersistedAdminKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.env")
+	settings, _, created, err := Ensure(path)
+	if err != nil || !created {
+		t.Fatalf("initial ensure failed: settings=%+v created=%v err=%v", settings, created, err)
+	}
+	bootstrapPath := filepath.Join(filepath.Dir(path), "bootstrap-admin-key.txt")
+	if err := os.Remove(bootstrapPath); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveredSettings, bootstrapKey, recovered, err := Ensure(path)
+	if err != nil || !recovered || bootstrapKey != recoveredSettings.AdminAPIKey || bootstrapKey != settings.AdminAPIKey {
+		t.Fatalf("missing bootstrap was not recovered: key=%q recovered=%v settings=%+v err=%v", bootstrapKey, recovered, recoveredSettings, err)
+	}
+	if content, err := os.ReadFile(bootstrapPath); err != nil || strings.TrimSpace(string(content)) != settings.AdminAPIKey {
+		t.Fatalf("recovered bootstrap mismatch: %q err=%v", content, err)
+	}
+}
+
 func TestParseEnvTextSupportsCommentsQuotesAndDuplicateLastWins(t *testing.T) {
 	values, err := ParseEnvText("\n# comment\nexport A=plain\nB=\"a value # with quote\"\nC='single quoted'\nA=last\n")
 	if err != nil {
@@ -115,6 +135,28 @@ func TestConfigStoreWriteIsAtomicAndPreservesUnknownValues(t *testing.T) {
 		if strings.HasPrefix(entry, ".relay.env-") {
 			t.Fatalf("temporary file left behind: %s", entry)
 		}
+	}
+}
+
+func TestConfigStoreWriteReplacesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.env")
+	initial, err := GenerateInitialSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("STALE=value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(path)
+	if err := store.Write(initial); err != nil {
+		t.Fatalf("replacing existing config failed: %v", err)
+	}
+	values, err := store.ReadMapping()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values["STALE"] != "value" || values["ADMIN_API_KEY"] != initial.AdminAPIKey {
+		t.Fatalf("replacement did not produce expected mapping: %#v", values)
 	}
 }
 
