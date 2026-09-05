@@ -1,0 +1,24 @@
+[Unit]
+Description=Civic Relay Go OpenAI-compatible API relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=civic-relay
+Group=civic-relay
+WorkingDirectory=/opt/civic-ai-relay
+Environment=CIVIC_RELAY_CONFIG_FILE=/etc/civic-relay/relay.env
+ExecStart=/opt/civic-ai-relay/civic-relay
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/civic-relay /etc/civic-relay
+MemoryMax=200M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

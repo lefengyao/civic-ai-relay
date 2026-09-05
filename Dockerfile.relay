@@ -1,0 +1,11 @@
+FROM golang:1.27-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd internal web ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/civic-relay ./cmd/civic-relay
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/civic-relay /civic-relay
+EXPOSE 8000
+ENTRYPOINT ["/civic-relay"]
