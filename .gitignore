@@ -11,5 +11,6 @@ data/*.db
 data/*.db-*
 *.pem
 *.key
+*.exe
 bootstrap-admin-key.txt
 .superpowers/

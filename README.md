@@ -1,122 +1,82 @@
 # Civic Relay
 
-Civic Relay is a small, self-hosted OpenAI-compatible API relay. It supports multiple client keys, model-group authorization, per-key concurrency limits, one-time Token and RMB limits, and multiple OpenAI-compatible upstream providers.
+Civic Relay 是一个单进程 Go 服务，将多个 OpenAI 兼容上游统一转发给局域网客户端。它支持供应商、模型、模型组、随机客户端 Key、并发限制、Token/金额配额、SSE 流式响应和中文管理端。
 
-## Features
+## 当前能力
 
-- `GET /v1/models` returns only models authorized for the caller's client key.
-- Each client key can belong to multiple model groups and has independent concurrency, Token, and RMB limits.
-- Provider API keys are encrypted at rest; client key plaintext is returned only once on creation.
-- Providers can refresh their `/v1/models` catalogue; imported models stay disabled and unpriced until an administrator approves them.
-- `POST /v1/chat/completions` supports JSON and streaming SSE responses.
-- Atomic SQLite accounting for RPM, rolling five-hour tokens, and Beijing-calendar-day tokens.
-- Conservative token reservation before upstream work, including streams without usage data.
-- Single-process global concurrency guard and bounded request/stream lifetimes.
-- No prompt, completion, authorization header, or API key retention.
+- `GET /v1/models`：只返回当前客户端 Key 被授权的启用且已定价模型。
+- `POST /v1/chat/completions`：支持普通 JSON 和流式 SSE。
+- 供应商 API Key 使用 AES-256-GCM 加密保存，管理接口只返回是否已配置。
+- 客户端 Key 使用 `crk_` 前缀，数据库只保存 HMAC 摘要，明文只在创建时返回一次。
+- 模型组与客户端 Key 支持多组关联，授权模型取去重并集。
+- 全局 RPM、滚动五小时 Token、北京时间自然日 Token、Key 并发和 Key 总 Token/金额配额均在 SQLite 事务中控制。
+- 达到客户端 Key 任一总配额后自动停用，并记录 `quota_exhausted`。
+- 默认进程 RSS 软限制为 200 MB；Linux、Windows 均提供读取实现。
+- 请求记录只保存元数据，不保存 prompt、回复内容、Authorization 或上游 Key。
 
-## Quick Start With uv
+## 本地启动
+
+需要 Go 1.27 或更新版本。配置文件不放在仓库内：
 
 ```powershell
-# The application creates external configuration and a one-time bootstrap
-# administrator key on first start. Keep this directory outside the repository.
-New-Item -ItemType Directory -Force C:\ProgramData\CivicRelay | Out-Null
 $env:CIVIC_RELAY_CONFIG_FILE = "C:\ProgramData\CivicRelay\relay.env"
-uv sync --dev
-.\.venv\Scripts\uvicorn.exe app:app --host 127.0.0.1 --port 8000
+go run ./cmd/civic-relay
 ```
 
-On first start, read `C:\ProgramData\CivicRelay\bootstrap-admin-key.txt` once and then protect or remove it after storing the administrator credential safely. Add a provider from the administrator console; a public client key is created there. For an existing project `.env`, copy it to the external path manually, retain the existing values, and add `RELAY_ENCRYPTION_KEY` if it is missing. The service uses one Uvicorn process; do not use multiple workers until key concurrency and quotas are moved to shared storage.
+首次启动会创建 `relay.env` 和一次性 `bootstrap-admin-key.txt`。读取管理员 Key 后，请妥善保存并删除 bootstrap 文件。管理端地址：
+
+```text
+http://127.0.0.1:8000/admin
+```
+
+局域网测试时将 `HOST` 设置为 `0.0.0.0`，然后用服务器局域网 IP 访问。先在管理端添加供应商、模型和模型组，再创建客户端 Key。
+
+客户端使用：
+
+```bash
+curl http://<relay-ip>:8000/v1/chat/completions \
+  -H "Authorization: Bearer crk_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"provider/model","messages":[{"role":"user","content":"Hello"}]}'
+```
 
 ## Docker Compose
 
+配置和数据库目录必须位于仓库外：
+
 ```powershell
-# Keep application secrets outside the repository. On Windows:
 $env:CIVIC_RELAY_CONFIG_DIR = "C:\ProgramData\CivicRelay"
-New-Item -ItemType Directory -Force $env:CIVIC_RELAY_CONFIG_DIR | Out-Null
-# On Linux, use an external directory such as /etc/civic-relay:
-# sudo install -d -o 10001 -g 10001 -m 700 /etc/civic-relay
+$env:CIVIC_RELAY_DATA_DIR = "C:\ProgramData\CivicRelay\data"
+New-Item -ItemType Directory -Force $env:CIVIC_RELAY_CONFIG_DIR,$env:CIVIC_RELAY_DATA_DIR | Out-Null
 docker compose up -d --build
-curl http://127.0.0.1:8000/healthz
 ```
 
-Compose requires `CIVIC_RELAY_CONFIG_DIR` and mounts that directory at `/app/config`; this avoids a host-specific Windows path and works on a VPS. The first container start creates `relay.env` and `bootstrap-admin-key.txt` there. Apply restrictive host permissions to the directory and read the bootstrap key once.
+Compose 默认只绑定 `127.0.0.1:8000`。生产环境应通过 HTTPS 反向代理对外提供访问，不要直接暴露 HTTP 端口。
 
-SQLite is persisted in `./data`.
+## Linux systemd
 
-## Container Panel HTTPS 反向代理
-
-The Relay container listens on `127.0.0.1:8000` only. It is not a public API endpoint; use the container panel's reverse-proxy feature to terminate HTTPS.
-
-1. Start the container with `docker-compose up -d --build`.
-2. In the container panel, create a reverse proxy for the assigned domain.
-3. Set the proxy target to `127.0.0.1:8000`.
-4. Select or upload the certificate for that exact domain and enable HTTP-to-HTTPS redirect.
-5. Do not publish port `8000` to the public network and do not select “不部署证书” for production access.
-6. Verify `https://<bound-domain>/healthz`, then configure clients with `https://<bound-domain>/v1`.
-7. Restrict `/admin` to an administrator IP allowlist or VPN subnet when the panel supports path-level policy.
-
-The proxy-to-container hop is host-local HTTP by design. Client-to-proxy and Relay-to-upstream traffic use HTTPS. The panel owns certificate lifecycle; do not bypass a missing, expired, or invalid certificate by exposing port `8000` publicly.
-
-## Example Calls
-
-Non-streaming:
+编译并安装二进制到 `/opt/civic-ai-relay/civic-relay`，创建 `civic-relay` 用户和 `/etc/civic-relay`、`/var/lib/civic-relay` 目录，然后安装：
 
 ```bash
-curl https://your-domain/v1/chat/completions \
-  -H "Authorization: Bearer public_xxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hello"}],"stream":false}'
-```
-
-Streaming:
-
-```bash
-curl https://your-domain/v1/chat/completions \
-  -H "Authorization: Bearer public_xxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hello"}],"stream":true}'
-```
-
-## Configuration
-
-`ADMIN_API_KEY` is a separate internal-management credential. `UPSTREAM_BASE_URL` and `UPSTREAM_API_KEY` provide a migration-compatible default provider; they are imported into the tenant database on start. `RELAY_ENCRYPTION_KEY` encrypts provider API keys in SQLite and must be retained for the life of the database. `MODEL_AUTO_SYNC` refreshes the legacy provider's catalogue; each additional provider can also be synchronized from the management console.
-
-`MAX_OUTPUT_TOKENS` is a hard per-request ceiling. `MEMORY_LIMIT_MB` is a process RSS soft guard (default `200` MB): new model requests return `503 memory_limit_exceeded` while over the limit, and an active stream receives an SSE error before it is terminated. The administrator console remains available to raise the limit or reduce load. This is an application-level guard, not an operating-system hard cap; use a Docker or systemd/cgroup memory limit as a second defense when a hard ceiling is required. `RPM_LIMIT` limits request starts during the last 60 seconds. `TOKEN_LIMIT_5H` is a rolling five-hour reservation/charge ceiling. `TOKEN_LIMIT_DAILY` uses `Asia/Shanghai` calendar dates. `GLOBAL_CONCURRENCY_LIMIT` rejects immediately when all active stream or non-stream slots are occupied. `MAX_BODY_MB` and `MAX_STREAM_DURATION` bound abuse. `RETENTION_DAYS` controls ledger cleanup.
-
-Production API documentation is disabled by default. Set `DOCS_ENABLED=true` only in a protected development environment.
-
-## Internal Administration
-
-Open `http://<internal-host>:8000/admin` only from the internal network or a VPN. The page asks for `ADMIN_API_KEY` and keeps it only in the current browser page; it is never returned by the server, stored in the browser, database, or logs. Put the service behind an internal TLS reverse proxy when administrators cross an untrusted network segment.
-
-Create a provider, approve and price its models, create a model group, then create a client key and assign its groups. The client uses that one-time key as `Authorization: Bearer <client-key>`, points its SDK base URL to `http://<relay-host>:8000/v1`, and chooses one of the public model aliases. A Token or amount limit is an all-time total; either limit reaching its ceiling automatically disables that key.
-
-The dashboard refreshes every two seconds while the page is visible. It reports service/database health, active concurrency, current RPM, rolling 5-hour and Beijing-calendar-day token usage, recent outcome rates, and up to 50 request metadata records. It never stores or displays prompts, completions, authorization headers, or API keys.
-
-The configuration page validates before saving and writes the managed configuration file atomically. Blank key inputs preserve the current key; a non-blank value rotates it without readback. The model section includes an authenticated manual sync action in addition to automatic synchronization. `PUBLIC_API_KEY`, `ADMIN_API_KEY`, upstream connection settings, model settings, limits, timeouts, retention, and log level apply to new requests immediately. `HOST`, `PORT`, `DB_PATH`, and `DOCS_ENABLED` are saved but require a service restart. Rotating `ADMIN_API_KEY` signs the current page out; sign in again with the replacement key.
-
-On Windows, configuration is stored outside the repository at `C:\ProgramData\CivicRelay\relay.env`; grant access only to the current user, Administrators, and SYSTEM. Docker Compose mounts an operator-selected external directory at `/app/config` so first startup can create `relay.env`; apply restrictive host permissions and ensure the container's `relay` user can write it. The image uses UID/GID `10001`, so on Linux create the mounted directory with `sudo install -d -o 10001 -g 10001 -m 700 /etc/civic-relay`. Linux systemd uses `/etc/civic-relay/relay.env`; create that directory before first start, protect it with `chmod 700`, make the file `chmod 600`, and grant ownership to the service account.
-
-## systemd
-
-Install the project at `/opt/civic-ai-relay`, create a `civic-relay` system user, then create a private configuration directory. The application creates `/etc/civic-relay/relay.env` and its one-time bootstrap key when the service first starts:
-
-```bash
-sudo install -d -o civic-relay -g civic-relay -m 700 /etc/civic-relay
-uv sync --frozen
-sudo cp ai-relay.service /etc/systemd/system/
+sudo cp civic-relay-go.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now civic-relay
-sudo systemctl status civic-relay
+sudo systemctl enable --now civic-relay-go
 ```
 
-Read `/etc/civic-relay/bootstrap-admin-key.txt` once as an administrator, then remove it after storing the credential safely. The unit intentionally starts one worker so the in-memory concurrency limit remains global for the process.
+服务单元启用 `MemoryMax=200M`、`ProtectSystem=strict`、`ProtectHome=true` 和 `NoNewPrivileges=true`。
 
-## Tests
+## 安全说明
 
-```bash
-uv run pytest -q
-uv run python -m compileall app.py admin_api.py config.py config_store.py db.py limiter.py provider_registry.py runtime.py tenant_store.py upstream.py
+- 不要把 `relay.env`、`bootstrap-admin-key.txt`、数据库文件或真实上游 Key 提交到 Git。
+- 管理员 Key 与客户端 Key 不同；管理员接口使用 `X-Admin-Key`，公共接口使用 `Authorization: Bearer`。
+- HTTPS 终止应放在反向代理或 VPS 面板；代理到本机 Go 服务的 HTTP 只适用于受信任的本机链路。
+- 修改 `RELAY_ENCRYPTION_KEY` 会导致已有供应商 Key 无法解密；数据库与该密钥必须一起备份。
+
+## 测试
+
+```powershell
+go test -count=1 ./...
+go vet ./...
 ```
 
-Tests use temporary SQLite databases and mocked upstream responses; no real API key is needed.
+当前 Windows 环境没有 CGO/GCC，`go test -race ./...` 需要在具备 GCC 的环境执行。
