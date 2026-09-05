@@ -18,8 +18,9 @@ import (
 
 // Store is a bounded SQLite connection pool and its encryption context.
 type Store struct {
-	db  *sql.DB
-	box *secret.Box
+	db                 *sql.DB
+	box                *secret.Box
+	providerCacheEvict func(providerID int64)
 }
 
 // Open creates or opens a relay database, enables safe pragmas, and applies all
