@@ -101,6 +101,15 @@ var migrations = []migration{
 		`CREATE INDEX idx_requests_time ON requests(created_at_utc)`,
 		`CREATE INDEX idx_requests_key_time ON requests(key_id, created_at_utc)`,
 	}},
+	{version: 2, statements: []string{
+		`ALTER TABLE requests ADD COLUMN billing_date_bj TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN reserved_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reserved_tokens >= 0)`,
+		`ALTER TABLE requests ADD COLUMN charged_tokens INTEGER NOT NULL DEFAULT 0 CHECK (charged_tokens >= 0)`,
+		`ALTER TABLE key_reservations ADD COLUMN request_id TEXT`,
+		`ALTER TABLE key_reservations ADD COLUMN billing_date_bj TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX idx_key_reservations_request ON key_reservations(request_id)`,
+		`CREATE INDEX idx_requests_billing_date ON requests(billing_date_bj, created_at_utc)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

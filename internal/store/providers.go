@@ -80,11 +80,15 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	if name == "" {
 		return Provider{}, errors.New("provider name is required")
 	}
+	apiKey := strings.TrimSpace(in.APIKey)
+	if apiKey == "" {
+		return Provider{}, errors.New("provider API key is required")
+	}
 	baseURL, err := validateProviderURL(in.BaseURL)
 	if err != nil {
 		return Provider{}, err
 	}
-	ciphertext, err := s.box.Seal(in.APIKey)
+	ciphertext, err := s.box.Seal(apiKey)
 	if err != nil {
 		return Provider{}, fmt.Errorf("encrypt provider API key: %w", err)
 	}
@@ -99,7 +103,7 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	if err != nil {
 		return Provider{}, err
 	}
-	return Provider{ID: id, Name: name, BaseURL: baseURL, Enabled: true, APIKeyConfigured: strings.TrimSpace(in.APIKey) != ""}, nil
+	return Provider{ID: id, Name: name, BaseURL: baseURL, Enabled: true, APIKeyConfigured: true}, nil
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider) (Provider, error) {
@@ -124,10 +128,11 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 		}
 	}
 	ciphertext := currentCipher
-	rotated := strings.TrimSpace(in.APIKey) != ""
+	apiKey := strings.TrimSpace(in.APIKey)
+	rotated := apiKey != ""
 	if rotated {
 		var err error
-		ciphertext, err = s.box.Seal(in.APIKey)
+		ciphertext, err = s.box.Seal(apiKey)
 		if err != nil {
 			return Provider{}, fmt.Errorf("encrypt provider API key: %w", err)
 		}
