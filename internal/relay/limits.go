@@ -148,3 +148,15 @@ func (ks *KeyGates) Size() int {
 	defer ks.mu.Unlock()
 	return len(ks.gates)
 }
+
+func (ks *KeyGates) Active(keyID int64) int {
+	if ks == nil {
+		return 0
+	}
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	if entry := ks.gates[keyID]; entry != nil {
+		return entry.gate.Active()
+	}
+	return 0
+}

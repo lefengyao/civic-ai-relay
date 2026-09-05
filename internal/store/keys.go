@@ -119,6 +119,15 @@ func (s *Store) GetClientKey(ctx context.Context, id int64) (ClientKey, error) {
 	return scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,'') FROM client_keys WHERE id=?`, id))
 }
 
+// AuthenticateClientKey resolves a plaintext client token to its redacted
+// database record. The token is compared only through its keyed digest.
+func (s *Store) AuthenticateClientKey(ctx context.Context, token string) (ClientKey, error) {
+	if strings.TrimSpace(token) == "" {
+		return ClientKey{}, errors.New("client token is required")
+	}
+	return scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,'') FROM client_keys WHERE token_digest=?`, s.box.DigestBytes(token)))
+}
+
 func scanClientKey(src interface{ Scan(...any) error }) (ClientKey, error) {
 	var k ClientKey
 	var enabled int
