@@ -236,6 +236,8 @@ func (s *Store) AuthorizedModels(ctx context.Context, token string) ([]Model, er
 }
 
 func (s *Store) ReserveForKey(ctx context.Context, keyID, modelID, tokens, amount int64) (KeyReservation, error) {
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
 	if keyID <= 0 || modelID <= 0 || tokens < 0 || amount < 0 {
 		return KeyReservation{}, errors.New("invalid reservation")
 	}
@@ -291,6 +293,8 @@ func (s *Store) ReserveForKey(ctx context.Context, keyID, modelID, tokens, amoun
 }
 
 func (s *Store) SettleKey(ctx context.Context, reservationID, tokens, amount int64, status string) error {
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
 	if reservationID <= 0 || tokens < 0 || amount < 0 {
 		return errors.New("invalid settlement")
 	}

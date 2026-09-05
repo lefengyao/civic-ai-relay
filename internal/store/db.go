@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"civic-ai-relay/internal/secret"
@@ -21,6 +22,7 @@ type Store struct {
 	db                 *sql.DB
 	box                *secret.Box
 	providerCacheEvict func(providerID int64)
+	reservationMu      sync.Mutex
 }
 
 // Open creates or opens a relay database, enables safe pragmas, and applies all

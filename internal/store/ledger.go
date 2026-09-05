@@ -113,11 +113,16 @@ func billingDate(t time.Time) string {
 }
 
 func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestReservation, error) {
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
 	if strings.TrimSpace(in.RequestID) == "" || in.KeyID <= 0 || in.ModelID <= 0 || in.ProviderID <= 0 {
 		return RequestReservation{}, errors.New("request metadata is required")
 	}
 	if in.StartedAt.IsZero() {
 		in.StartedAt = time.Now().UTC()
+	}
+	if in.InputTokens < 0 {
+		return RequestReservation{}, errors.New("input token estimate must be non-negative")
 	}
 	in.StartedAt = in.StartedAt.UTC()
 	inputTokens := estimateInputTokens(in)
@@ -131,10 +136,6 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	reservedTokens := inputTokens + outputTokens
 	if reservedTokens < inputTokens {
 		return RequestReservation{}, errors.New("reservation token overflow")
-	}
-	amount, err := reserveAmount(inputTokens, outputTokens, in.InputPriceMicroyuan, in.OutputPriceMicroyuan)
-	if err != nil {
-		return RequestReservation{}, err
 	}
 	for name, value := range map[string]int64{"rpm_limit": in.RPMLimit, "token_limit_5h": in.TokenLimit5H, "token_limit_daily": in.TokenLimitDaily} {
 		if value <= 0 {
@@ -170,12 +171,16 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if active >= concurrency {
 		return rollback(&QuotaError{Code: "concurrency_exceeded"})
 	}
-	var allowed int
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_models gm ON gm.group_id=g.id JOIN models m ON m.id=gm.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE kg.key_id=? AND m.id=? AND p.id=?`, in.KeyID, in.ModelID, in.ProviderID).Scan(&allowed); err != nil {
+	var inputPrice, outputPrice sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_models gm ON gm.group_id=g.id JOIN models m ON m.id=gm.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE kg.key_id=? AND m.id=? AND p.id=? LIMIT 1`, in.KeyID, in.ModelID, in.ProviderID).Scan(&inputPrice, &outputPrice); err != nil {
 		return rollback(err)
 	}
-	if allowed == 0 {
+	if !inputPrice.Valid || !outputPrice.Valid {
 		return rollback(errors.New("model is not authorized for key"))
+	}
+	amount, err := reserveAmount(inputTokens, outputTokens, inputPrice.Int64, outputPrice.Int64)
+	if err != nil {
+		return rollback(err)
 	}
 	var rpm int
 	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE created_at_utc>=datetime(?, '-60 seconds') AND created_at_utc<=?`, started, started).Scan(&rpm); err != nil {
@@ -236,6 +241,9 @@ func (s *Store) CancelRequest(ctx context.Context, reservationID int64, status s
 	if status == "" {
 		status = "rejected"
 	}
+	if status != "rejected" && status != "aborted" && status != "failed" {
+		return errors.New("cancel status must be rejected, aborted, or failed")
+	}
 	return s.finishRequest(ctx, reservationID, 0, 0, 0, status, httpStatus)
 }
 
@@ -250,6 +258,8 @@ func (s *Store) SettleRequest(ctx context.Context, reservationID, inputTokens, o
 }
 
 func (s *Store) finishRequest(ctx context.Context, requestID, inputTokens, outputTokens, amount int64, status string, httpStatus int) error {
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
 	if status != "completed" && status != "failed" && status != "aborted" && status != "rejected" {
 		return errors.New("invalid settlement status")
 	}
