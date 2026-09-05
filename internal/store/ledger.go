@@ -190,20 +190,20 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 		return rollback(&QuotaError{Code: "rpm_exceeded"})
 	}
 	var fiveHour, daily int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE status IN ('reserved','completed') AND created_at_utc>=datetime(?, '-5 hours') AND created_at_utc<=?`, started, started).Scan(&fiveHour); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND created_at_utc>=datetime(?, '-5 hours') AND created_at_utc<=?`, started, started).Scan(&fiveHour); err != nil {
 		return rollback(err)
 	}
 	if fiveHour > in.TokenLimit5H-reservedTokens {
 		return rollback(&QuotaError{Code: "token_quota_exceeded"})
 	}
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE status IN ('reserved','completed') AND billing_date_bj=? AND created_at_utc<=?`, date, started).Scan(&daily); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND billing_date_bj=? AND created_at_utc<=?`, date, started).Scan(&daily); err != nil {
 		return rollback(err)
 	}
 	if daily > in.TokenLimitDaily-reservedTokens {
 		return rollback(&QuotaError{Code: "token_quota_exceeded"})
 	}
 	var keyTokens, keyAmount int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens+reserved_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status IN ('reserved','completed')`, in.KeyID).Scan(&keyTokens, &keyAmount); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens+reserved_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status IN ('reserved','completed','failed','aborted')`, in.KeyID).Scan(&keyTokens, &keyAmount); err != nil {
 		return rollback(err)
 	}
 	if tokenLimit.Valid && keyTokens > tokenLimit.Int64-reservedTokens {
@@ -212,7 +212,7 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if amountLimit.Valid && keyAmount > amountLimit.Int64-amount {
 		return rollback(&QuotaError{Code: "key_amount_quota_exceeded"})
 	}
-	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, "reserved", inputTokens, amount, boolInt(in.Stream), date, started)
+	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,reserved_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, "reserved", inputTokens, reservedTokens, amount, boolInt(in.Stream), date, started)
 	if err != nil {
 		return rollback(err)
 	}
@@ -281,10 +281,7 @@ func (s *Store) finishRequest(ctx context.Context, requestID, inputTokens, outpu
 	if err := conn.QueryRowContext(ctx, `SELECT id,status FROM key_reservations WHERE request_id=? AND status='reserved' ORDER BY id DESC LIMIT 1`, requestToken).Scan(&keyReservationID, &current); err != nil {
 		return fail(err)
 	}
-	chargedTokens, chargedAmount := int64(0), int64(0)
-	if status == "completed" {
-		chargedTokens, chargedAmount = inputTokens+outputTokens, amount
-	}
+	chargedTokens, chargedAmount := inputTokens+outputTokens, amount
 	if _, err := conn.ExecContext(ctx, `UPDATE key_reservations SET charged_tokens=?,charged_amount_microyuan=?,reserved_tokens=0,reserved_amount_microyuan=0,status=?,finished_at_utc=? WHERE id=? AND status='reserved'`, chargedTokens, chargedAmount, status, nowUTC(), keyReservationID); err != nil {
 		return fail(err)
 	}
@@ -296,7 +293,7 @@ func (s *Store) finishRequest(ctx context.Context, requestID, inputTokens, outpu
 		return fail(err)
 	}
 	var totalTokens, totalAmount int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens),0),COALESCE(SUM(charged_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status='completed'`, keyID).Scan(&totalTokens, &totalAmount); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens),0),COALESCE(SUM(charged_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status IN ('completed','failed','aborted')`, keyID).Scan(&totalTokens, &totalAmount); err != nil {
 		return fail(err)
 	}
 	if (tokenLimit.Valid && totalTokens >= tokenLimit.Int64) || (amountLimit.Valid && totalAmount >= amountLimit.Int64) {
@@ -313,7 +310,7 @@ func (s *Store) finishRequest(ctx context.Context, requestID, inputTokens, outpu
 func (s *Store) OccupiedTokens(ctx context.Context, startedAt time.Time) int64 {
 	var total int64
 	started := startedAt.UTC().Format(time.RFC3339Nano)
-	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE status IN ('reserved','completed') AND created_at_utc>=datetime(?, '-5 hours') AND created_at_utc<=?`, started, started).Scan(&total)
+	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND created_at_utc>=datetime(?, '-5 hours') AND created_at_utc<=?`, started, started).Scan(&total)
 	return total
 }
 
@@ -366,12 +363,20 @@ func (s *Store) Healthcheck(ctx context.Context) error {
 // by the caller so retention policy remains outside the persistence layer.
 func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	cutoffText := cutoff.UTC().Format(time.RFC3339Nano)
-	result, err := s.db.ExecContext(ctx, `DELETE FROM requests WHERE created_at_utc < ?`, cutoffText)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE created_at_utc < ?`, cutoffText)
 	if err != nil {
 		return 0, err
 	}
 	// Reservations may include legacy rows without a matching request.
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM key_reservations WHERE created_at_utc < ?`, cutoffText); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM key_reservations WHERE created_at_utc < ?`, cutoffText); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
@@ -395,10 +400,10 @@ func (s *Store) Overview(ctx context.Context, now time.Time, rpmLimit, fiveHourL
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE created_at_utc>=? AND created_at_utc<=?`, minuteStart, nowText).Scan(&rpm); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE status IN ('reserved','completed') AND created_at_utc>=? AND created_at_utc<=?`, fiveHourStart, nowText).Scan(&fiveHour); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND created_at_utc>=? AND created_at_utc<=?`, fiveHourStart, nowText).Scan(&fiveHour); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE status IN ('reserved','completed') AND billing_date_bj=? AND created_at_utc<=?`, date, nowText).Scan(&daily); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND billing_date_bj=? AND created_at_utc<=?`, date, nowText).Scan(&daily); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE created_at_utc>=? AND created_at_utc<=? GROUP BY status`, hourStart.Format(time.RFC3339Nano), nowText)
