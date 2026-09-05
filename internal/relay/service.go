@@ -52,6 +52,14 @@ type Service struct {
 	keys     *KeyGates
 }
 
+func (s *Service) Models(ctx context.Context, token string) ([]store.Model, error) {
+	key, err := s.store.AuthenticateClientKey(ctx, token)
+	if err != nil || !key.Enabled {
+		return nil, ErrUnauthorized
+	}
+	return s.store.AuthorizedModels(ctx, token)
+}
+
 func NewService(repo *store.Store, clients ClientFactory, settings func() config.Settings) *Service {
 	limit := 1
 	if settings != nil && settings().GlobalConcurrencyLimit > 0 {
@@ -118,6 +126,9 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	}
 	if settings.GlobalConcurrencyLimit > 0 {
 		s.global.SetLimit(settings.GlobalConcurrencyLimit)
+	}
+	if req.MaxTokens < 0 || req.MaxCompletionTokens < 0 {
+		return nil, store.Model{}, ErrInvalidRequest
 	}
 	output := req.MaxTokens
 	if req.MaxCompletionTokens > 0 {
