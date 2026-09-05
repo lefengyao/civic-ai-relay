@@ -147,6 +147,15 @@ func (s *Store) GetModel(ctx context.Context, id int64) (Model, error) {
 	return scanModel(row)
 }
 
+func (s *Store) GetModelByPublicName(ctx context.Context, name string) (Model, error) {
+	return scanModel(s.db.QueryRowContext(ctx, "SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled FROM models WHERE public_name=?", name))
+}
+
+func (s *Store) CreateImportedModel(ctx context.Context, in NewModel) error {
+	_, err := s.db.ExecContext(ctx, "INSERT INTO models(provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?)", in.ProviderID, in.PublicName, in.UpstreamName, nil, nil, 0, nowUTC(), nowUTC())
+	return err
+}
+
 type scanner interface{ Scan(...any) error }
 
 func scanModel(src scanner) (Model, error) {
