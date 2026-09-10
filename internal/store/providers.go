@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
@@ -198,6 +199,30 @@ func (s *Store) ProviderAPIKey(ctx context.Context, id int64) (string, error) {
 
 // providerConfigured decrypts only to determine whether an API key is empty;
 // the plaintext is never returned or logged.
+// DeleteProvider removes a channel. Its models are removed by the ON DELETE
+// CASCADE foreign key; historical requests keep their amount but lose the
+// provider reference (ON DELETE SET NULL).
+func (s *Store) DeleteProvider(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return errors.New("provider ID is required")
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM providers WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	if s.providerCacheEvict != nil {
+		s.providerCacheEvict(id)
+	}
+	return nil
+}
+
 func (s *Store) providerConfigured(ciphertext string) bool {
 	if s == nil || s.box == nil || ciphertext == "" {
 		return false

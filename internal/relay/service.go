@@ -60,6 +60,21 @@ func (s *Service) Models(ctx context.Context, token string) ([]store.Model, erro
 	return s.store.AuthorizedModels(ctx, token)
 }
 
+// PreviewProviderModels fetches the upstream model catalog for a provider via
+// the configured client factory, without importing anything.
+func (s *Service) PreviewProviderModels(ctx context.Context, providerID int64) ([]string, error) {
+	if s == nil || s.clients == nil {
+		return nil, errors.New("relay service unavailable")
+	}
+	previewer, ok := s.clients.(interface {
+		PreviewModels(context.Context, int64) ([]string, error)
+	})
+	if !ok {
+		return nil, errors.New("upstream client does not support model preview")
+	}
+	return previewer.PreviewModels(ctx, providerID)
+}
+
 func NewService(repo *store.Store, clients ClientFactory, settings func() config.Settings) *Service {
 	limit := 1
 	if settings != nil && settings().GlobalConcurrencyLimit > 0 {
@@ -120,6 +135,13 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	if model.ID == 0 {
 		return nil, store.Model{}, ErrModelNotAllowed
 	}
+	rate, err := s.store.KeyModelRateMilli(ctx, key.ID, model.ID)
+	if err != nil {
+		return nil, store.Model{}, err
+	}
+	effective := model
+	effective.InputPriceMicroyuan = applyRate(model.InputPriceMicroyuan, rate)
+	effective.OutputPriceMicroyuan = applyRate(model.OutputPriceMicroyuan, rate)
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 4096}
 	if s.settings != nil {
 		settings = s.settings()
@@ -160,7 +182,7 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		RequestID: requestID(), KeyID: key.ID, ModelID: model.ID, ProviderID: model.ProviderID,
 		Stream: req.Stream, InputText: req.InputText, StringFields: stringFields,
 		OutputTokenCeiling: output, MaxOutputTokens: output,
-		InputPriceMicroyuan: valueOrZero(model.InputPriceMicroyuan), OutputPriceMicroyuan: valueOrZero(model.OutputPriceMicroyuan),
+		InputPriceMicroyuan: valueOrZero(effective.InputPriceMicroyuan), OutputPriceMicroyuan: valueOrZero(effective.OutputPriceMicroyuan),
 		RPMLimit: int64(settings.RPMLimit), TokenLimit5H: settings.TokenLimit5H, TokenLimitDaily: settings.TokenLimitDaily,
 	})
 	if err != nil {
@@ -172,7 +194,20 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		}
 		return nil, store.Model{}, err
 	}
-	return &Lease{service: s, reservation: reservation, keyID: key.ID, token: req.Token, model: model}, model, nil
+	return &Lease{service: s, reservation: reservation, keyID: key.ID, token: req.Token, model: effective}, effective, nil
+}
+
+// applyRate scales a per-million-token price by a group multiplier expressed in
+// thousandths (1000 = 1.0x). A nil price stays nil (unpriced).
+func applyRate(price *int64, rateMilli int64) *int64 {
+	if price == nil || rateMilli == 1000 {
+		return price
+	}
+	if rateMilli <= 0 {
+		rateMilli = 1000
+	}
+	n := *price * rateMilli / 1000
+	return &n
 }
 
 func valueOrZero(value *int64) int64 {

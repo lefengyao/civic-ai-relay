@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -83,3 +84,65 @@ func TestAdminServesChineseEmbeddedPage(t *testing.T) {
 		t.Fatal("embedded page missing Chinese settings text")
 	}
 }
+
+func TestAdminDeleteRoutes(t *testing.T) {
+	handler, key := adminFixture(t)
+
+	provider := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", key, map[string]any{"name": "p", "base_url": "https://provider.example", "api_key": "k"})
+	if provider.Code != http.StatusCreated {
+		t.Fatal(provider.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(provider.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	providerID := created.Data.ID
+
+	model := adminRequest(t, handler, http.MethodPost, "/admin/api/models", key, map[string]any{"provider_id": providerID, "public_name": "m", "upstream_name": "m", "input_price": 1, "output_price": 1, "enabled": true})
+	if model.Code != http.StatusCreated {
+		t.Fatal(model.Body.String())
+	}
+	if err := json.Unmarshal(model.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	modelID := created.Data.ID
+
+	group := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", key, map[string]any{"name": "g", "model_ids": []int64{modelID}})
+	if group.Code != http.StatusCreated {
+		t.Fatal(group.Body.String())
+	}
+	if err := json.Unmarshal(group.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	groupID := created.Data.ID
+
+	clientKey := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", key, map[string]any{"name": "k", "max_concurrency": 1, "group_ids": []int64{groupID}})
+	if clientKey.Code != http.StatusCreated {
+		t.Fatal(clientKey.Body.String())
+	}
+	if err := json.Unmarshal(clientKey.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	keyID := created.Data.ID
+
+	for _, path := range []string{
+		"/admin/api/keys/" + itoa(keyID),
+		"/admin/api/groups/" + itoa(groupID),
+		"/admin/api/models/" + itoa(modelID),
+		"/admin/api/providers/" + itoa(providerID),
+	} {
+		if response := adminRequest(t, handler, http.MethodDelete, path, key, nil); response.Code != http.StatusOK {
+			t.Fatalf("DELETE %s = %d: %s", path, response.Code, response.Body.String())
+		}
+		// A second delete must report 404 rather than silently succeeding.
+		if response := adminRequest(t, handler, http.MethodDelete, path, key, nil); response.Code != http.StatusNotFound {
+			t.Fatalf("repeat DELETE %s = %d, want 404", path, response.Code)
+		}
+	}
+}
+
+func itoa(v int64) string { return strconv.FormatInt(v, 10) }

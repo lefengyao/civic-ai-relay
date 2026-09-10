@@ -1,8 +1,5 @@
-.venv/
 .worktrees/
 .codex/
-__pycache__/
-.pytest_cache/
 .env
 docs/
 *-codex-build-prompt.md

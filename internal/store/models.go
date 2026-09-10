@@ -37,19 +37,34 @@ type UpdateModel struct {
 }
 
 type ModelGroup struct {
-	ID      int64
-	Name    string
-	Enabled bool
+	ID        int64
+	Name      string
+	Enabled   bool
+	RateMilli int64 // 计费倍率，千分比表示：1000 = 1.0x
 }
 
 type NewModelGroup struct {
-	Name    string
-	Enabled bool
+	Name      string
+	Enabled   bool
+	RateMilli int64 // 0 视为默认 1000
 }
 
 type UpdateModelGroup struct {
-	Name    string
-	Enabled *bool
+	Name      string
+	Enabled   *bool
+	RateMilli *int64
+}
+
+const DefaultGroupRateMilli int64 = 1000
+
+func normalizeRateMilli(v int64) (int64, error) {
+	if v == 0 {
+		return DefaultGroupRateMilli, nil
+	}
+	if v < 0 {
+		return 0, errors.New("group rate multiplier must be positive")
+	}
+	return v, nil
 }
 
 func validatePrice(v *int64) error {
@@ -151,6 +166,46 @@ func (s *Store) GetModelByPublicName(ctx context.Context, name string) (Model, e
 	return scanModel(s.db.QueryRowContext(ctx, "SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled FROM models WHERE public_name=?", name))
 }
 
+// DeleteModel removes a model. Group memberships and reservations cascade;
+// historical requests keep their billing amount but lose the model reference.
+func (s *Store) DeleteModel(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return errors.New("model ID is required")
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM models WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteModelGroup removes a group. Its memberships and key grants cascade;
+// models themselves are untouched.
+func (s *Store) DeleteModelGroup(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return errors.New("group ID is required")
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM model_groups WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) CreateImportedModel(ctx context.Context, in NewModel) error {
 	_, err := s.db.ExecContext(ctx, "INSERT INTO models(provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?)", in.ProviderID, in.PublicName, in.UpstreamName, nil, nil, 0, nowUTC(), nowUTC())
 	return err
@@ -187,7 +242,11 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 	if name == "" {
 		return ModelGroup{}, errors.New("group name is required")
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO model_groups(name,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?)`, name, 1, nowUTC(), nowUTC())
+	rate, err := normalizeRateMilli(in.RateMilli)
+	if err != nil {
+		return ModelGroup{}, err
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO model_groups(name,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?)`, name, 1, rate, nowUTC(), nowUTC())
 	if err != nil {
 		return ModelGroup{}, err
 	}
@@ -195,13 +254,13 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 	if err != nil {
 		return ModelGroup{}, err
 	}
-	return ModelGroup{ID: id, Name: name, Enabled: true}, nil
+	return ModelGroup{ID: id, Name: name, Enabled: true, RateMilli: rate}, nil
 }
 
 func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGroup) (ModelGroup, error) {
 	var g ModelGroup
 	var enabled int
-	if err := s.db.QueryRowContext(ctx, `SELECT name,enabled FROM model_groups WHERE id=?`, id).Scan(&g.Name, &enabled); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT name,enabled,rate_milli FROM model_groups WHERE id=?`, id).Scan(&g.Name, &enabled, &g.RateMilli); err != nil {
 		return ModelGroup{}, err
 	}
 	g.ID, g.Enabled = id, enabled == 1
@@ -211,14 +270,21 @@ func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGr
 	if in.Enabled != nil {
 		g.Enabled = *in.Enabled
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), nowUTC(), id); err != nil {
+	if in.RateMilli != nil {
+		rate, err := normalizeRateMilli(*in.RateMilli)
+		if err != nil {
+			return ModelGroup{}, err
+		}
+		g.RateMilli = rate
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,rate_milli=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), g.RateMilli, nowUTC(), id); err != nil {
 		return ModelGroup{}, err
 	}
 	return g, nil
 }
 
 func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled FROM model_groups ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled,rate_milli FROM model_groups ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -227,11 +293,33 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 	for rows.Next() {
 		var g ModelGroup
 		var enabled int
-		if err := rows.Scan(&g.ID, &g.Name, &enabled); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &enabled, &g.RateMilli); err != nil {
 			return nil, err
 		}
 		g.Enabled = enabled == 1
 		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// GroupModelIDs returns the model IDs currently assigned to a group, ordered
+// by model ID. Used by the administration console to prefill group editing.
+func (s *Store) GroupModelIDs(ctx context.Context, groupID int64) ([]int64, error) {
+	if groupID <= 0 {
+		return nil, errors.New("group ID is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT model_id FROM group_models WHERE group_id=? ORDER BY model_id`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
 	}
 	return out, rows.Err()
 }

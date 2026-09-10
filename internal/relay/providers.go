@@ -53,6 +53,22 @@ func (r *Registry) EvictProvider(providerID int64) {
 func (r *Registry) ForProvider(ctx context.Context, providerID int64) (UpstreamClient, error) {
 	return r.forProvider(ctx, providerID)
 }
+
+// PreviewModels fetches the upstream model catalog without writing anything to
+// the database. Used by the admin console to let operators pick which upstream
+// models to import.
+func (r *Registry) PreviewModels(ctx context.Context, providerID int64) ([]string, error) {
+	client, err := r.forProvider(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := client.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return parseModelCatalog(data)
+}
+
 func (r *Registry) SyncProvider(ctx context.Context, providerID int64) ([]string, error) {
 	client, err := r.forProvider(ctx, providerID)
 	if err != nil {
@@ -62,6 +78,29 @@ func (r *Registry) SyncProvider(ctx context.Context, providerID int64) ([]string
 	if err != nil {
 		return nil, err
 	}
+	names, err := parseModelCatalog(data)
+	if err != nil {
+		return nil, err
+	}
+	provider, err := r.store.GetProvider(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+	imported := make([]string, 0)
+	for _, item := range names {
+		name := provider.Name + "/" + item
+		if _, err := r.store.GetModelByPublicName(ctx, name); err == nil {
+			continue
+		}
+		if err := r.store.CreateImportedModel(ctx, store.NewModel{ProviderID: providerID, PublicName: name, UpstreamName: item, Enabled: false}); err != nil {
+			return nil, err
+		}
+		imported = append(imported, name)
+	}
+	return imported, nil
+}
+
+func parseModelCatalog(data []byte) ([]string, error) {
 	var payload struct {
 		Data []struct {
 			ID string `json:"id"`
@@ -70,23 +109,12 @@ func (r *Registry) SyncProvider(ctx context.Context, providerID int64) ([]string
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("decode model catalog: %w", err)
 	}
-	provider, err := r.store.GetProvider(ctx, providerID)
-	if err != nil {
-		return nil, err
-	}
-	imported := make([]string, 0)
+	names := make([]string, 0, len(payload.Data))
 	for _, item := range payload.Data {
 		if item.ID == "" {
 			continue
 		}
-		name := provider.Name + "/" + item.ID
-		if _, err := r.store.GetModelByPublicName(ctx, name); err == nil {
-			continue
-		}
-		if err := r.store.CreateImportedModel(ctx, store.NewModel{ProviderID: providerID, PublicName: name, UpstreamName: item.ID, Enabled: false}); err != nil {
-			return nil, err
-		}
-		imported = append(imported, name)
+		names = append(names, item.ID)
 	}
-	return imported, nil
+	return names, nil
 }

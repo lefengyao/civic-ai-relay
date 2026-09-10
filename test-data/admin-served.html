@@ -81,10 +81,6 @@ tr:last-child td{border-bottom:none}
 tbody tr{transition:background .15s}
 tbody tr:hover{background:#f8faff}
 .mono{font-family:Consolas,monospace;font-size:12.5px}
-.token-hint{font-family:Consolas,monospace;font-size:11px;color:var(--muted);margin-top:3px;letter-spacing:.4px;font-weight:400}
-.usage-bar{display:inline-block;width:90px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;vertical-align:middle;margin:3px 6px 0 0}
-.usage-bar i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width .4s ease}
-.usage-bar i.full{background:var(--red)}
 .empty{color:var(--muted);text-align:center;padding:26px 0}
 .tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500}
 .tag.ok{background:var(--green-soft);color:var(--green)}
@@ -133,10 +129,6 @@ details .card{margin-bottom:0}
 .modal-box p{color:var(--muted);font-size:13px;margin:0 0 16px}
 .token-box{display:flex;gap:8px}
 .token-box code{flex:1;background:#f4f6fb;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:Consolas,monospace;font-size:12.5px;word-break:break-all}
-#edit-modal{position:fixed;inset:0;background:rgba(20,26,40,.45);display:none;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(2px)}
-#edit-modal.on{display:flex}
-#edit-body .field{margin-bottom:12px}
-#edit-body .switch-row{display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--text)}
 .skeleton{background:linear-gradient(90deg,#eef1f6 25%,#f7f9fc 50%,#eef1f6 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:6px;height:14px;margin:10px 0}
 @keyframes shimmer{to{background-position:-200% 0}}
 .trend{display:flex;align-items:flex-end;gap:5px;height:110px;padding-top:8px}
@@ -233,10 +225,7 @@ details .card{margin-bottom:0}
     <section id="view-groups" class="view">
       <details class="add-box"><summary>＋ 创建模型组</summary>
         <div class="card"><form id="group-form">
-          <div class="form-grid">
-            <div class="field" style="margin-bottom:12px"><label>组名</label><input name="name" required placeholder="例如 默认组" style="max-width:280px"></div>
-            <div class="field" style="margin-bottom:12px"><label>计费倍率（1.00 = 原价）</label><input name="rate" type="number" step="0.01" min="0.01" value="1.00" required style="max-width:140px"></div>
-          </div>
+          <div class="field" style="margin-bottom:12px"><label>组名</label><input name="name" required placeholder="例如 默认组" style="max-width:280px"></div>
           <div class="field"><label>包含的模型（需已启用且已定价）</label><div class="check-list" id="group-model-checks"></div></div>
           <div class="form-actions"><button class="btn">创建模型组</button></div>
         </form></div>
@@ -279,20 +268,10 @@ details .card{margin-bottom:0}
 
 <!-- Token 弹窗 -->
 <div id="modal"><div class="modal-box">
-  <h3 id="modal-title">🎉 Key 创建成功</h3>
+  <h3>🎉 Key 创建成功</h3>
   <p>客户端明文密钥<b>只显示这一次</b>，请立即复制保存：</p>
   <div class="token-box"><code id="modal-token"></code><button class="btn" id="copy-token">复制</button></div>
   <div style="text-align:right;margin-top:18px"><button class="btn-ghost" id="modal-close">我已保存</button></div>
-</div></div>
-
-<!-- 编辑弹窗 -->
-<div id="edit-modal"><div class="modal-box" style="width:560px">
-  <h3 id="edit-title" style="margin-bottom:16px"></h3>
-  <div id="edit-body"></div>
-  <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:20px">
-    <button class="btn-ghost" id="edit-cancel">取消</button>
-    <button class="btn" id="edit-save">保存修改</button>
-  </div>
 </div></div>
 
 <div id="toasts"></div>
@@ -443,72 +422,22 @@ async function loadProviders() {
       <td class="mono">${p.ID}</td><td><b>${esc(p.Name)}</b></td><td class="mono">${esc(p.BaseURL)}</td>
       <td>${p.APIKeyConfigured ? `<span class="tag ok">已配置</span>` : `<span class="tag err">未配置</span>`}</td>
       <td><label class="switch"><input type="checkbox" ${p.Enabled ? "checked" : ""} onchange="toggleProvider(${p.ID},this)"><span class="track"></span></label></td>
-      <td><button class="btn-ghost btn-sm" onclick="pullModels(${p.ID})">拉取模型</button> <button class="btn-ghost btn-sm" onclick="editProvider(${p.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delProvider(${p.ID})">删除</button></td>
+      <td><button class="btn-ghost btn-sm" onclick="editProvider(${p.ID})">改名 / 换 Key</button></td>
     </tr>`).join("") + `</tbody></table>`;
 }
 window.toggleProvider = async (id, el) => {
   try { await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Enabled: el.checked }) }); toast(el.checked ? "供应商已启用" : "供应商已停用", "ok"); }
   catch (e) { el.checked = !el.checked; toast(e.message, "err"); }
 };
-/* ── 通用编辑弹窗 ── */
-function openEdit(title, bodyHTML, onsave) {
-  $("edit-title").textContent = title;
-  $("edit-body").innerHTML = bodyHTML;
-  $("edit-modal").classList.add("on");
-  $("edit-save").onclick = async () => {
-    try { await onsave(); $("edit-modal").classList.remove("on"); toast("已保存", "ok"); }
-    catch (e) { toast(e.message, "err"); }
-  };
-}
-function checkListHTML(items, selected, name) {
-  return items.length ? `<div class="check-list">` + items.map(x =>
-    `<label class="check-item ${selected.includes(x.id) ? "on" : ""}"><input type="checkbox" data-id="${x.id}" ${selected.includes(x.id) ? "checked" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span class="mono">${esc(x.label)}</span></label>`).join("") + `</div>`
-    : `<span style="color:var(--muted);font-size:13px">${name}</span>`;
-}
-const checkedIds = container => [...container.querySelectorAll(".check-list input:checked")].map(i => Number(i.dataset.id));
-window.closeEdit = () => $("edit-modal").classList.remove("on");
-$("edit-cancel").onclick = () => $("edit-modal").classList.remove("on");
-$("edit-modal").addEventListener("click", e => { if (e.target.id === "edit-modal") $("edit-modal").classList.remove("on"); });
-
-/* ── 拉取上游模型 ── */
-window.pullModels = async id => {
+window.editProvider = async id => {
   const p = cache.providers.find(x => x.ID === id);
-  if (!p) return;
-  toast("正在从上游拉取模型列表…", "info");
-  let remote;
-  try { remote = (await apiJSON(`/admin/api/providers/${id}/remote-models`)).data || []; }
-  catch (e) { toast("拉取失败：" + e.message, "err"); return; }
-  if (!remote.length) { toast("上游未返回任何模型", "err"); return; }
-  const items = remote.map(m => ({ id: m.upstream_name, label: m.public_name + (m.exists ? "（已存在）" : ""), exists: m.exists }));
-  const newCount = remote.filter(m => !m.exists).length;
-  openEdit(`从「${esc(p.Name)}」拉取模型`, `
-    <p style="color:var(--muted);font-size:13px;margin:0 0 10px">上游共 ${remote.length} 个模型，其中 <b>${newCount}</b> 个未导入。勾选后导入（导入后为<b>停用、未定价</b>状态，请到「模型」页定价并启用）。</p>
-    <div class="field"><label>模型列表</label><div class="check-list" id="pull-list">${items.map(x =>
-      `<label class="check-item ${x.exists ? "on" : ""}"><input type="checkbox" data-id="${esc(x.id)}" ${x.exists ? "checked disabled" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span class="mono">${esc(x.label)}</span></label>`).join("")}</div></div>
-  `, async () => {
-    const picked = [...$("pull-list").querySelectorAll("input:checked:not(:disabled)")].map(i => i.dataset.id);
-    if (!picked.length) { toast("未选择任何新模型", "err"); throw new Error("noop"); }
-    const res = await apiJSON(`/admin/api/providers/${id}/models/import`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ models: picked.map(u => ({ upstream_name: u })) }) });
-    toast(`已导入 ${res.count} 个模型，请到「模型」页定价并启用`, "ok");
-  });
-};
-
-/* ── 供应商编辑 ── */
-window.editProvider = id => {
-  const p = cache.providers.find(x => x.ID === id);
-  if (!p) return;
-  openEdit(`编辑供应商 #${id}`, `
-    <div class="field"><label>名称</label><input id="ep-name" value="${esc(p.Name)}"></div>
-    <div class="field"><label>上游地址（HTTPS）</label><input id="ep-url" value="${esc(p.BaseURL)}"></div>
-    <div class="field"><label>新的上游 API Key（留空表示不变）</label><input id="ep-key" type="password" placeholder="${p.APIKeyConfigured ? "已配置，留空保持不变" : "尚未配置"}"></div>
-    <label class="switch-row"><label class="switch"><input id="ep-enabled" type="checkbox" ${p.Enabled ? "checked" : ""}><span class="track"></span></label>启用该供应商</label>
-  `, async () => {
-    const body = { Name: $("ep-name").value.trim(), BaseURL: $("ep-url").value.trim(), Enabled: $("ep-enabled").checked };
-    const key = $("ep-key").value.trim();
-    if (key) body.APIKey = key;
-    await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    loadProviders();
-  });
+  const name = prompt("供应商名称：", p.Name); if (name === null) return;
+  const key = prompt("新的上游 API Key（留空则不变）：", "");
+  if (key === null) return;
+  try {
+    await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Name: name, ...(key ? { APIKey: key } : {}) }) });
+    toast("供应商已更新", "ok"); loadProviders();
+  } catch (e) { toast(e.message, "err"); }
 };
 $("provider-form").onsubmit = async e => {
   e.preventDefault();
@@ -529,40 +458,13 @@ async function loadModels() {
   renderProviderSelect();
   if (!cache.models.length) { $("model-data").innerHTML = `<div class="empty">还没有模型，点击上方按钮添加</div>`; return; }
   const pname = id => (cache.providers.find(p => p.ID === id) || {}).Name || ("#" + id);
-  $("model-data").innerHTML = `<table><thead><tr><th>ID</th><th>供应商</th><th>对外名称</th><th>上游名称</th><th>输入价</th><th>输出价</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+  $("model-data").innerHTML = `<table><thead><tr><th>ID</th><th>供应商</th><th>对外名称</th><th>上游名称</th><th>输入价</th><th>输出价</th><th>状态</th></tr></thead><tbody>` +
     cache.models.map(m => `<tr>
       <td class="mono">${m.ID}</td><td>${esc(pname(m.ProviderID))}</td><td><b class="mono">${esc(m.PublicName)}</b></td><td class="mono">${esc(m.UpstreamName)}</td>
       <td>${fmtYuan(m.InputPriceMicroyuan)}</td><td>${fmtYuan(m.OutputPriceMicroyuan)}</td>
       <td><label class="switch"><input type="checkbox" ${m.Enabled ? "checked" : ""} onchange="toggleModel(${m.ID},this)"><span class="track"></span></label></td>
-      <td><button class="btn-ghost btn-sm" onclick="editModel(${m.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delModel(${m.ID})">删除</button></td>
     </tr>`).join("") + `</tbody></table>`;
 }
-window.editModel = id => {
-  const m = cache.models.find(x => x.ID === id);
-  if (!m) return;
-  const yuan = micro => micro == null ? "" : micro / 1e6;
-  openEdit(`编辑模型 #${id}`, `
-    <div class="form-grid">
-      <div class="field"><label>所属供应商</label><select id="em-provider">${cache.providers.map(p => `<option value="${p.ID}" ${p.ID === m.ProviderID ? "selected" : ""}>${esc(p.Name)}</option>`).join("")}</select></div>
-      <div class="field"><label>对外名称</label><input id="ep-public" value="${esc(m.PublicName)}"></div>
-      <div class="field"><label>上游模型名</label><input id="em-upstream" value="${esc(m.UpstreamName)}"></div>
-      <div class="field"><label>输入单价（元 / 百万 Token）</label><input id="em-in" type="number" step="0.000001" min="0" value="${yuan(m.InputPriceMicroyuan)}"></div>
-      <div class="field"><label>输出单价（元 / 百万 Token）</label><input id="em-out" type="number" step="0.000001" min="0" value="${yuan(m.OutputPriceMicroyuan)}"></div>
-    </div>
-    <label class="switch-row" style="margin-top:4px"><label class="switch"><input id="em-enabled" type="checkbox" ${m.Enabled ? "checked" : ""}><span class="track"></span></label>启用该模型</label>
-  `, async () => {
-    const body = {
-      ProviderID: Number($("em-provider").value),
-      PublicName: $("ep-public").value.trim(),
-      UpstreamName: $("em-upstream").value.trim(),
-      Enabled: $("em-enabled").checked,
-    };
-    if ($("em-in").value !== "") body.InputPriceMicroyuan = micro($("em-in").value);
-    if ($("em-out").value !== "") body.OutputPriceMicroyuan = micro($("em-out").value);
-    await apiJSON("/admin/api/models/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    loadModels();
-  });
-};
 window.toggleModel = async (id, el) => {
   try { await apiJSON("/admin/api/models/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Enabled: el.checked }) }); toast(el.checked ? "模型已启用" : "模型已停用", "ok"); }
   catch (e) { el.checked = !el.checked; toast(e.message, "err"); }
@@ -591,35 +493,14 @@ async function loadGroups() {
   cache.groups = d.data || [];
   renderGroupChecks();
   if (!cache.groups.length) { $("group-data").innerHTML = `<div class="empty">还没有模型组，点击上方按钮创建</div>`; return; }
-  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
-    cache.groups.map(g => `<tr><td class="mono">${g.ID}</td><td><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td><button class="btn-ghost btn-sm" onclick="editGroup(${g.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delGroup(${g.ID})">删除</button></td></tr>`).join("") + `</tbody></table>`;
+  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>状态</th></tr></thead><tbody>` +
+    cache.groups.map(g => `<tr><td class="mono">${g.ID}</td><td><b>${esc(g.Name)}</b></td><td>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td></tr>`).join("") + `</tbody></table>`;
 }
-window.editGroup = async id => {
-  const g = cache.groups.find(x => x.ID === id);
-  if (!g) return;
-  if (!cache.models.length) { try { cache.models = (await apiJSON("/admin/api/models")).data || []; } catch {} }
-  let memberIds = [];
-  try { memberIds = (await apiJSON("/admin/api/groups/" + id + "/models")).data || []; } catch {}
-  const okModels = cache.models.filter(m => m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null);
-  const items = okModels.map(m => ({ id: m.ID, label: m.PublicName }));
-  const orphans = memberIds.filter(mid => !okModels.some(m => m.ID === mid));
-  openEdit(`编辑模型组 #${id}`, `
-    <div class="field"><label>组名</label><input id="eg-name" value="${esc(g.Name)}" style="max-width:280px"></div>
-    <div class="field"><label>计费倍率（该组内请求按模型单价 × 倍率计费）</label><input id="eg-rate" type="number" step="0.01" min="0.01" value="${g.RateMilli != null ? (g.RateMilli / 1000).toFixed(2) : "1.00"}" style="max-width:140px"></div>
-    <div class="field"><label>包含的模型（需已启用且已定价）</label>${checkListHTML(items, memberIds, "暂无可用模型")}</div>
-    ${orphans.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${orphans.length} 个已失效的成员模型（已停用或未定价）保存后将被移除</p>` : ""}
-    <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="eg-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该模型组</label>
-  `, async () => {
-    await apiJSON("/admin/api/groups/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: $("eg-name").value.trim(), rate: parseFloat($("eg-rate").value) || 1, enabled: $("eg-enabled").checked }) });
-    await apiJSON("/admin/api/groups/" + id + "/models", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_ids: checkedIds($("edit-body")) }) });
-    loadGroups();
-  });
-};
 $("group-form").onsubmit = async e => {
   e.preventDefault();
   const ids = [...$("group-model-checks").querySelectorAll("input:checked")].map(i => Number(i.value));
   try {
-    await apiJSON("/admin/api/groups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: new FormData(e.target).get("name"), rate: parseFloat(new FormData(e.target).get("rate")) || 1, model_ids: ids }) });
+    await apiJSON("/admin/api/groups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: new FormData(e.target).get("name"), model_ids: ids }) });
     toast("模型组已创建", "ok"); loadGroups();
   } catch (err) { toast(err.message, "err"); }
 };
@@ -635,121 +516,16 @@ async function loadKeys() {
   cache.keys = d.data || [];
   renderKeyGroupChecks();
   if (!cache.keys.length) { $("key-data").innerHTML = `<div class="empty">还没有客户端 Key，点击上方按钮创建</div>`; return; }
-  $("key-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>密钥标识 / 缩略</th><th>并发</th><th>Token 已用 / 限额</th><th>金额已用 / 限额</th><th>请求次数</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
-    cache.keys.map(k => {
-      const pct = (used, limit) => limit == null ? null : Math.min(100, limit > 0 ? used / limit * 100 : 0);
-      const tp = pct(k.UsedTokens, k.TokenLimit), ap = pct(k.UsedAmountMicroyuan, k.AmountLimitMicroyuan);
-      const usageCell = (used, limit, fmt, p) =>
-        `${fmt(used)} <span style="color:var(--muted)">/ ${limit == null ? "不限" : fmt(limit)}</span>` +
-        (p == null ? "" : `<div class="usage-bar"><i style="width:${p.toFixed(1)}%" class="${p >= 90 ? "full" : ""}"></i></div><span style="font-size:11px;color:${p >= 90 ? "var(--red)" : "var(--muted)"}">${p.toFixed(0)}% 已用</span>`);
-      return `<tr>
-      <td class="mono">${k.ID}</td><td><b>${esc(k.Name)}</b></td>
-      <td class="mono">${k.TokenLabel ? esc(k.TokenLabel) : `<span style="color:var(--muted)">未记录</span>`}
-        <div class="token-hint" id="hint-${k.ID}" title="密钥脱敏缩略，明文仅在创建/重置时显示一次">…</div>
-      </td>
-      <td>${k.ConcurrencyLimit}</td>
-      <td>${usageCell(k.UsedTokens || 0, k.TokenLimit, fmtNum, tp)}</td>
-      <td>${usageCell(k.UsedAmountMicroyuan || 0, k.AmountLimitMicroyuan, fmtYuan, ap)}</td>
-      <td class="mono">${k.RequestCount || 0}</td>
+  $("key-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>并发</th><th>Token 已用限额</th><th>金额限额</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+    cache.keys.map(k => `<tr>
+      <td class="mono">${k.ID}</td><td><b>${esc(k.Name)}</b></td><td>${k.ConcurrencyLimit}</td>
+      <td>${k.TokenLimit == null ? "不限" : fmtNum(k.TokenLimit)}</td><td>${k.AmountLimitMicroyuan == null ? "不限" : fmtYuan(k.AmountLimitMicroyuan)}</td>
       <td>${k.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag err">${esc(k.DisabledReason || "停用")}</span>`}</td>
-      <td style="white-space:nowrap"><label class="switch"><input type="checkbox" ${k.Enabled ? "checked" : ""} onchange="toggleKey(${k.ID},this)"><span class="track"></span></label> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="editKey(${k.ID})">编辑</button> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="rotateKey(${k.ID})">重置密钥</button> <button class="btn-danger btn-sm" style="margin-left:6px" onclick="delKey(${k.ID})">删除</button></td>
-    </tr>`;}).join("") + `</tbody></table>`;
-  loadKeyHints();
+      <td><label class="switch"><input type="checkbox" ${k.Enabled ? "checked" : ""} onchange="toggleKey(${k.ID},this)"><span class="track"></span></label></td>
+    </tr>`).join("") + `</tbody></table>`;
 }
-/* ── 删除：确认 → DELETE → 刷新。历史账单金额始终保留 ── */
-async function removeResource(path, message, refresh) {
-  if (!confirm(message + "\n\n历史账单金额会保留，此操作不可撤销。")) return;
-  try {
-    await apiJSON(path, { method: "DELETE" });
-    toast("已删除", "ok");
-    refresh();
-  } catch (e) { toast(e.message, "err"); }
-}
-window.delProvider = id => {
-  const p = cache.providers.find(x => x.ID === id);
-  if (!p) return;
-  removeResource(`/admin/api/providers/${id}`,
-    `删除渠道「${p.Name}」？其下所有模型会一并移除，引用它们的模型组将失去这些成员。`,
-    () => { loadProviders(); loadModels(); loadGroups(); });
-};
-window.delModel = id => {
-  const m = cache.models.find(x => x.ID === id);
-  if (!m) return;
-  removeResource(`/admin/api/models/${id}`,
-    `删除模型「${m.PublicName}」？它会从所有模型组中移除，客户端将无法再调用。`,
-    () => { loadModels(); loadGroups(); });
-};
-window.delGroup = id => {
-  const g = cache.groups.find(x => x.ID === id);
-  if (!g) return;
-  removeResource(`/admin/api/groups/${id}`,
-    `删除模型组「${g.Name}」？授权了该组的 Key 将失去对应模型的访问权。`,
-    loadGroups);
-};
-window.delKey = id => {
-  const k = cache.keys.find(x => x.ID === id);
-  if (!k) return;
-  removeResource(`/admin/api/keys/${id}`,
-    `删除 Key「${k.Name}」？客户端将立即无法调用，且无法恢复（只能重新创建）。`,
-    loadKeys);
-};
-
-/* 密钥缩略由独立接口返回：列表接口本身不会出现任何密钥字符 */
-async function loadKeyHints() {
-  try {
-    const d = await apiJSON("/admin/api/keys/hints");
-    (d.data || []).forEach(x => {
-      const el = document.getElementById("hint-" + x.id);
-      if (!el) return;
-      el.innerHTML = x.hint
-        ? esc(x.hint)
-        : `<span style="opacity:.7">重置后显示</span>`;
-    });
-  } catch (e) { /* 缩略加载失败不影响主功能 */ }
-}
-/* 重置密钥：旧 token 立即失效，新 token 只显示这一次 */
-window.rotateKey = async id => {
-  const k = cache.keys.find(x => x.ID === id);
-  if (!k) return;
-  if (!confirm(`重置「${k.Name}」的密钥？旧密钥将立即失效，正在使用它的客户端需要更新。`)) return;
-  try {
-    const res = await apiJSON(`/admin/api/keys/${id}/rotate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    const token = res.token || (res.data && res.data.Token);
-    if (!token) { toast("重置成功但未返回新密钥", "err"); loadKeys(); return; }
-    $("modal-title").textContent = "密钥已重置";
-    $("modal-token").textContent = token;
-    $("modal").classList.add("on");
-    loadKeys();
-  } catch (e) { toast(e.message, "err"); }
-};
-window.editKey = async id => {
-  const k = cache.keys.find(x => x.ID === id);
-  if (!k) return;
-  if (!cache.groups.length) { try { cache.groups = (await apiJSON("/admin/api/groups")).data || []; } catch {} }
-  let groupIds = [];
-  try { groupIds = (await apiJSON("/admin/api/keys/" + id + "/groups")).data || []; } catch {}
-  const items = cache.groups.filter(g => g.Enabled).map(g => ({ id: g.ID, label: g.Name }));
-  openEdit(`编辑客户端 Key #${id}`, `
-    <div class="form-grid">
-      <div class="field"><label>名称</label><input id="ek-name" value="${esc(k.Name)}"></div>
-      <div class="field"><label>最大并发</label><input id="ek-conc" type="number" min="1" value="${k.ConcurrencyLimit}"></div>
-      <div class="field"><label>总 Token 限额（留空保持原值）</label><input id="ek-token" type="number" min="0" value="${k.TokenLimit ?? ""}"></div>
-      <div class="field"><label>总金额限额（元，留空保持原值）</label><input id="ek-money" type="number" step="0.01" min="0" value="${k.AmountLimitMicroyuan == null ? "" : k.AmountLimitMicroyuan / 1e6}"></div>
-    </div>
-    <div class="field" style="margin-top:12px"><label>授权模型组</label>${checkListHTML(items, groupIds, "暂无模型组，请先创建")}</div>
-    <label class="switch-row" style="margin-top:4px"><label class="switch"><input id="ek-enabled" type="checkbox" ${k.Enabled ? "checked" : ""}><span class="track"></span></label>启用该 Key</label>
-  `, async () => {
-    const conc = Number($("ek-conc").value);
-    const body = { name: $("ek-name").value.trim(), enabled: $("ek-enabled").checked, concurrency_limit: conc > 0 ? conc : 1 };
-    if ($("ek-token").value !== "") body.token_limit_total = Number($("ek-token").value);
-    if ($("ek-money").value !== "") body.money_limit_yuan_total = Number($("ek-money").value);
-    await apiJSON("/admin/api/keys/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    await apiJSON("/admin/api/keys/" + id + "/groups", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_ids: checkedIds($("edit-body")) }) });
-    loadKeys();
-  });
-};
 window.toggleKey = async (id, el) => {
-  try { await apiJSON("/admin/api/keys/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: el.checked }) }); toast(el.checked ? "Key 已启用" : "Key 已停用", "ok"); }
+  try { await apiJSON("/admin/api/keys/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Enabled: el.checked }) }); toast(el.checked ? "Key 已启用" : "Key 已停用", "ok"); }
   catch (e) { el.checked = !el.checked; toast(e.message, "err"); }
 };
 $("key-form").onsubmit = async e => {
@@ -769,7 +545,7 @@ $("copy-token").onclick = async () => {
   try { await navigator.clipboard.writeText($("modal-token").textContent); toast("已复制到剪贴板", "ok"); }
   catch { const r = document.createRange(); r.selectNodeContents($("modal-token")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); toast("请按 Ctrl+C 复制"); }
 };
-$("modal-close").onclick = () => { $("modal").classList.remove("on"); $("modal-token").textContent = ""; };
+$("modal-close").onclick = () => $("modal").classList.remove("on");
 
 /* ── 请求日志 ── */
 async function loadRequests() {

@@ -143,3 +143,84 @@ func TestAtomicJoinReplacementOnlyChangesPassedRows(t *testing.T) {
 		t.Fatalf("models = %#v, err = %v", models, err)
 	}
 }
+
+func TestGroupRateMultiplierPersistenceAndKeyModelRate(t *testing.T) {
+	ctx := context.Background()
+	repo := newTestStore(t)
+	provider, err := repo.CreateProvider(ctx, NewProvider{Name: "p", BaseURL: "http://localhost:1", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	price := int64(1000)
+	m, err := repo.CreateModel(ctx, NewModel{ProviderID: provider.ID, PublicName: "m", UpstreamName: "m", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cheap, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "cheap", Enabled: true, RateMilli: 800})
+	if err != nil {
+		t.Fatal(err)
+	}
+	premium, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "premium", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cheap.RateMilli != 800 || premium.RateMilli != DefaultGroupRateMilli {
+		t.Fatalf("rates = %d, %d", cheap.RateMilli, premium.RateMilli)
+	}
+	if _, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "bad", RateMilli: -1}); err == nil {
+		t.Fatal("negative rate accepted")
+	}
+	for _, gid := range []int64{cheap.ID, premium.ID} {
+		if err := repo.ReplaceGroupModels(ctx, gid, []int64{m.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated, err := repo.UpdateModelGroup(ctx, premium.ID, UpdateModelGroup{RateMilli: intPtr(1500)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.RateMilli != 1500 {
+		t.Fatalf("updated rate = %d", updated.RateMilli)
+	}
+	// 单个 key 同时属于两个分组：取最大倍率
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceKeyGroups(ctx, key.ID, []int64{cheap.ID, premium.ID}); err != nil {
+		t.Fatal(err)
+	}
+	rate, err := repo.KeyModelRateMilli(ctx, key.ID, m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate != 1500 {
+		t.Fatalf("rate = %d, want 1500", rate)
+	}
+	// 禁用分组不参与倍率
+	if _, err := repo.UpdateModelGroup(ctx, premium.ID, UpdateModelGroup{Enabled: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	rate, err = repo.KeyModelRateMilli(ctx, key.ID, m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate != 800 {
+		t.Fatalf("rate after disable = %d, want 800", rate)
+	}
+	// 无分组的模型回落默认倍率
+	other, err := repo.CreateModel(ctx, NewModel{ProviderID: provider.ID, PublicName: "m2", UpstreamName: "m2", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rate, err = repo.KeyModelRateMilli(ctx, key.ID, other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate != DefaultGroupRateMilli {
+		t.Fatalf("fallback rate = %d", rate)
+	}
+}
+
+func intPtr(v int64) *int64 { return &v }
+func boolPtr(v bool) *bool  { return &v }

@@ -110,6 +110,18 @@ var migrations = []migration{
 		`CREATE INDEX idx_key_reservations_request ON key_reservations(request_id)`,
 		`CREATE INDEX idx_requests_billing_date ON requests(billing_date_bj, created_at_utc)`,
 	}},
+	{version: 3, statements: []string{
+		`ALTER TABLE model_groups ADD COLUMN rate_milli INTEGER NOT NULL DEFAULT 1000 CHECK (rate_milli > 0)`,
+	}},
+	{version: 4, statements: []string{
+		`ALTER TABLE client_keys ADD COLUMN token_label TEXT NOT NULL DEFAULT ''`,
+	}},
+	{version: 5, statements: []string{
+		`UPDATE client_keys SET token_label = 'key-' || lower(hex(randomblob(4))) WHERE token_label = ''`,
+	}},
+	{version: 6, statements: []string{
+		`ALTER TABLE client_keys ADD COLUMN token_hint TEXT NOT NULL DEFAULT ''`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

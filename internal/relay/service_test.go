@@ -113,3 +113,36 @@ func TestLeaseCloseIsIdempotent(t *testing.T) {
 		t.Fatal("leases leaked")
 	}
 }
+
+func TestBeginAppliesGroupRateMultiplier(t *testing.T) {
+	client := &fakeClient{}
+	service, repo, key := serviceFixture(t, client)
+	ctx := context.Background()
+	groups, err := repo.ListModelGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateModelGroup(ctx, groups[0].ID, store.UpdateModelGroup{RateMilli: &[]int64{2500}[0]}); err != nil {
+		t.Fatal(err)
+	}
+	lease, model, err := service.Begin(ctx, Request{Token: key.Token, Model: "public-model", MaxTokens: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close(ctx, Outcome{Status: "aborted"}) })
+	// 模型单价 1000 microyuan/M，分组倍率 2.5x → 2500
+	if model.InputPriceMicroyuan == nil || *model.InputPriceMicroyuan != 2500 {
+		t.Fatalf("input price = %v", model.InputPriceMicroyuan)
+	}
+	if model.OutputPriceMicroyuan == nil || *model.OutputPriceMicroyuan != 2500 {
+		t.Fatalf("output price = %v", model.OutputPriceMicroyuan)
+	}
+	// 数据库中的原始定价不被改写
+	stored, err := repo.GetModel(ctx, model.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *stored.InputPriceMicroyuan != 1000 {
+		t.Fatalf("stored price mutated: %d", *stored.InputPriceMicroyuan)
+	}
+}
