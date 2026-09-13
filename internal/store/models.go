@@ -9,31 +9,34 @@ import (
 )
 
 type Model struct {
-	ID                   int64
-	ProviderID           int64
-	PublicName           string
-	UpstreamName         string
-	InputPriceMicroyuan  *int64
-	OutputPriceMicroyuan *int64
-	Enabled              bool
+	ID                        int64
+	ProviderID                int64
+	PublicName                string
+	UpstreamName              string
+	InputPriceMicroyuan       *int64
+	OutputPriceMicroyuan      *int64
+	CachedInputPriceMicroyuan *int64 // 缓存命中输入单价；nil 表示按普通输入价计费
+	Enabled                   bool
 }
 
 type NewModel struct {
-	ProviderID           int64
-	PublicName           string
-	UpstreamName         string
-	InputPriceMicroyuan  *int64
-	OutputPriceMicroyuan *int64
-	Enabled              bool
+	ProviderID                int64
+	PublicName                string
+	UpstreamName              string
+	InputPriceMicroyuan       *int64
+	OutputPriceMicroyuan      *int64
+	CachedInputPriceMicroyuan *int64
+	Enabled                   bool
 }
 
 type UpdateModel struct {
-	ProviderID           *int64
-	PublicName           string
-	UpstreamName         string
-	InputPriceMicroyuan  *int64
-	OutputPriceMicroyuan *int64
-	Enabled              *bool
+	ProviderID                *int64
+	PublicName                string
+	UpstreamName              string
+	InputPriceMicroyuan       *int64
+	OutputPriceMicroyuan      *int64
+	CachedInputPriceMicroyuan *int64
+	Enabled                   *bool
 }
 
 type ModelGroup struct {
@@ -84,9 +87,12 @@ func (s *Store) CreateModel(ctx context.Context, in NewModel) (Model, error) {
 	if err := validatePrice(in.OutputPriceMicroyuan); err != nil {
 		return Model{}, err
 	}
+	if err := validatePrice(in.CachedInputPriceMicroyuan); err != nil {
+		return Model{}, err
+	}
 	name, upstream := strings.TrimSpace(in.PublicName), strings.TrimSpace(in.UpstreamName)
 	now := nowUTC()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO models(provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?)`, in.ProviderID, name, upstream, in.InputPriceMicroyuan, in.OutputPriceMicroyuan, boolInt(in.Enabled), now, now)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO models(provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?)`, in.ProviderID, name, upstream, in.InputPriceMicroyuan, in.OutputPriceMicroyuan, in.CachedInputPriceMicroyuan, boolInt(in.Enabled), now, now)
 	if err != nil {
 		return Model{}, err
 	}
@@ -94,18 +100,18 @@ func (s *Store) CreateModel(ctx context.Context, in NewModel) (Model, error) {
 	if err != nil {
 		return Model{}, err
 	}
-	return Model{ID: id, ProviderID: in.ProviderID, PublicName: name, UpstreamName: upstream, InputPriceMicroyuan: in.InputPriceMicroyuan, OutputPriceMicroyuan: in.OutputPriceMicroyuan, Enabled: in.Enabled}, nil
+	return Model{ID: id, ProviderID: in.ProviderID, PublicName: name, UpstreamName: upstream, InputPriceMicroyuan: in.InputPriceMicroyuan, OutputPriceMicroyuan: in.OutputPriceMicroyuan, CachedInputPriceMicroyuan: in.CachedInputPriceMicroyuan, Enabled: in.Enabled}, nil
 }
 
 func (s *Store) UpdateModel(ctx context.Context, id int64, in UpdateModel) (Model, error) {
 	var m Model
 	var enabled int
-	var input, output sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled FROM models WHERE id=?`, id).Scan(&m.ProviderID, &m.PublicName, &m.UpstreamName, &input, &output, &enabled); err != nil {
+	var input, output, cached sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled FROM models WHERE id=?`, id).Scan(&m.ProviderID, &m.PublicName, &m.UpstreamName, &input, &output, &cached, &enabled); err != nil {
 		return Model{}, err
 	}
 	m.ID = id
-	m.InputPriceMicroyuan, m.OutputPriceMicroyuan = nullableInt(input), nullableInt(output)
+	m.InputPriceMicroyuan, m.OutputPriceMicroyuan, m.CachedInputPriceMicroyuan = nullableInt(input), nullableInt(output), nullableInt(cached)
 	m.Enabled = enabled == 1
 	if in.ProviderID != nil {
 		if *in.ProviderID <= 0 {
@@ -131,22 +137,29 @@ func (s *Store) UpdateModel(ctx context.Context, id int64, in UpdateModel) (Mode
 		}
 		m.OutputPriceMicroyuan = in.OutputPriceMicroyuan
 	}
+	if in.CachedInputPriceMicroyuan != nil {
+		if err := validatePrice(in.CachedInputPriceMicroyuan); err != nil {
+			return Model{}, err
+		}
+		m.CachedInputPriceMicroyuan = in.CachedInputPriceMicroyuan
+	}
 	if in.Enabled != nil {
 		m.Enabled = *in.Enabled
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE models SET provider_id=?,public_name=?,upstream_name=?,input_price_microyuan=?,output_price_microyuan=?,enabled=?,updated_at_utc=? WHERE id=?`, m.ProviderID, m.PublicName, m.UpstreamName, m.InputPriceMicroyuan, m.OutputPriceMicroyuan, boolInt(m.Enabled), nowUTC(), id); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE models SET provider_id=?,public_name=?,upstream_name=?,input_price_microyuan=?,output_price_microyuan=?,cached_input_price_microyuan=?,enabled=?,updated_at_utc=? WHERE id=?`, m.ProviderID, m.PublicName, m.UpstreamName, m.InputPriceMicroyuan, m.OutputPriceMicroyuan, m.CachedInputPriceMicroyuan, boolInt(m.Enabled), nowUTC(), id); err != nil {
 		return Model{}, err
 	}
 	return m, nil
 }
 
 func (s *Store) ListModels(ctx context.Context) ([]Model, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled FROM models ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled FROM models ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Model
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]Model, 0)
 	for rows.Next() {
 		m, err := scanModel(rows)
 		if err != nil {
@@ -158,12 +171,12 @@ func (s *Store) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 func (s *Store) GetModel(ctx context.Context, id int64) (Model, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled FROM models WHERE id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled FROM models WHERE id=?`, id)
 	return scanModel(row)
 }
 
 func (s *Store) GetModelByPublicName(ctx context.Context, name string) (Model, error) {
-	return scanModel(s.db.QueryRowContext(ctx, "SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,enabled FROM models WHERE public_name=?", name))
+	return scanModel(s.db.QueryRowContext(ctx, "SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled FROM models WHERE public_name=?", name))
 }
 
 // DeleteModel removes a model. Group memberships and reservations cascade;
@@ -215,12 +228,12 @@ type scanner interface{ Scan(...any) error }
 
 func scanModel(src scanner) (Model, error) {
 	var m Model
-	var input, output sql.NullInt64
+	var input, output, cached sql.NullInt64
 	var enabled int
-	if err := src.Scan(&m.ID, &m.ProviderID, &m.PublicName, &m.UpstreamName, &input, &output, &enabled); err != nil {
+	if err := src.Scan(&m.ID, &m.ProviderID, &m.PublicName, &m.UpstreamName, &input, &output, &cached, &enabled); err != nil {
 		return Model{}, err
 	}
-	m.InputPriceMicroyuan, m.OutputPriceMicroyuan, m.Enabled = nullableInt(input), nullableInt(output), enabled == 1
+	m.InputPriceMicroyuan, m.OutputPriceMicroyuan, m.CachedInputPriceMicroyuan, m.Enabled = nullableInt(input), nullableInt(output), nullableInt(cached), enabled == 1
 	return m, nil
 }
 func nullableInt(v sql.NullInt64) *int64 {
@@ -289,7 +302,8 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ModelGroup
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]ModelGroup, 0)
 	for rows.Next() {
 		var g ModelGroup
 		var enabled int
@@ -302,18 +316,21 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 	return out, rows.Err()
 }
 
-// GroupModelIDs returns the model IDs currently assigned to a group, ordered
-// by model ID. Used by the administration console to prefill group editing.
-func (s *Store) GroupModelIDs(ctx context.Context, groupID int64) ([]int64, error) {
+// GroupProviderIDs returns the provider (channel) IDs currently assigned to a
+// group, ordered by provider ID. Used by the administration console to prefill
+// group editing. A group manages providers; authorized models are derived from
+// the providers it contains.
+func (s *Store) GroupProviderIDs(ctx context.Context, groupID int64) ([]int64, error) {
 	if groupID <= 0 {
 		return nil, errors.New("group ID is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT model_id FROM group_models WHERE group_id=? ORDER BY model_id`, groupID)
+	rows, err := s.db.QueryContext(ctx, `SELECT provider_id FROM group_providers WHERE group_id=? ORDER BY provider_id`, groupID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []int64
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]int64, 0)
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
@@ -324,7 +341,7 @@ func (s *Store) GroupModelIDs(ctx context.Context, groupID int64) ([]int64, erro
 	return out, rows.Err()
 }
 
-func (s *Store) ReplaceGroupModels(ctx context.Context, groupID int64, modelIDs []int64) error {
+func (s *Store) ReplaceGroupProviders(ctx context.Context, groupID int64, providerIDs []int64) error {
 	if groupID <= 0 {
 		return errors.New("group ID is required")
 	}
@@ -340,29 +357,28 @@ func (s *Store) ReplaceGroupModels(ctx context.Context, groupID int64, modelIDs 
 	if groupEnabled != 1 {
 		return errors.New("model group is disabled")
 	}
-	seen := make(map[int64]struct{}, len(modelIDs))
-	for _, id := range modelIDs {
+	seen := make(map[int64]struct{}, len(providerIDs))
+	for _, id := range providerIDs {
 		if id <= 0 {
-			return errors.New("invalid model ID")
+			return errors.New("invalid provider ID")
 		}
 		if _, ok := seen[id]; ok {
-			return errors.New("duplicate model ID")
+			return errors.New("duplicate provider ID")
 		}
 		seen[id] = struct{}{}
 		var enabled int
-		var input, output sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT enabled,input_price_microyuan,output_price_microyuan FROM models WHERE id=?`, id).Scan(&enabled, &input, &output); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT enabled FROM providers WHERE id=?`, id).Scan(&enabled); err != nil {
 			return err
 		}
-		if enabled != 1 || !input.Valid || !output.Valid {
-			return fmt.Errorf("model %d is disabled or unpriced", id)
+		if enabled != 1 {
+			return fmt.Errorf("provider %d is disabled", id)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM group_models WHERE group_id=?`, groupID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM group_providers WHERE group_id=?`, groupID); err != nil {
 		return err
 	}
-	for _, id := range modelIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO group_models(group_id,model_id) VALUES (?,?)`, groupID, id); err != nil {
+	for _, id := range providerIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO group_providers(group_id,provider_id) VALUES (?,?)`, groupID, id); err != nil {
 			return err
 		}
 	}

@@ -10,13 +10,17 @@ import (
 	"strings"
 
 	"civic-ai-relay/internal/relay"
-	"civic-ai-relay/internal/store"
 	"civic-ai-relay/internal/upstream"
 )
 
 type PublicHandler struct {
 	service      *relay.Service
 	maxBodyBytes int64
+	// admission 在接受公共对话请求前调用（如 RSS 软保护），非 nil 且返回
+	// 错误时以 503 拒绝；管理端不受影响。
+	admission func() error
+	// streamAdmission 在流式转发过程中周期调用，超限时中止流并按 aborted 结算。
+	streamAdmission func() error
 }
 
 func NewPublicHandler(service *relay.Service, maxBodyBytes int64) http.Handler {
@@ -24,10 +28,36 @@ func NewPublicHandler(service *relay.Service, maxBodyBytes int64) http.Handler {
 		maxBodyBytes = 8 * 1024 * 1024
 	}
 	h := &PublicHandler{service: service, maxBodyBytes: maxBodyBytes}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/models", h.models)
-	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
-	return mux
+	return h
+}
+
+// SetAdmission 注册请求准入检查（例如 memory.Guard.PublicAdmission）。
+func (h *PublicHandler) SetAdmission(fn func() error) { h.admission = fn }
+
+// SetStreamAdmission 注册流式过程中的周期检查（例如 memory.Guard.StreamContinue）。
+func (h *PublicHandler) SetStreamAdmission(fn func() error) { h.streamAdmission = fn }
+
+// ServeHTTP normalizes the request path before dispatching. Both
+// "/v1/chat/completions" and the variants clients actually send in the wild
+// (double "/v1" prefix, missing prefix, trailing slash) reach the same handler.
+func (h *PublicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	path = strings.TrimPrefix(path, "/v1")
+	path = strings.TrimPrefix(path, "/v1") // 客户端 Base URL 已带 /v1 时会拼出双重前缀
+	switch path {
+	case "/models":
+		h.models(w, r)
+	case "/chat/completions":
+		h.chatCompletions(w, r)
+	case "/responses":
+		h.responsesAPI(w, r)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{
+			"message": "unsupported endpoint " + r.URL.Path + ": use /v1/chat/completions or /v1/responses (POST) or /v1/models (GET)",
+			"type":    "relay_error",
+			"code":    "not_found",
+		}})
+	}
 }
 
 func bearer(r *http.Request) string {
@@ -70,12 +100,18 @@ func (h *PublicHandler) chatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnauthorized, "invalid_api_key")
 		return
 	}
+	if h.admission != nil {
+		if err := h.admission(); err != nil {
+			writeErrorDetail(w, http.StatusServiceUnavailable, "memory_limit_exceeded", err.Error())
+			return
+		}
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
 	var payload map[string]any
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
 	if err := decoder.Decode(&payload); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request")
+		writeErrorDetail(w, http.StatusBadRequest, "invalid_request", "request body is not valid JSON: "+err.Error())
 		return
 	}
 	model, _ := payload["model"].(string)
@@ -118,7 +154,8 @@ func (h *PublicHandler) stream(w http.ResponseWriter, r *http.Request, req relay
 	scanner := bufio.NewScanner(response.Body)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	outputChars := int64(0)
-	inputTokens, outputTokens := int64(0), int64(0)
+	lines := 0
+	var usageEvent upstream.Usage
 	amount := int64(0)
 	status := "completed"
 	for scanner.Scan() {
@@ -133,36 +170,27 @@ func (h *PublicHandler) stream(w http.ResponseWriter, r *http.Request, req relay
 		event := upstream.ParseEvent([]byte(line + "\n\n"))
 		outputChars += int64(event.OutputCharacters)
 		if event.Usage.TotalTokens > 0 {
-			inputTokens = int64(event.Usage.PromptTokens)
-			outputTokens = int64(event.Usage.CompletionTokens)
+			usageEvent = event.Usage
 		}
+		if h.streamAdmission != nil && lines%256 == 255 {
+			if err := h.streamAdmission(); err != nil {
+				status = "aborted"
+				break
+			}
+		}
+		lines++
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		status = "failed"
 	}
-	if outputTokens == 0 && outputChars > 0 {
-		outputTokens = (outputChars + 1) / 2
+	if usageEvent.TotalTokens == 0 && outputChars > 0 {
+		// Upstream never reported usage; estimate output tokens from
+		// streamed characters so quota and ledger still record something.
+		usageEvent = upstream.Usage{PromptTokens: int(usageEvent.PromptTokens), CompletionTokens: int((outputChars + 1) / 2), TotalTokens: int(outputChars)}
 	}
-	amount = priceForStream(model, inputTokens, outputTokens)
-	_ = lease.Close(r.Context(), relay.Outcome{Status: status, InputTokens: inputTokens, OutputTokens: outputTokens, AmountMicroyuan: amount, HTTPStatus: 200})
-}
-
-func priceForStream(model store.Model, inputTokens, outputTokens int64) int64 {
-	inputPrice, outputPrice := int64(0), int64(0)
-	if model.InputPriceMicroyuan != nil {
-		inputPrice = *model.InputPriceMicroyuan
-	}
-	if model.OutputPriceMicroyuan != nil {
-		outputPrice = *model.OutputPriceMicroyuan
-	}
-	return pricePartHTTP(inputTokens, inputPrice) + pricePartHTTP(outputTokens, outputPrice)
-}
-
-func pricePartHTTP(tokens, price int64) int64 {
-	if tokens <= 0 || price <= 0 {
-		return 0
-	}
-	return (tokens*price + 999999) / 1000000
+	amount = relay.PriceUsage(usageEvent, model)
+	_ = lease.Close(r.Context(), relay.Outcome{Status: status, InputTokens: int64(usageEvent.PromptTokens), OutputTokens: int64(usageEvent.CompletionTokens), CachedInputTokens: int64(usageEvent.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: 200})
+	return
 }
 
 func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
@@ -182,7 +210,7 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 			status, code = http.StatusBadGateway, upstreamErr.Code
 		}
 	}
-	writeError(w, status, code)
+	writeErrorDetail(w, status, code, err.Error())
 }
 
 func boolValue(value any) bool { result, _ := value.(bool); return result }

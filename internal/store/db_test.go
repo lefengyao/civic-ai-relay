@@ -30,7 +30,7 @@ func TestOpenInitializesWALAndSchema(t *testing.T) {
 	if got := db.JournalMode(context.Background()); got != "wal" {
 		t.Fatalf("journal_mode = %q", got)
 	}
-	for _, table := range []string{"providers", "models", "model_groups", "group_models", "client_keys", "key_groups", "key_reservations", "requests"} {
+	for _, table := range []string{"providers", "models", "model_groups", "group_providers", "client_keys", "key_groups", "key_reservations", "requests"} {
 		var count int
 		if err := db.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
 			t.Fatal(err)

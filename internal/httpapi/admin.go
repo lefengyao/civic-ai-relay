@@ -23,11 +23,22 @@ type AdminHandler struct {
 	mu       sync.RWMutex
 	adminKey string
 	settings config.Settings
+	// configPath 非空时，管理端保存的设置会原子写回 relay.env（重启不丢）。
+	configPath string
+	// onSettingsChange 在设置验证通过并持久化后同步调用，用于把新值热应用到
+	// 运行中的服务（并发闸门、配额、输出上限等），无需重启进程。
+	onSettingsChange func(config.Settings)
 }
 
-func NewAdminHandler(repo *store.Store, service *relay.Service, settings config.Settings, adminKey string) http.Handler {
+func NewAdminHandler(repo *store.Store, service *relay.Service, settings config.Settings, adminKey string) *AdminHandler {
 	return &AdminHandler{repo: repo, service: service, settings: settings, adminKey: adminKey}
 }
+
+// SetConfigPersistence 启用设置持久化：保存时原子写回该 env 文件。
+func (h *AdminHandler) SetConfigPersistence(path string) { h.configPath = path }
+
+// SetSettingsListener 注册设置热应用回调（例如 config.Source.Set）。
+func (h *AdminHandler) SetSettingsListener(fn func(config.Settings)) { h.onSettingsChange = fn }
 
 func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/admin" || r.URL.Path == "/admin/" {
@@ -175,8 +186,18 @@ func (h *AdminHandler) configSave(w http.ResponseWriter, r *http.Request, valida
 		}
 	}
 	if !validateOnly {
+		// 先持久化再热应用：写盘失败时保持旧设置生效，避免"内存已改、重启即失"。
+		if h.configPath != "" {
+			if err := config.NewStore(h.configPath).Write(next); err != nil {
+				writeAdminError(w, 500, "config_persist_failed")
+				return
+			}
+		}
 		h.settings = next
 		h.adminKey = next.AdminAPIKey
+		if h.onSettingsChange != nil {
+			h.onSettingsChange(next)
+		}
 	}
 	writeJSON(w, 200, map[string]any{"valid": true, "changed_fields": changed, "pending_restart_fields": pending, "settings": safeSettings(next)})
 }
@@ -257,9 +278,12 @@ type modelPayload struct {
 	UpstreamName     string   `json:"upstream_name"`
 	InputPrice       *float64 `json:"input_price"`
 	OutputPrice      *float64 `json:"output_price"`
+	CachedInputPrice *float64 `json:"cached_input_price"`
 	InputPriceMicro  *int64   `json:"input_price_microyuan"`
 	OutputPriceMicro *int64   `json:"output_price_microyuan"`
-	Enabled          bool     `json:"enabled"`
+	CachedInputMicro *int64   `json:"cached_input_price_microyuan"`
+	// Enabled 为指针：nil 表示保持原值，部分更新（如只改价格）不会误停用
+	Enabled *bool `json:"enabled"`
 }
 
 func microPrice(value *float64, direct *int64) *int64 {
@@ -366,7 +390,8 @@ func (h *AdminHandler) modelCreate(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
-	value, err := h.repo.CreateModel(r.Context(), store.NewModel{ProviderID: p.ProviderID, PublicName: p.PublicName, UpstreamName: p.UpstreamName, InputPriceMicroyuan: microPrice(p.InputPrice, p.InputPriceMicro), OutputPriceMicroyuan: microPrice(p.OutputPrice, p.OutputPriceMicro), Enabled: p.Enabled})
+	// 创建时 enabled 缺省视为启用
+	value, err := h.repo.CreateModel(r.Context(), store.NewModel{ProviderID: p.ProviderID, PublicName: p.PublicName, UpstreamName: p.UpstreamName, InputPriceMicroyuan: microPrice(p.InputPrice, p.InputPriceMicro), OutputPriceMicroyuan: microPrice(p.OutputPrice, p.OutputPriceMicro), CachedInputPriceMicroyuan: microPrice(p.CachedInputPrice, p.CachedInputMicro), Enabled: p.Enabled == nil || *p.Enabled})
 	if err != nil {
 		writeAdminError(w, 400, "model_invalid")
 		return
@@ -404,7 +429,7 @@ func (h *AdminHandler) modelItem(w http.ResponseWriter, r *http.Request, rawID s
 	if p.ProviderID > 0 {
 		provider = &p.ProviderID
 	}
-	value, err := h.repo.UpdateModel(r.Context(), id, store.UpdateModel{ProviderID: provider, PublicName: p.PublicName, UpstreamName: p.UpstreamName, InputPriceMicroyuan: microPrice(p.InputPrice, p.InputPriceMicro), OutputPriceMicroyuan: microPrice(p.OutputPrice, p.OutputPriceMicro), Enabled: &p.Enabled})
+	value, err := h.repo.UpdateModel(r.Context(), id, store.UpdateModel{ProviderID: provider, PublicName: p.PublicName, UpstreamName: p.UpstreamName, InputPriceMicroyuan: microPrice(p.InputPrice, p.InputPriceMicro), OutputPriceMicroyuan: microPrice(p.OutputPrice, p.OutputPriceMicro), CachedInputPriceMicroyuan: microPrice(p.CachedInputPrice, p.CachedInputMicro), Enabled: p.Enabled})
 	if err != nil {
 		writeAdminError(w, 400, "model_invalid")
 		return
@@ -414,10 +439,10 @@ func (h *AdminHandler) modelItem(w http.ResponseWriter, r *http.Request, rawID s
 
 func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 	var p struct {
-		Name      string   `json:"name"`
-		Rate      *float64 `json:"rate"`
-		RateMilli *int64   `json:"rate_milli"`
-		ModelIDs  []int64  `json:"model_ids"`
+		Name        string   `json:"name"`
+		Rate        *float64 `json:"rate"`
+		RateMilli   *int64   `json:"rate_milli"`
+		ProviderIDs []int64  `json:"provider_ids"`
 	}
 	if json.NewDecoder(r.Body).Decode(&p) != nil {
 		writeAdminError(w, 400, "invalid_request")
@@ -425,7 +450,7 @@ func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	g, err := h.repo.CreateModelGroup(r.Context(), store.NewModelGroup{Name: p.Name, RateMilli: rateMilli(p.Rate, p.RateMilli)})
 	if err == nil {
-		err = h.repo.ReplaceGroupModels(r.Context(), g.ID, p.ModelIDs)
+		err = h.repo.ReplaceGroupProviders(r.Context(), g.ID, p.ProviderIDs)
 	}
 	if err != nil {
 		writeAdminError(w, 400, "group_invalid")
@@ -488,9 +513,18 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 		writeJSON(w, 200, map[string]any{"data": g})
 		return
 	}
-	if len(parts) == 2 && parts[1] == "models" {
+	if len(parts) == 2 && parts[1] == "overview" && r.Method == http.MethodGet {
+		data, err := h.repo.GroupOverview(r.Context(), id, time.Now().UTC())
+		if err != nil {
+			writeAdminError(w, 500, "ledger_unavailable")
+			return
+		}
+		writeJSON(w, 200, data)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "providers" {
 		if r.Method == http.MethodGet {
-			ids, err := h.repo.GroupModelIDs(r.Context(), id)
+			ids, err := h.repo.GroupProviderIDs(r.Context(), id)
 			if err != nil {
 				writeAdminError(w, 400, "group_invalid")
 				return
@@ -500,13 +534,13 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 		}
 		if r.Method == http.MethodPut {
 			var p struct {
-				ModelIDs []int64 `json:"model_ids"`
+				ProviderIDs []int64 `json:"provider_ids"`
 			}
 			if json.NewDecoder(r.Body).Decode(&p) != nil {
 				writeAdminError(w, 400, "invalid_request")
 				return
 			}
-			if err := h.repo.ReplaceGroupModels(r.Context(), id, p.ModelIDs); err != nil {
+			if err := h.repo.ReplaceGroupProviders(r.Context(), id, p.ProviderIDs); err != nil {
 				writeAdminError(w, 400, "group_invalid")
 				return
 			}

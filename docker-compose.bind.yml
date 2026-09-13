@@ -1,0 +1,28 @@
+# 覆盖文件：把配置与数据库放到宿主机目录，而不是 Docker 命名卷。
+# 适合需要直接备份/审计文件、或用外部工具读取 relay.db 的场景。
+#
+#   # Linux / macOS
+#   export CIVIC_RELAY_CONFIG_DIR=/srv/civic-relay/config
+#   export CIVIC_RELAY_DATA_DIR=/srv/civic-relay/data
+#   sudo mkdir -p "$CIVIC_RELAY_CONFIG_DIR" "$CIVIC_RELAY_DATA_DIR"
+#   # 容器以非 root 的 UID 65532 运行，宿主目录必须归它所有，
+#   # 否则首次启动无法写入 relay.env 与 relay.db。
+#   sudo chown -R 65532:65532 "$CIVIC_RELAY_CONFIG_DIR" "$CIVIC_RELAY_DATA_DIR"
+#   docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d --build
+#
+#   # Windows (Docker Desktop)：绑定 Windows 目录由 Desktop 处理属主，无需 chown
+#   $env:CIVIC_RELAY_CONFIG_DIR = "D:\CivicRelay\config"
+#   $env:CIVIC_RELAY_DATA_DIR   = "D:\CivicRelay\data"
+#   docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d --build
+#
+# 注意：切换卷类型不会自动搬迁数据。从命名卷换到绑定卷前，先导出旧数据
+# （docker compose cp civic-relay:/app/data/relay.db ./relay.db 等）。
+#
+# 另一个必须一起备份的是 RELAY_ENCRYPTION_KEY（在 relay.env 内）：
+# 它用于加密渠道密钥，一旦丢失，数据库里的上游 Key 将无法解密。
+
+services:
+  civic-relay:
+    volumes:
+      - ${CIVIC_RELAY_CONFIG_DIR:?请设置 CIVIC_RELAY_CONFIG_DIR 指向宿主机目录}:/app/config
+      - ${CIVIC_RELAY_DATA_DIR:?请设置 CIVIC_RELAY_DATA_DIR 指向宿主机目录}:/app/data

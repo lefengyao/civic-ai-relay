@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"civic-ai-relay/internal/config"
 	"civic-ai-relay/internal/secret"
@@ -146,3 +147,54 @@ func TestAdminDeleteRoutes(t *testing.T) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
+	raw := make([]byte, 32)
+	box, err := secret.New(base64.StdEncoding.EncodeToString(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := store.Open(filepath.Join(t.TempDir(), "relay.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	envPath := filepath.Join(t.TempDir(), "relay.env")
+	settings := config.Settings{AdminAPIKey: "admin-key", EncryptionKey: base64.StdEncoding.EncodeToString(raw), Host: "127.0.0.1", Port: 8000, DBPath: "data/relay.db", LogLevel: "INFO", RPMLimit: 30, TokenLimit5H: 1000, TokenLimitDaily: 1000, GlobalConcurrencyLimit: 1, MemoryLimitMB: 200, MaxOutputTokens: 64, RetentionDays: 7,
+		MaxBodyBytes: 8 << 20, MaxStreamDuration: time.Minute, ConnectTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, PoolTimeout: time.Second, ModelSyncInterval: time.Minute}
+	if err := config.NewStore(envPath).Write(settings); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAdminHandler(repo, nil, settings, settings.AdminAPIKey)
+	handler.SetConfigPersistence(envPath)
+	applied := make(chan config.Settings, 1)
+	handler.SetSettingsListener(func(s config.Settings) { applied <- s })
+
+	// 修改一个运行时参数（非重启项）：应持久化并热应用
+	save := adminRequest(t, handler, http.MethodPut, "/admin/api/config", settings.AdminAPIKey,
+		map[string]any{"settings": map[string]string{"TOKEN_LIMIT_DAILY": "999999"}})
+	if save.Code != http.StatusOK {
+		t.Fatal(save.Body.String())
+	}
+	select {
+	case got := <-applied:
+		if got.TokenLimitDaily != 999999 {
+			t.Fatalf("applied TokenLimitDaily = %d", got.TokenLimitDaily)
+		}
+	default:
+		t.Fatal("settings listener was not notified")
+	}
+	// 持久化校验：重读 env 文件应包含新值
+	stored, err := config.NewStore(envPath).ReadMapping()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored["TOKEN_LIMIT_DAILY"] != "999999" {
+		t.Fatalf("persisted TOKEN_LIMIT_DAILY = %q", stored["TOKEN_LIMIT_DAILY"])
+	}
+	// GET 返回的也是新值
+	get := adminRequest(t, handler, http.MethodGet, "/admin/api/config", settings.AdminAPIKey, nil)
+	if !strings.Contains(get.Body.String(), "999999") {
+		t.Fatal(get.Body.String())
+	}
+}

@@ -72,10 +72,8 @@ func (s *Store) CreateClientKey(ctx context.Context, in NewClientKey) (ClientKey
 		return ClientKey{}, err
 	}
 	label, hint := tokenLabel(), tokenHint(token)
+	// 客户端 Key 一律以启用状态创建；停用通过 UpdateClientKey 显式操作。
 	enabled := 1
-	if in.Enabled {
-		enabled = 1
-	}
 	now := nowUTC()
 	result, err := s.db.ExecContext(ctx, `INSERT INTO client_keys(name,token_digest,token_label,token_hint,enabled,concurrency_limit,token_limit,amount_limit_microyuan,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?)`, name, s.box.DigestBytes(token), label, hint, enabled, in.ConcurrencyLimit, in.TokenLimit, in.AmountLimitMicroyuan, now, now)
 	if err != nil {
@@ -199,7 +197,8 @@ func (s *Store) ListClientKeys(ctx context.Context) ([]ClientKey, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ClientKey
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]ClientKey, 0)
 	for rows.Next() {
 		k, err := scanClientKey(rows)
 		if err != nil {
@@ -320,7 +319,8 @@ func (s *Store) KeyGroupIDs(ctx context.Context, keyID int64) ([]int64, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []int64
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]int64, 0)
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
@@ -377,14 +377,14 @@ func (s *Store) ReplaceKeyGroups(ctx context.Context, keyID int64, groupIDs []in
 
 // KeyModelRateMilli returns the billing rate multiplier (in thousandths, 1000 = 1.0x)
 // that applies to a model for a given client key: the highest rate among the key's
-// enabled groups that contain the model. Falls back to the default rate when no
-// matching group carries an explicit multiplier.
+// enabled groups whose providers include the model's provider. Falls back to the
+// default rate when no matching group carries an explicit multiplier.
 func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (int64, error) {
 	if keyID <= 0 || modelID <= 0 {
 		return DefaultGroupRateMilli, errors.New("key and model IDs are required")
 	}
 	var rate sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT MAX(g.rate_milli) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_models gm ON gm.group_id=g.id WHERE kg.key_id=? AND gm.model_id=?`, keyID, modelID).Scan(&rate)
+	err := s.db.QueryRowContext(ctx, `SELECT MAX(g.rate_milli) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id WHERE kg.key_id=?`, modelID, keyID).Scan(&rate)
 	if err != nil {
 		return DefaultGroupRateMilli, err
 	}
@@ -398,12 +398,14 @@ func (s *Store) AuthorizedModels(ctx context.Context, token string) ([]Model, er
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("client token is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.enabled FROM client_keys k JOIN key_groups kg ON kg.key_id=k.id JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_models gm ON gm.group_id=g.id JOIN models m ON m.id=gm.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE k.token_digest=? AND k.enabled=1 ORDER BY m.id`, s.box.DigestBytes(token))
+	// 组管理渠道：授权模型 = Key 启用组内渠道下、已定价且启用的模型。
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN key_groups kg ON kg.key_id=k.id JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE k.token_digest=? AND k.enabled=1 ORDER BY m.id`, s.box.DigestBytes(token))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Model
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]Model, 0)
 	for rows.Next() {
 		m, err := scanModel(rows)
 		if err != nil {
@@ -441,7 +443,7 @@ func (s *Store) ReserveForKey(ctx context.Context, keyID, modelID, tokens, amoun
 		return KeyReservation{}, errors.New("concurrency limit exceeded")
 	}
 	var allowed int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_models gm ON gm.group_id=g.id JOIN models m ON m.id=gm.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE kg.key_id=? AND m.id=?`, keyID, modelID).Scan(&allowed); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE kg.key_id=?`, modelID, keyID).Scan(&allowed); err != nil {
 		return KeyReservation{}, err
 	}
 	if allowed == 0 {

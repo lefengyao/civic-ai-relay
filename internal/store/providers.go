@@ -34,8 +34,9 @@ type UpdateProvider struct {
 	Enabled *bool
 }
 
-// SetProviderCacheEvictor registers a callback invoked after API-key rotation.
-// The store remains independent from any upstream HTTP client cache.
+// SetProviderCacheEvictor registers a callback invoked after a provider's
+// API key rotates or its base URL changes, so cached upstream clients are
+// rebuilt with the new credentials instead of serving stale ones.
 func (s *Store) SetProviderCacheEvictor(fn func(providerID int64)) {
 	s.providerCacheEvict = fn
 }
@@ -149,7 +150,9 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,api_key_ciphertext=?,enabled=?,updated_at_utc=? WHERE id=?`, name, baseURL, []byte(ciphertext), enabled, nowUTC(), id); err != nil {
 		return Provider{}, err
 	}
-	if rotated && s.providerCacheEvict != nil {
+	// 轮换密钥或修改地址后，缓存的 upstream client 已过期，必须驱逐重建；
+	// 否则旧凭据/旧地址会一直用到进程重启。
+	if s.providerCacheEvict != nil && (rotated || baseURL != currentURL) {
 		s.providerCacheEvict(id)
 	}
 	return Provider{ID: id, Name: name, BaseURL: baseURL, Enabled: enabled == 1, APIKeyConfigured: s.providerConfigured(ciphertext)}, nil
@@ -161,7 +164,8 @@ func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Provider
+	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
+	out := make([]Provider, 0)
 	for rows.Next() {
 		var p Provider
 		var enabled int

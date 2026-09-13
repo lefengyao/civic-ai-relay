@@ -6,8 +6,11 @@ docs/
 *.ps1
 data/*.db
 data/*.db-*
+backups/
 *.pem
 *.key
 *.exe
+*.exe~
 bootstrap-admin-key.txt
 .superpowers/
+dist/

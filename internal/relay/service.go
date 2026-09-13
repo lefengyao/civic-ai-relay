@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -37,11 +38,12 @@ type Request struct {
 }
 
 type Outcome struct {
-	Status          string
-	InputTokens     int64
-	OutputTokens    int64
-	AmountMicroyuan int64
-	HTTPStatus      int
+	Status            string
+	InputTokens       int64
+	OutputTokens      int64
+	CachedInputTokens int64
+	AmountMicroyuan   int64
+	HTTPStatus        int
 }
 
 type Service struct {
@@ -50,6 +52,16 @@ type Service struct {
 	settings func() config.Settings
 	global   *Gate
 	keys     *KeyGates
+}
+
+// Ready reports whether the relay can serve traffic: the encrypted SQLite
+// state must still answer queries. It backs the /readyz probe used by
+// container orchestrators and reverse proxies.
+func (s *Service) Ready(ctx context.Context) error {
+	if s == nil || s.store == nil {
+		return errors.New("relay service unavailable")
+	}
+	return s.store.Ping(ctx)
 }
 
 func (s *Service) Models(ctx context.Context, token string) ([]store.Model, error) {
@@ -107,7 +119,7 @@ func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
 	if outcome.Status == "" {
 		outcome.Status = "completed"
 	}
-	err := l.service.store.SettleRequest(ctx, l.reservation.ID, outcome.InputTokens, outcome.OutputTokens, outcome.AmountMicroyuan, outcome.Status)
+	err := l.service.store.SettleRequest(ctx, l.reservation.ID, outcome.InputTokens, outcome.OutputTokens, outcome.CachedInputTokens, outcome.AmountMicroyuan, outcome.Status)
 	l.service.keys.Release(l.keyID)
 	l.service.global.Release()
 	return err
@@ -142,6 +154,7 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	effective := model
 	effective.InputPriceMicroyuan = applyRate(model.InputPriceMicroyuan, rate)
 	effective.OutputPriceMicroyuan = applyRate(model.OutputPriceMicroyuan, rate)
+	effective.CachedInputPriceMicroyuan = applyRate(model.CachedInputPriceMicroyuan, rate)
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 4096}
 	if s.settings != nil {
 		settings = s.settings()
@@ -150,20 +163,25 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		s.global.SetLimit(settings.GlobalConcurrencyLimit)
 	}
 	if req.MaxTokens < 0 || req.MaxCompletionTokens < 0 {
-		return nil, store.Model{}, ErrInvalidRequest
+		return nil, store.Model{}, fmt.Errorf("max_tokens must not be negative: %w", ErrInvalidRequest)
 	}
 	output := req.MaxTokens
 	if req.MaxCompletionTokens > 0 {
 		if output > 0 && output != req.MaxCompletionTokens {
-			return nil, store.Model{}, ErrInvalidRequest
+			return nil, store.Model{}, fmt.Errorf("max_tokens (%d) conflicts with max_completion_tokens (%d): %w", output, req.MaxCompletionTokens, ErrInvalidRequest)
 		}
 		output = req.MaxCompletionTokens
 	}
 	if output <= 0 {
 		output = int64(settings.MaxOutputTokens)
 	}
-	if output <= 0 || (settings.MaxOutputTokens > 0 && output > int64(settings.MaxOutputTokens)) {
-		return nil, store.Model{}, ErrInvalidRequest
+	if output <= 0 {
+		return nil, store.Model{}, fmt.Errorf("no output token budget: client sent none and server MAX_OUTPUT_TOKENS is unset: %w", ErrInvalidRequest)
+	}
+	// 客户端（尤其是第三方 UI）常硬编码较大的默认输出上限，超过服务器
+	// 限制时收敛到上限继续服务，而不是整体拒绝请求。
+	if settings.MaxOutputTokens > 0 && output > int64(settings.MaxOutputTokens) {
+		output = int64(settings.MaxOutputTokens)
 	}
 	if !s.global.TryAcquire() {
 		return nil, store.Model{}, ErrGlobalConcurrencyExceeded
@@ -243,8 +261,8 @@ func (s *Service) Chat(ctx context.Context, req Request) ([]byte, error) {
 		_ = lease.Close(ctx, Outcome{Status: "failed"})
 		return nil, &upstream.Error{Code: "upstream_response_invalid"}
 	}
-	amount := priceUsage(usage.Usage, model)
-	if err := lease.Close(ctx, Outcome{Status: "completed", InputTokens: int64(usage.Usage.PromptTokens), OutputTokens: int64(usage.Usage.CompletionTokens), AmountMicroyuan: amount, HTTPStatus: 200}); err != nil {
+	amount := PriceUsage(usage.Usage, model)
+	if err := lease.Close(ctx, Outcome{Status: "completed", InputTokens: int64(usage.Usage.PromptTokens), OutputTokens: int64(usage.Usage.CompletionTokens), CachedInputTokens: int64(usage.Usage.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: 200}); err != nil {
 		return nil, err
 	}
 	return data, nil
@@ -288,9 +306,25 @@ func requestID() string {
 	return "relay-" + hex.EncodeToString(raw)
 }
 
-func priceUsage(usage upstream.Usage, model store.Model) int64 {
+// PriceUsage is the single billing implementation shared by non-stream and
+// stream settlement. Cached prompt tokens (a subset of PromptTokens) are
+// billed at the model's cached input price; when no cached price is
+// configured they fall back to the regular input price.
+func PriceUsage(usage upstream.Usage, model store.Model) int64 {
 	input, output := valueOrZero(model.InputPriceMicroyuan), valueOrZero(model.OutputPriceMicroyuan)
-	return pricePart(int64(usage.PromptTokens), input) + pricePart(int64(usage.CompletionTokens), output)
+	cachedPrice := input
+	if model.CachedInputPriceMicroyuan != nil {
+		cachedPrice = *model.CachedInputPriceMicroyuan
+	}
+	prompt := int64(usage.PromptTokens)
+	cached := int64(usage.PromptTokensDetails.CachedTokens)
+	if cached < 0 {
+		cached = 0
+	}
+	if cached > prompt {
+		cached = prompt
+	}
+	return pricePart(prompt-cached, input) + pricePart(cached, cachedPrice) + pricePart(int64(usage.CompletionTokens), output)
 }
 func pricePart(tokens, price int64) int64 {
 	if tokens <= 0 || price <= 0 {

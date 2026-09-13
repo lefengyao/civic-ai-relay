@@ -78,34 +78,38 @@ func TestProviderURLValidationAndUpdatePreservesOrRotatesSecret(t *testing.T) {
 	}
 }
 
-func TestGroupRejectsDisabledOrUnpricedModelsAndAuthorizationUsesUnion(t *testing.T) {
+func TestGroupRejectsDisabledProvidersAndAuthorizationDerivesFromProviders(t *testing.T) {
 	repo := newTestStore(t)
 	provider, err := repo.CreateProvider(context.Background(), NewProvider{Name: "p", BaseURL: "https://provider.example", APIKey: "secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	off, err := repo.CreateProvider(context.Background(), NewProvider{Name: "off", BaseURL: "https://off.example", APIKey: "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateProvider(context.Background(), off.ID, UpdateProvider{Enabled: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
 	price := int64(100)
-	basic, err := repo.CreateModel(context.Background(), NewModel{ProviderID: provider.ID, PublicName: "basic", UpstreamName: "basic", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
-	if err != nil {
+	if _, err = repo.CreateModel(context.Background(), NewModel{ProviderID: provider.ID, PublicName: "basic", UpstreamName: "basic", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	advanced, err := repo.CreateModel(context.Background(), NewModel{ProviderID: provider.ID, PublicName: "advanced", UpstreamName: "advanced", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
-	if err != nil {
+	if _, err = repo.CreateModel(context.Background(), NewModel{ProviderID: provider.ID, PublicName: "advanced", UpstreamName: "advanced", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	unpriced, err := repo.CreateModel(context.Background(), NewModel{ProviderID: provider.ID, PublicName: "unpriced", UpstreamName: "unpriced", Enabled: true})
-	if err != nil {
+	if _, err = repo.CreateModel(context.Background(), NewModel{ProviderID: provider.ID, PublicName: "unpriced", UpstreamName: "unpriced", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	groupA, _ := repo.CreateModelGroup(context.Background(), NewModelGroup{Name: "basic-group"})
-	groupB, _ := repo.CreateModelGroup(context.Background(), NewModelGroup{Name: "advanced-group"})
-	if err := repo.ReplaceGroupModels(context.Background(), groupA.ID, []int64{basic.ID, unpriced.ID}); err == nil {
-		t.Fatal("unpriced model accepted")
+	groupA, _ := repo.CreateModelGroup(context.Background(), NewModelGroup{Name: "main"})
+	groupB, _ := repo.CreateModelGroup(context.Background(), NewModelGroup{Name: "spare"})
+	if err := repo.ReplaceGroupProviders(context.Background(), groupA.ID, []int64{off.ID}); err == nil {
+		t.Fatal("disabled provider accepted")
 	}
-	if err := repo.ReplaceGroupModels(context.Background(), groupA.ID, []int64{basic.ID}); err != nil {
+	if err := repo.ReplaceGroupProviders(context.Background(), groupA.ID, []int64{provider.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceGroupModels(context.Background(), groupB.ID, []int64{advanced.ID}); err != nil {
+	if err := repo.ReplaceGroupProviders(context.Background(), groupB.ID, []int64{provider.ID}); err != nil {
 		t.Fatal(err)
 	}
 	key, err := repo.CreateClientKey(context.Background(), NewClientKey{Name: "alice", ConcurrencyLimit: 2})
@@ -115,6 +119,7 @@ func TestGroupRejectsDisabledOrUnpricedModelsAndAuthorizationUsesUnion(t *testin
 	if err := repo.ReplaceKeyGroups(context.Background(), key.ID, []int64{groupA.ID, groupB.ID}); err != nil {
 		t.Fatal(err)
 	}
+	// 授权模型 = Key 启用组内渠道下的已定价启用模型去重并集；未定价模型不授权
 	models, err := repo.AuthorizedModels(context.Background(), key.Token)
 	if err != nil || len(models) != 2 {
 		t.Fatalf("models = %#v, err = %v", models, err)
@@ -125,20 +130,28 @@ func TestAtomicJoinReplacementOnlyChangesPassedRows(t *testing.T) {
 	repo := newTestStore(t)
 	p, _ := repo.CreateProvider(context.Background(), NewProvider{Name: "p", BaseURL: "https://provider.example", APIKey: "s"})
 	price := int64(1)
-	m1, _ := repo.CreateModel(context.Background(), NewModel{ProviderID: p.ID, PublicName: "m1", UpstreamName: "m1", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
-	m2, _ := repo.CreateModel(context.Background(), NewModel{ProviderID: p.ID, PublicName: "m2", UpstreamName: "m2", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	if _, err := repo.CreateModel(context.Background(), NewModel{ProviderID: p.ID, PublicName: "m1", UpstreamName: "m1", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateModel(context.Background(), NewModel{ProviderID: p.ID, PublicName: "m2", UpstreamName: "m2", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	g, _ := repo.CreateModelGroup(context.Background(), NewModelGroup{Name: "g"})
-	if err := repo.ReplaceGroupModels(context.Background(), g.ID, []int64{m1.ID, m2.ID}); err != nil {
+	if err := repo.ReplaceGroupProviders(context.Background(), g.ID, []int64{p.ID}); err != nil {
 		t.Fatal(err)
 	}
 	key, _ := repo.CreateClientKey(context.Background(), NewClientKey{Name: "k", ConcurrencyLimit: 1})
 	if err := repo.ReplaceKeyGroups(context.Background(), key.ID, []int64{g.ID}); err != nil {
 		t.Fatal(err)
 	}
+	models, err := repo.AuthorizedModels(context.Background(), key.Token)
+	if err != nil || len(models) != 2 {
+		t.Fatalf("models = %#v, err = %v", models, err)
+	}
 	if err := repo.ReplaceKeyGroups(context.Background(), key.ID, []int64{}); err != nil {
 		t.Fatal(err)
 	}
-	models, err := repo.AuthorizedModels(context.Background(), key.Token)
+	models, err = repo.AuthorizedModels(context.Background(), key.Token)
 	if err != nil || len(models) != 0 {
 		t.Fatalf("models = %#v, err = %v", models, err)
 	}
@@ -171,7 +184,7 @@ func TestGroupRateMultiplierPersistenceAndKeyModelRate(t *testing.T) {
 		t.Fatal("negative rate accepted")
 	}
 	for _, gid := range []int64{cheap.ID, premium.ID} {
-		if err := repo.ReplaceGroupModels(ctx, gid, []int64{m.ID}); err != nil {
+		if err := repo.ReplaceGroupProviders(ctx, gid, []int64{provider.ID}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -208,8 +221,12 @@ func TestGroupRateMultiplierPersistenceAndKeyModelRate(t *testing.T) {
 	if rate != 800 {
 		t.Fatalf("rate after disable = %d, want 800", rate)
 	}
-	// 无分组的模型回落默认倍率
-	other, err := repo.CreateModel(ctx, NewModel{ProviderID: provider.ID, PublicName: "m2", UpstreamName: "m2", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	// 不属于任何组的渠道：其模型回落默认倍率
+	otherProvider, err := repo.CreateProvider(ctx, NewProvider{Name: "p2", BaseURL: "http://localhost:2", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := repo.CreateModel(ctx, NewModel{ProviderID: otherProvider.ID, PublicName: "m2", UpstreamName: "m2", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}

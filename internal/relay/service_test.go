@@ -53,15 +53,14 @@ func serviceFixture(t *testing.T, client *fakeClient) (*Service, *store.Store, s
 		t.Fatal(err)
 	}
 	price := int64(1000)
-	m, err := repo.CreateModel(context.Background(), store.NewModel{ProviderID: p.ID, PublicName: "public-model", UpstreamName: "upstream-model", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
-	if err != nil {
+	if _, err := repo.CreateModel(context.Background(), store.NewModel{ProviderID: p.ID, PublicName: "public-model", UpstreamName: "upstream-model", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	g, err := repo.CreateModelGroup(context.Background(), store.NewModelGroup{Name: "g"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceGroupModels(context.Background(), g.ID, []int64{m.ID}); err != nil {
+	if err := repo.ReplaceGroupProviders(context.Background(), g.ID, []int64{p.ID}); err != nil {
 		t.Fatal(err)
 	}
 	k, err := repo.CreateClientKey(context.Background(), store.NewClientKey{Name: "k", ConcurrencyLimit: 1, TokenLimit: ptr(1000), AmountLimitMicroyuan: ptr(100000)})

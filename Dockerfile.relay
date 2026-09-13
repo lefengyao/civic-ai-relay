@@ -1,11 +1,118 @@
+# 不声明 `# syntax=docker/dockerfile:N`：那会强制 BuildKit 从 Docker Hub 拉取
+# 外部前端镜像，在受限网络下会让构建在第一步就失败。当前使用的
+# `RUN --mount=type=cache` 由内置前端原生支持，无需外部前端。
+#
+# Civic Relay 容器镜像：多阶段构建 + 非 root 运行 + 内置健康检查。
+#
+#   docker build -f Dockerfile.relay -t civic-relay:dev .
+#   docker run --rm -p 127.0.0.1:8000:8000 \
+#     -v civic-relay-config:/app/config -v civic-relay-data:/app/data \
+#     civic-relay:dev
+#
+# 首次启动会在 /app/config 生成 relay.env 与一次性的
+# bootstrap-admin-key.txt（后者读走后请删除）。
+
+# 运行阶段的基础镜像。必须声明在第一个 FROM 之前（全局 ARG），
+# 否则 FROM 看不到它，构建会以 "base name should not be blank" 失败。
+# 默认 distroless；无法访问 gcr.io 时改传
+#   --build-arg RUNTIME_IMAGE=scratch
+# 二进制是纯静态的，scratch 同样可用（下方已显式复制 CA 证书）。
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
+
+# ---------------------------------------------------------------------------
+# 构建阶段
+# ---------------------------------------------------------------------------
 FROM golang:1.27-bookworm AS build
+
+# 目标平台由 BuildKit 自动注入；给出默认值以便不带 buildx 的
+# `docker build` / `docker compose build` 也能产出 linux/amd64 镜像。
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+# 模块代理与校验数据库。默认走 goproxy.cn：中国大陆网络下
+# proxy.golang.org / sum.golang.org 常常 TLS 握手超时导致构建中断，
+# 而 goproxy.cn 同时代理校验数据库。境外构建可覆盖：
+#   docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
+#                --build-arg GOSUMDB=sum.golang.org ...
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
+
+# GOTOOLCHAIN=local 禁止构建期联网下载工具链：go.mod 要求 1.27，
+# 与基础镜像一致时没有必要再拉一次。CGO_ENABLED=0 产出静态二进制，
+# 运行阶段才能使用无 libc 的最小镜像。
+ENV GOTOOLCHAIN=local \
+    CGO_ENABLED=0 \
+    GOPROXY=${GOPROXY} \
+    GOSUMDB=${GOSUMDB}
+
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
-COPY cmd internal web ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/civic-relay ./cmd/civic-relay
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# 必须逐个指定目标目录：`COPY cmd internal web ./` 会把三个目录的*内容*
+# 拍平合并到 /src（Docker 的 COPY 复制的是目录内容而非目录本身），
+# 结果 /src/cmd/civic-relay 根本不存在，go build 直接报
+# "stat /src/cmd/civic-relay: directory not found"。
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY web/ ./web/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -mod=readonly \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
+      -o /out/civic-relay ./cmd/civic-relay
+
+# 运行阶段基于 distroless（无 shell、无包管理器），在那里无法执行 RUN/mkdir，
+# 所以两个可写目录必须在本阶段造好，连属主一起 COPY 过去。
+# 命名卷首次挂载时会继承镜像内目录的属主，容器才能以 UID 65532 写入。
+RUN mkdir -p /out/config /out/data /out/zoneinfo/Asia \
+ && cp /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt \
+ && cp /usr/share/zoneinfo/Asia/Shanghai /out/zoneinfo/Asia/Shanghai \
+ && cp /usr/share/zoneinfo/UTC /out/zoneinfo/UTC
+
+# ---------------------------------------------------------------------------
+# 运行阶段
+# ---------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS runtime
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="Civic Relay" \
+      org.opencontainers.image.description="OpenAI 兼容的多上游转发与计费服务（中文本地控制台）" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+# 转发上游走 HTTPS，必须带上受信根证书。
+COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# 时区数据：distroless 不含 tzdata，容器默认 UTC，日志时间戳会比本地时间差
+# 8 小时，排障时极易看错。只复制需要的时区文件，不塞进整个 tzdata（约 3.5MB）。
+COPY --from=build /out/zoneinfo /usr/share/zoneinfo
+COPY --from=build --chown=65532:65532 /out/config /app/config
+COPY --from=build --chown=65532:65532 /out/data /app/data
 COPY --from=build /out/civic-relay /civic-relay
+
+# WORKDIR 是数据目录能否落到卷上的关键：首次引导写入的
+# DB_PATH=data/relay.db 是相对工作目录的路径。如果工作目录是 /，
+# 数据库会落在容器临时层，容器重建即丢失全部账目与配置。
+WORKDIR /app
+# TZ 只影响日志时间戳：配额窗口、账目时间全部显式使用 UTC，换时区不改变计费口径。
+ENV TZ=Asia/Shanghai \
+    CIVIC_RELAY_CONFIG_FILE=/app/config/relay.env
+
+USER 65532:65532
 EXPOSE 8000
+
+# 镜像内没有 shell 与 curl，健康检查复用同一个二进制。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/civic-relay", "-healthcheck"]
+
 ENTRYPOINT ["/civic-relay"]

@@ -122,6 +122,24 @@ var migrations = []migration{
 	{version: 6, statements: []string{
 		`ALTER TABLE client_keys ADD COLUMN token_hint TEXT NOT NULL DEFAULT ''`,
 	}},
+	{version: 7, statements: []string{
+		`ALTER TABLE models ADD COLUMN cached_input_price_microyuan INTEGER CHECK (cached_input_price_microyuan IS NULL OR cached_input_price_microyuan >= 0)`,
+		`ALTER TABLE requests ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cached_input_tokens >= 0)`,
+	}},
+	// v8: 模型组从"管理模型"改为"管理供应商（渠道）"。组内挂渠道，授权模型 =
+	// 组内启用渠道下的所有已定价启用模型。历史组内模型成员折算为其所属渠道。
+	{version: 8, statements: []string{
+		`CREATE TABLE group_providers (
+			group_id INTEGER NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+			provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+			PRIMARY KEY (group_id, provider_id)
+		)`,
+		`INSERT INTO group_providers(group_id, provider_id)
+			SELECT DISTINCT gm.group_id, m.provider_id FROM group_models gm JOIN models m ON m.id = gm.model_id`,
+		`DROP INDEX IF EXISTS idx_group_models_model`,
+		`DROP TABLE group_models`,
+		`CREATE INDEX idx_group_providers_provider ON group_providers(provider_id, group_id)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

@@ -1,14 +1,87 @@
+# Civic Relay —— 单容器运行方案（默认配置：命名卷，跨平台零准备）
+#
+#   docker compose up -d --build
+#   docker compose ps             # 等待 STATUS 变为 healthy
+#   docker compose logs -f
+#
+# 首次启动会在卷内生成 relay.env 与一次性的 bootstrap-admin-key.txt：
+#   docker compose exec civic-relay cat /app/config/bootstrap-admin-key.txt
+# 取得管理员密钥后请删除该文件：
+#   docker compose exec civic-relay rm /app/config/bootstrap-admin-key.txt
+#
+# 需要把配置与数据库放到宿主机指定目录（便于备份/迁移/审计）时，叠加绑定卷覆盖文件：
+#   docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d --build
+#
+# 端口默认绑定所有网卡（0.0.0.0:8000，等价 8000:8000），局域网内可用 http://<本机IP>:8000 访问。
+# 注意这是明文 HTTP：除非只用可信内网，否则应改为只绑本机（CIVIC_RELAY_BIND=127.0.0.1）
+# 并在前面挂 HTTPS 反向代理；另外 Windows 防火墙需放行入站 8000，否则局域网仍连不上。
+# 若只想改宿主机端口，用 CIVIC_RELAY_PORT，不要改 relay.env 里的 PORT。
+
 services:
   civic-relay:
     build:
       context: .
       dockerfile: Dockerfile.relay
+      args:
+        VERSION: ${CIVIC_RELAY_VERSION:-dev}
+        COMMIT: ${CIVIC_RELAY_COMMIT:-unknown}
+        BUILD_DATE: ${CIVIC_RELAY_BUILD_DATE:-unknown}
+    image: civic-relay:${CIVIC_RELAY_VERSION:-dev}
     environment:
+      # 配置与数据库都在卷内；DB_PATH 由引导配置写成相对路径 data/relay.db，
+      # 镜像 WORKDIR 为 /app，因此实际落在 /app/data/relay.db（见 Dockerfile）。
       CIVIC_RELAY_CONFIG_FILE: /app/config/relay.env
+      # 容器日志时区（镜像内已带 Asia/Shanghai 时区数据）。仅影响日志时间戳，
+      # 配额窗口与账目一律用 UTC，改这里不会改变计费口径。
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "127.0.0.1:8000:8000"
+      # 默认绑定所有网卡（等价于 "8000:8000"），局域网内可用 http://<本机IP>:8000 访问。
+      # 只想本机访问时设 CIVIC_RELAY_BIND=127.0.0.1。
+      # 注意这里是明文 HTTP：对局域网开放时，管理台与客户端 Key 都会以明文传输，
+      # 请只在可信内网使用，对外提供服务务必走 HTTPS 反向代理。
+      - "${CIVIC_RELAY_BIND:-0.0.0.0}:${CIVIC_RELAY_PORT:-8000}:8000"
     volumes:
-      # Set CIVIC_RELAY_CONFIG_DIR to a host directory outside the repository.
-      - ${CIVIC_RELAY_CONFIG_DIR:?Set CIVIC_RELAY_CONFIG_DIR to an external host directory}:/app/config
-      - ${CIVIC_RELAY_DATA_DIR:?Set CIVIC_RELAY_DATA_DIR to an external host directory}:/app/data
+      # relay.env + bootstrap-admin-key.txt
+      - civic-relay-config:/app/config
+      # relay.db（WAL 模式，同目录还会有 -wal / -shm）
+      - civic-relay-data:/app/data
+
+    # 进程内存软上限略高于 MEMORY_LIMIT_MB（默认 200MB）：让应用自己的
+    # RSS 保护先于 cgroup OOM 终止生效，请求被拒绝而不是进程被杀。
+    # 调整 MEMORY_LIMIT_MB 时请同步调整这里（建议留 25% 余量）。
+    mem_limit: 256m
+    pids_limit: 256
+
+    # 进程只写 /app/config 与 /app/data 两个卷，根文件系统可以只读；
+    # SQLite 需要临时目录时使用内存盘（容器重建即清空）。
+    read_only: true
+    tmpfs:
+      - "/tmp:size=16m,mode=1777"
+
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+
     restart: unless-stopped
+    # 收到 SIGTERM 后进程会先排空在途请求（含 SSE 流，最长 15s）再退出。
+    stop_grace_period: 30s
+
+    healthcheck:
+      test: ["CMD", "/civic-relay", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+    # 日志走 json-file，避免长期运行撑爆磁盘。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  civic-relay-config:
+  civic-relay-data:

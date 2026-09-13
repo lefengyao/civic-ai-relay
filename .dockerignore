@@ -1,0 +1,48 @@
+# 构建上下文收敛。镜像只需要 go.mod/go.sum、cmd/、internal/、web/，
+# 其余内容一律不进上下文：既避免每次构建上传数十 MB 的本地产物，
+# 也确保 relay.env、SQLite 数据库与 WAL 这些含密钥的运行时文件
+# 永远不会出现在构建上下文里。
+
+# --- 本地构建产物 ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.log
+
+# --- 运行时状态与密钥（绝不能进镜像）---
+data/
+deploy/
+.env
+.env.*
+!/.env.example
+bootstrap-admin-key.txt
+*.db
+*.db-shm
+*.db-wal
+*.pem
+*.key
+
+# --- 测试与文档 ---
+test-data/
+docs/
+scripts/
+
+# --- 版本控制与工具目录 ---
+.git/
+.gitignore
+.gitattributes
+.worktrees/
+.workbuddy/
+.codex/
+.superpowers/
+
+# --- 编辑器与操作系统 ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- 仓库元数据（镜像内不需要）---
+*.md
+!README.md

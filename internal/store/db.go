@@ -72,6 +72,16 @@ func Open(path string, box *secret.Box) (*Store, error) {
 	return s, nil
 }
 
+// Ping verifies that the connection pool still answers queries. It backs the
+// /readyz probe so an orchestrator can tell a wedged database from a live one
+// instead of relying on process liveness alone.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return errors.New("database is not open")
+	}
+	return s.db.PingContext(ctx)
+}
+
 // JournalMode reports SQLite's active journal mode in lower-case.
 func (s *Store) JournalMode(ctx context.Context) string {
 	if s == nil || s.db == nil {

@@ -26,7 +26,7 @@ func TestDeletesCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceGroupModels(ctx, group.ID, []int64{model.ID}); err != nil {
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{provider.ID}); err != nil {
 		t.Fatal(err)
 	}
 	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 1})
@@ -44,13 +44,13 @@ func TestDeletesCascade(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deleting the model drops it from the group but keeps the group itself.
+	// 组管理渠道：删除单个模型不影响组的渠道成员关系。
 	if err := repo.DeleteModel(ctx, model.ID); err != nil {
 		t.Fatal(err)
 	}
-	if ids, err := repo.GroupModelIDs(ctx, group.ID); err != nil {
+	if ids, err := repo.GroupProviderIDs(ctx, group.ID); err != nil {
 		t.Fatal(err)
-	} else if len(ids) != 0 {
+	} else if len(ids) != 1 || ids[0] != provider.ID {
 		t.Fatalf("group members after model delete = %v", ids)
 	}
 	if groups, err := repo.ListModelGroups(ctx); err != nil {
