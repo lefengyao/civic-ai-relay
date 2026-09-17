@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -28,7 +29,19 @@ type AdminHandler struct {
 	// onSettingsChange 在设置验证通过并持久化后同步调用，用于把新值热应用到
 	// 运行中的服务（并发闸门、配额、输出上限等），无需重启进程。
 	onSettingsChange func(config.Settings)
+	// groupMonitor 提供「立即检测」的按需触发；为 nil 时相关接口返回 503。
+	// 定时轮询由 cmd 层的后台循环负责，这里只做手动触发与历史查询。
+	groupMonitor GroupMonitor
 }
+
+// GroupMonitor 是管理台手动触发分组监测所需的最小依赖面，由 relay.Monitor 实现。
+type GroupMonitor interface {
+	RunOnce(ctx context.Context, trigger string) (int, error)
+	RunGroup(ctx context.Context, groupID int64) (store.GroupMonitorResult, error)
+}
+
+// SetGroupMonitor 注册分组监测器，启用 /admin/api/groups/monitor 等接口。
+func (h *AdminHandler) SetGroupMonitor(m GroupMonitor) { h.groupMonitor = m }
 
 func NewAdminHandler(repo *store.Store, service *relay.Service, settings config.Settings, adminKey string) *AdminHandler {
 	return &AdminHandler{repo: repo, service: service, settings: settings, adminKey: adminKey}
@@ -78,6 +91,12 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.groupsList(w, r)
 	case path == "groups" && r.Method == http.MethodPost:
 		h.groupCreate(w, r)
+	// 这两条必须排在下面的 HasPrefix("groups/") 之前：它们的第一段不是数字 ID，
+	// 交给 groupItem 会被 ParseInt 判成 invalid_id。
+	case path == "groups/health" && r.Method == http.MethodGet:
+		h.groupsHealth(w, r)
+	case path == "groups/monitor" && r.Method == http.MethodPost:
+		h.groupsMonitorAll(w, r)
 	case strings.HasPrefix(path, "groups/"):
 		h.groupItem(w, r, strings.TrimPrefix(path, "groups/"))
 	case path == "keys" && r.Method == http.MethodGet:
@@ -113,6 +132,24 @@ func writeAdminError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message}})
 }
 
+// writeAdminErrorDetail 在管理端错误结构上附加具体原因，形状与 json.go 的
+// writeErrorDetail 一致（message 带原因、code 保持稳定），但不带 relay_error
+// 的 type —— 那是面向上游客户端的标记，不属于管理台。
+func writeAdminErrorDetail(w http.ResponseWriter, status int, code, detail string) {
+	message := code
+	if detail != "" {
+		message = code + ": " + detail
+	}
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "code": code}})
+}
+
+// writeProviderError 透出渠道建/改失败的真实原因。只回一个 "provider_invalid"
+// 会让操作员看到一串没有任何指向性的 toast，无法判断是地址格式、重名还是
+// 加密失败（2026-09-16 实机踩到的正是这个：一个缺协议头的地址反复弹了 9 次）。
+func writeProviderError(w http.ResponseWriter, err error) {
+	writeAdminErrorDetail(w, 400, "provider_invalid", err.Error())
+}
+
 // writeDeleteResult reports the outcome of a delete, mapping "row missing" to
 // 404 so operators can tell an unknown ID apart from a failed delete.
 func writeDeleteResult(w http.ResponseWriter, err error) {
@@ -130,7 +167,15 @@ func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	settings := h.settings
 	h.mu.RUnlock()
-	data, err := h.repo.Overview(r.Context(), time.Now().UTC(), int64(settings.RPMLimit), settings.TokenLimit5H, settings.TokenLimitDaily)
+	data, err := h.repo.Overview(r.Context(), time.Now().UTC(), store.QuotaLimits{
+		RPMLimit:     int64(settings.RPMLimit),
+		Token5H:      settings.TokenLimit5H,
+		TokenDaily:   settings.TokenLimitDaily,
+		TokenWeekly:  settings.TokenLimitWeekly,
+		Amount5H:     settings.AmountLimit5H,
+		AmountDaily:  settings.AmountLimitDaily,
+		AmountWeekly: settings.AmountLimitWeekly,
+	})
 	if err != nil {
 		writeAdminError(w, 500, "ledger_unavailable")
 		return
@@ -144,7 +189,7 @@ func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 
 func safeSettings(s config.Settings) map[string]string {
 	values := s.EnvMap()
-	for _, key := range []string{"ADMIN_API_KEY", "RELAY_ENCRYPTION_KEY", "UPSTREAM_API_KEY"} {
+	for _, key := range []string{"ADMIN_API_KEY", "RELAY_ENCRYPTION_KEY"} {
 		values[key] = ""
 	}
 	return values
@@ -167,7 +212,7 @@ func (h *AdminHandler) configSave(w http.ResponseWriter, r *http.Request, valida
 	defer h.mu.Unlock()
 	values := h.settings.EnvMap()
 	for key, value := range body.Settings {
-		if value == "" && (key == "ADMIN_API_KEY" || key == "RELAY_ENCRYPTION_KEY" || key == "UPSTREAM_API_KEY") {
+		if value == "" && (key == "ADMIN_API_KEY" || key == "RELAY_ENCRYPTION_KEY") {
 			continue
 		}
 		values[key] = value
@@ -223,7 +268,7 @@ func (h *AdminHandler) providerCreate(w http.ResponseWriter, r *http.Request) {
 	in := store.NewProvider{Name: payload.Name, BaseURL: payload.BaseURL, APIKey: payload.APIKey}
 	value, err := h.repo.CreateProvider(r.Context(), in)
 	if err != nil {
-		writeAdminError(w, 400, "provider_invalid")
+		writeProviderError(w, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"data": value})
@@ -266,7 +311,7 @@ func (h *AdminHandler) providerItem(w http.ResponseWriter, r *http.Request, raw 
 	}
 	value, err := h.repo.UpdateProvider(r.Context(), id, in)
 	if err != nil {
-		writeAdminError(w, 400, "provider_invalid")
+		writeProviderError(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"data": value})
@@ -478,6 +523,67 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"data": data})
 }
+
+// groupsHealth 返回每个分组最近一次监测结果（键为分组 ID），以及当前是否开启了
+// 定时监测。管理台分组列表一次拿全，不必逐组发请求。
+func (h *AdminHandler) groupsHealth(w http.ResponseWriter, r *http.Request) {
+	latest, err := h.repo.LatestGroupMonitorResults(r.Context())
+	if err != nil {
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	h.mu.RLock()
+	interval := h.settings.GroupMonitorInterval
+	h.mu.RUnlock()
+	data := make(map[string]any, len(latest))
+	for id, result := range latest {
+		data[strconv.FormatInt(id, 10)] = result
+	}
+	writeJSON(w, 200, map[string]any{
+		"data":                data,
+		"monitor_enabled":     interval > 0,
+		"monitor_interval":    interval.String(),
+		"monitor_interval_ms": interval.Milliseconds(),
+	})
+}
+
+// groupsMonitorAll 立即监测全部分组（不等定时轮询）。
+func (h *AdminHandler) groupsMonitorAll(w http.ResponseWriter, r *http.Request) {
+	if h.groupMonitor == nil {
+		writeAdminError(w, 503, "monitor_unavailable")
+		return
+	}
+	count, err := h.groupMonitor.RunOnce(r.Context(), "manual")
+	if err != nil {
+		writeAdminErrorDetail(w, 500, "monitor_failed", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"monitored": count})
+}
+
+// groupMonitorNow 立即监测单个分组并返回本轮结果。
+func (h *AdminHandler) groupMonitorNow(w http.ResponseWriter, r *http.Request, id int64) {
+	if h.groupMonitor == nil {
+		writeAdminError(w, 503, "monitor_unavailable")
+		return
+	}
+	result, err := h.groupMonitor.RunGroup(r.Context(), id)
+	if err != nil {
+		writeAdminErrorDetail(w, 400, "monitor_failed", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"data": result})
+}
+
+// groupMonitorHistory 返回单个分组最近 50 轮结果，最新的在前。
+func (h *AdminHandler) groupMonitorHistory(w http.ResponseWriter, r *http.Request, id int64) {
+	history, err := h.repo.GroupMonitorHistory(r.Context(), id, 50)
+	if err != nil {
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"data": history})
+}
 func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw string) {
 	parts := strings.Split(raw, "/")
 	id, err := strconv.ParseInt(parts[0], 10, 64)
@@ -511,6 +617,17 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			return
 		}
 		writeJSON(w, 200, map[string]any{"data": g})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "monitor" {
+		switch r.Method {
+		case http.MethodPost:
+			h.groupMonitorNow(w, r, id)
+		case http.MethodGet:
+			h.groupMonitorHistory(w, r, id)
+		default:
+			writeAdminError(w, 405, "method_not_allowed")
+		}
 		return
 	}
 	if len(parts) == 2 && parts[1] == "overview" && r.Method == http.MethodGet {

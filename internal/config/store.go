@@ -281,7 +281,8 @@ func (s *ConfigStore) BuildCandidate(patch map[string]string, baseline *Settings
 		}
 	}
 	for name, value := range patch {
-		if (name == "ADMIN_API_KEY" || name == "RELAY_ENCRYPTION_KEY" || name == "UPSTREAM_API_KEY") && strings.TrimSpace(value) == "" {
+		// 空串表示「保持原值」，只对真正的敏感项生效，避免误清空管理员密钥。
+		if (name == "ADMIN_API_KEY" || name == "RELAY_ENCRYPTION_KEY") && strings.TrimSpace(value) == "" {
 			continue
 		}
 		values[name] = value
@@ -307,26 +308,34 @@ func GenerateInitialSettings() (Settings, error) {
 		return Settings{}, err
 	}
 	values := map[string]string{
-		"ADMIN_API_KEY":            "adm_" + base64.RawURLEncoding.EncodeToString(adminBytes),
-		"RELAY_ENCRYPTION_KEY":     base64.StdEncoding.EncodeToString(encryptionBytes),
-		"UPSTREAM_BASE_URL":        "",
-		"UPSTREAM_API_KEY":         "",
-		"MODEL_AUTO_SYNC":          "false",
-		"MODEL_SYNC_INTERVAL":      "30m",
+		"ADMIN_API_KEY":        "adm_" + base64.RawURLEncoding.EncodeToString(adminBytes),
+		"RELAY_ENCRYPTION_KEY": base64.StdEncoding.EncodeToString(encryptionBytes),
+		"MODEL_AUTO_SYNC":      "false",
+		"MODEL_SYNC_INTERVAL":  "30m",
+		// 分组可用性监测：默认每 30 分钟打一轮上游 /v1/models，0 关闭。
+		// 只读探测、不消耗 token，用来在用户报障之前发现某个渠道已经挂了。
+		"GROUP_MONITOR_INTERVAL":   "30m",
 		"MEMORY_LIMIT_MB":          "200",
 		"MAX_BODY_BYTES":           strconv.FormatInt(8*1024*1024, 10),
 		"MAX_OUTPUT_TOKENS":        "4096",
 		"MAX_STREAM_DURATION":      "1800s",
 		"GLOBAL_CONCURRENCY_LIMIT": "8",
 		"RPM_LIMIT":                "30",
-		"TOKEN_LIMIT_5H":           "100000",
-		"TOKEN_LIMIT_DAILY":        "20000",
+		// 六个额度窗口出厂全部不限（0）。旧版本这里写死 5h=100000 / 日=20000，
+		// 而预留要算「输入估算 + 输出上限」，编码类客户端第一次请求就会撞上
+		// token_quota_exceeded —— 运维看到的是"明明还有余量却提示额度不足"。
+		// 限额是运维的显式选择，不该由出厂值代劳；需要限流时在管理台填数字即可。
+		"TOKEN_LIMIT_5H":           "0",
+		"TOKEN_LIMIT_DAILY":        "0",
+		"TOKEN_LIMIT_WEEKLY":       "0",
+		"AMOUNT_LIMIT_5H":          "0",
+		"AMOUNT_LIMIT_DAILY":       "0",
+		"AMOUNT_LIMIT_WEEKLY":      "0",
 		"RETENTION_DAYS":           "7",
 		"DB_PATH":                  "data/relay.db",
 		"HOST":                     "0.0.0.0",
 		"PORT":                     "8000",
 		"LOG_LEVEL":                "INFO",
-		"DOCS_ENABLED":             "false",
 		"UPSTREAM_CONNECT_TIMEOUT": "10s",
 		"UPSTREAM_READ_TIMEOUT":    "300s",
 		"UPSTREAM_WRITE_TIMEOUT":   "30s",

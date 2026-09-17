@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -115,4 +116,61 @@ func TestPathVariantsReachPublicRoutes(t *testing.T) {
 
 func (*testFactory) ForProvider(_ context.Context, _ int64) (relay.UpstreamClient, error) {
 	return nil, nil
+}
+
+// 额度用满必须是 429 且带具体原因，而不是 500 relay_error 或 401 invalid_api_key。
+// 旧实现把 QuotaError 落到 default 分支返回 500，客户端会当成服务端故障反复重试；
+// Key 被自动停用时更是只回 401，运维看到概览里还有额度，完全无法定位。
+func TestQuotaRejectionReturns429WithReason(t *testing.T) {
+	raw := make([]byte, 32)
+	box, _ := secret.New(base64.StdEncoding.EncodeToString(raw))
+	repo, err := store.Open(filepath.Join(t.TempDir(), "relay.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	p, _ := repo.CreateProvider(t.Context(), store.NewProvider{Name: "p", BaseURL: "https://p.example", APIKey: "s"})
+	price := int64(1)
+	model, err := repo.CreateModel(t.Context(), store.NewModel{ProviderID: p.ID, PublicName: "m", UpstreamName: "m", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, _ := repo.CreateModelGroup(t.Context(), store.NewModelGroup{Name: "g"})
+	_ = repo.ReplaceGroupProviders(t.Context(), g.ID, []int64{p.ID})
+	limit := int64(1)
+	key, _ := repo.CreateClientKey(t.Context(), store.NewClientKey{Name: "k", ConcurrencyLimit: 4, TokenLimit: &limit})
+	_ = repo.ReplaceKeyGroups(t.Context(), key.ID, []int64{g.ID})
+	// 先直接占掉这唯一的 1 个 token 总额度，让后续请求处于「已欠费」状态。
+	if _, err := repo.ReserveRequest(t.Context(), store.ReserveInput{
+		RequestID: "seed", KeyID: key.ID, ModelID: model.ID, ProviderID: p.ID,
+		InputText: "x", OutputTokenCeiling: 1, MaxOutputTokens: 1,
+		Limits: store.QuotaLimits{RPMLimit: 30},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	settings := config.Settings{GlobalConcurrencyLimit: 4, RPMLimit: 30, MaxOutputTokens: 16}
+	service := relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
+	h := NewPublicHandler(service, 1<<20)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+key.Token)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Error.Code != "key_token_quota_exceeded" {
+		t.Fatalf("code = %q, want key_token_quota_exceeded: %s", payload.Error.Code, rec.Body.String())
+	}
+	if !strings.Contains(payload.Error.Message, "欠费") {
+		t.Fatalf("message = %q, want an overdraft explanation", payload.Error.Message)
+	}
 }

@@ -6,9 +6,70 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// QuotaLimits 是一次预留判定需要的全部限额。任一字段为 0 表示该窗口不限。
+// 三个窗口的语义：5h 为滚动五小时；daily 为北京时间自然日；weekly 为北京时间
+// 自然周（周一 00:00 CST 起）。
+type QuotaLimits struct {
+	RPMLimit                            int64
+	Token5H, TokenDaily, TokenWeekly    int64
+	Amount5H, AmountDaily, AmountWeekly int64 // 微元
+}
+
+// QuotaError 携带判定明细，供 HTTP 层返回可读原因与正确的状态码。
+type QuotaError struct {
+	Code   string // token_quota_exceeded / amount_quota_exceeded / key_* / rpm_exceeded / concurrency_exceeded
+	Scope  string // 5h / daily / weekly / key / ""
+	Metric string // tokens / amount / ""
+	Used   int64  // tokens 或微元，取决于 Metric
+	Limit  int64
+}
+
+func (e *QuotaError) Error() string {
+	if e == nil {
+		return "quota exceeded"
+	}
+	return e.Code
+}
+
+// Detail 生成给客户端看的中文说明。判定口径是"先欠费后停服"——用到限额之后
+// 才拒，所以文案要说清"已欠费"，否则客户端会以为是临时故障而反复重试。
+func (e *QuotaError) Detail() string {
+	if e == nil {
+		return ""
+	}
+	window := map[string]string{
+		"5h":     "5 小时窗口",
+		"daily":  "当日额度（北京时间）",
+		"weekly": "本周额度（北京时间，自周一起）",
+		"key":    "该 Key 的总额度",
+	}[e.Scope]
+	if window == "" {
+		window = e.Scope
+	}
+	metric := "Token"
+	if e.Metric == "amount" {
+		metric = "金额"
+	}
+	format := func(v int64) string {
+		if e.Metric == "amount" {
+			return "¥" + strconv.FormatFloat(float64(v)/1e6, 'f', 2, 64)
+		}
+		return strconv.FormatInt(v, 10) + " tokens"
+	}
+	return fmt.Sprintf("%s%s已用满（已用 %s，限额 %s）。当前处于欠费状态，请等待窗口轮换或在管理台调大限额", window, metric, format(e.Used), format(e.Limit))
+}
+
+type RequestReservation struct {
+	ID, KeyReservationID                    int64
+	RequestID                               string
+	StartedAt                               time.Time
+	ReservedTokens, ReservedAmountMicroyuan int64
+}
 
 // ReserveInput 描述一次预扣所需的输入规模信息。字符串字段只参与预估，
 // 不会落库。
@@ -23,23 +84,7 @@ type ReserveInput struct {
 	OutputTokenCeiling                        int64
 	MaxOutputTokens                           int64
 	InputPriceMicroyuan, OutputPriceMicroyuan int64
-	RPMLimit, TokenLimit5H, TokenLimitDaily   int64
-}
-
-type RequestReservation struct {
-	ID, KeyReservationID                    int64
-	RequestID                               string
-	StartedAt                               time.Time
-	ReservedTokens, ReservedAmountMicroyuan int64
-}
-
-type QuotaError struct{ Code string }
-
-func (e *QuotaError) Error() string {
-	if e == nil {
-		return "quota exceeded"
-	}
-	return e.Code
+	Limits                                    QuotaLimits
 }
 
 type TrendBucket struct {
@@ -75,15 +120,17 @@ func estimateInputTokens(in ReserveInput) int64 {
 			milli += tokenMilli(r)
 		}
 	}
-	if milli == 0 {
-		return 1
-	}
-	return (milli + 999) / 1000
+	return (milli+999)/1000 + perRequestOverheadTokens
 }
 
 const (
 	milliPerWideToken  = 1250 // 全角字符 1.25 token/字
 	milliPerNarrowChar = 286  // 3.5 字符 1 token（约 0.286 token/字符）
+
+	// perRequestOverheadTokens 是上游分词器给每条请求加的固定角色/分隔开销
+	// （BOS、role 标记、消息分隔符等实测约 3~5 token）。旧实现完全没算它，
+	// 短请求会被低估到 1 token，导致预留不足、结算时才发现超额。
+	perRequestOverheadTokens = 4
 )
 
 // tokenMilli 返回单个字符的预估 token 数，单位是千分之一 token，
@@ -134,8 +181,21 @@ func reserveAmount(inputTokens, outputTokens, inputPrice, outputPrice int64) (in
 	return in + out, nil
 }
 
+// 计费窗口一律按北京时间切分（日/周），与账目口径一致。
+var beijingZone = time.FixedZone("Asia/Shanghai", 8*60*60)
+
 func billingDate(t time.Time) string {
-	return t.In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02")
+	return t.In(beijingZone).Format("2006-01-02")
+}
+
+// billingWeekStart 返回 t 所在北京时间自然周的起点（周一 00:00 CST），
+// 以 UTC 返回，供 [start, now] 区间查询使用。用区间而非新增落库列，
+// 是为了避免迁移：key_reservations.created_at_utc 已有索引。
+func billingWeekStart(t time.Time) time.Time {
+	local := t.In(beijingZone)
+	offset := (int(local.Weekday()) + 6) % 7 // 周一 = 0
+	start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, beijingZone).AddDate(0, 0, -offset)
+	return start.UTC()
 }
 
 func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestReservation, error) {
@@ -163,13 +223,12 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if reservedTokens < inputTokens {
 		return RequestReservation{}, errors.New("reservation token overflow")
 	}
-	for name, value := range map[string]int64{"rpm_limit": in.RPMLimit, "token_limit_5h": in.TokenLimit5H, "token_limit_daily": in.TokenLimitDaily} {
-		if value <= 0 {
-			return RequestReservation{}, fmt.Errorf("%s must be positive", name)
-		}
+	if in.Limits.RPMLimit <= 0 {
+		return RequestReservation{}, errors.New("rpm_limit must be positive")
 	}
 	started := in.StartedAt.Format(time.RFC3339Nano)
 	date := billingDate(in.StartedAt)
+	weekStart := billingWeekStart(in.StartedAt).Format(time.RFC3339Nano)
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return RequestReservation{}, err
@@ -214,31 +273,73 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE julianday(created_at_utc)>=julianday(?,'-60 seconds') AND julianday(created_at_utc)<=julianday(?)`, started, started).Scan(&rpm); err != nil {
 		return rollback(err)
 	}
-	if rpm >= int(in.RPMLimit) {
-		return rollback(&QuotaError{Code: "rpm_exceeded"})
+	if rpm >= int(in.Limits.RPMLimit) {
+		return rollback(&QuotaError{Code: "rpm_exceeded", Scope: "rpm", Metric: "requests", Used: int64(rpm), Limit: in.Limits.RPMLimit})
 	}
-	var fiveHour, daily int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND julianday(created_at_utc)>=julianday(?,'-5 hours') AND julianday(created_at_utc)<=julianday(?)`, started, started).Scan(&fiveHour); err != nil {
+	// ── 额度判定：先欠费后停服 ──
+	//
+	// 只要求"窗口还没用满"，不再要求"窗口已用 + 本次预留 <= 限额"。旧口径会把
+	// "还剩一些、但不够本次输入估算 + 输出上限"的请求整体拒掉：运维看到概览里
+	// 明明还剩额度，客户端却报额度不足，还得靠读代码才能解释。现在改成先放过去、
+	// 用完即欠费，之后的请求才被挡下——欠费状态随窗口轮换或调大限额自动解除。
+	//
+	// 预留额度仍然照算（用于金额预扣与并发账目），只是不再参与"能不能发"的判断，
+	// 所以单次请求可能略微超出限额，多出的部分由后续请求被拒来兜底。
+	overdrawn := func(scope, code string, used, limit int64) error {
+		if limit > 0 && used >= limit {
+			return &QuotaError{Code: code, Scope: scope, Metric: "tokens", Used: used, Limit: limit}
+		}
+		return nil
+	}
+	overdrawnAmount := func(scope, code string, used, limit int64) error {
+		if limit > 0 && used >= limit {
+			return &QuotaError{Code: code, Scope: scope, Metric: "amount", Used: used, Limit: limit}
+		}
+		return nil
+	}
+	var usedTokens, usedAmount int64
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND julianday(created_at_utc)>=julianday(?,'-5 hours') AND julianday(created_at_utc)<=julianday(?)`, started, started).Scan(&usedTokens, &usedAmount); err != nil {
 		return rollback(err)
 	}
-	if fiveHour > in.TokenLimit5H-reservedTokens {
-		return rollback(&QuotaError{Code: "token_quota_exceeded"})
-	}
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND billing_date_bj=? AND created_at_utc<=?`, date, started).Scan(&daily); err != nil {
+	if err := overdrawn("5h", "token_quota_exceeded", usedTokens, in.Limits.Token5H); err != nil {
 		return rollback(err)
 	}
-	if daily > in.TokenLimitDaily-reservedTokens {
-		return rollback(&QuotaError{Code: "token_quota_exceeded"})
+	if err := overdrawnAmount("5h", "amount_quota_exceeded", usedAmount, in.Limits.Amount5H); err != nil {
+		return rollback(err)
 	}
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND billing_date_bj=? AND created_at_utc<=?`, date, started).Scan(&usedTokens, &usedAmount); err != nil {
+		return rollback(err)
+	}
+	if err := overdrawn("daily", "token_quota_exceeded", usedTokens, in.Limits.TokenDaily); err != nil {
+		return rollback(err)
+	}
+	if err := overdrawnAmount("daily", "amount_quota_exceeded", usedAmount, in.Limits.AmountDaily); err != nil {
+		return rollback(err)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND created_at_utc>=? AND created_at_utc<=?`, weekStart, started).Scan(&usedTokens, &usedAmount); err != nil {
+		return rollback(err)
+	}
+	if err := overdrawn("weekly", "token_quota_exceeded", usedTokens, in.Limits.TokenWeekly); err != nil {
+		return rollback(err)
+	}
+	if err := overdrawnAmount("weekly", "amount_quota_exceeded", usedAmount, in.Limits.AmountWeekly); err != nil {
+		return rollback(err)
+	}
+	// Key 总额度不随窗口轮换，用满即欠费。这里只拒绝请求，不再自动停用 Key：
+	// 永久停用会让"明明调大了限额却仍然用不了"，而且必须人工恢复，比欠费即拒更难排查。
 	var keyTokens, keyAmount int64
 	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens+reserved_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status IN ('reserved','completed','failed','aborted')`, in.KeyID).Scan(&keyTokens, &keyAmount); err != nil {
 		return rollback(err)
 	}
-	if tokenLimit.Valid && keyTokens > tokenLimit.Int64-reservedTokens {
-		return rollback(&QuotaError{Code: "key_token_quota_exceeded"})
+	if tokenLimit.Valid {
+		if err := overdrawn("key", "key_token_quota_exceeded", keyTokens, tokenLimit.Int64); err != nil {
+			return rollback(err)
+		}
 	}
-	if amountLimit.Valid && keyAmount > amountLimit.Int64-amount {
-		return rollback(&QuotaError{Code: "key_amount_quota_exceeded"})
+	if amountLimit.Valid {
+		if err := overdrawnAmount("key", "key_amount_quota_exceeded", keyAmount, amountLimit.Int64); err != nil {
+			return rollback(err)
+		}
 	}
 	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,reserved_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, "reserved", inputTokens, reservedTokens, amount, boolInt(in.Stream), date, started)
 	if err != nil {
@@ -300,10 +401,10 @@ func (s *Store) finishRequest(ctx context.Context, requestID, inputTokens, outpu
 		return err
 	}
 	fail := func(e error) error { _, _ = conn.ExecContext(context.Background(), "ROLLBACK"); return e }
-	var keyID, keyReservationID int64
+	var keyReservationID int64
 	var requestToken string
 	var current string
-	if err := conn.QueryRowContext(ctx, `SELECT key_id,request_id FROM requests WHERE id=? AND status='reserved'`, requestID).Scan(&keyID, &requestToken); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT request_id FROM requests WHERE id=? AND status='reserved'`, requestID).Scan(&requestToken); err != nil {
 		return fail(err)
 	}
 	if err := conn.QueryRowContext(ctx, `SELECT id,status FROM key_reservations WHERE request_id=? AND status='reserved' ORDER BY id DESC LIMIT 1`, requestToken).Scan(&keyReservationID, &current); err != nil {
@@ -316,19 +417,10 @@ func (s *Store) finishRequest(ctx context.Context, requestID, inputTokens, outpu
 	if _, err := conn.ExecContext(ctx, `UPDATE requests SET reserved_tokens=0,charged_tokens=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,amount_microyuan=?,status=?,upstream_status=?,finished_at_utc=? WHERE id=? AND status='reserved'`, chargedTokens, inputTokens, outputTokens, cachedInputTokens, chargedAmount, status, httpStatus, nowUTC(), requestID); err != nil {
 		return fail(err)
 	}
-	var tokenLimit, amountLimit sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT token_limit,amount_limit_microyuan FROM client_keys WHERE id=?`, keyID).Scan(&tokenLimit, &amountLimit); err != nil {
-		return fail(err)
-	}
-	var totalTokens, totalAmount int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens),0),COALESCE(SUM(charged_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status IN ('completed','failed','aborted')`, keyID).Scan(&totalTokens, &totalAmount); err != nil {
-		return fail(err)
-	}
-	if (tokenLimit.Valid && totalTokens >= tokenLimit.Int64) || (amountLimit.Valid && totalAmount >= amountLimit.Int64) {
-		if _, err := conn.ExecContext(ctx, `UPDATE client_keys SET enabled=0,disabled_reason='quota_exhausted',updated_at_utc=? WHERE id=?`, nowUTC(), keyID); err != nil {
-			return fail(err)
-		}
-	}
+	// 这里刻意不再把 Key 自动停用（旧行为：总配额用满即 enabled=0 +
+	// disabled_reason='quota_exhausted'）。停用是永久性的，运维调大限额后 Key
+	// 仍然用不了，只会让人以为"明明还有余量却提示无法使用"。额度管控改由
+	// ReserveRequest 在每次请求时判定：欠费即拒，限额调大或窗口轮换后自动恢复。
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err
 	}
@@ -426,6 +518,7 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 	nowText := now.Format(time.RFC3339Nano)
 	minuteStart := now.Add(-time.Minute).Format(time.RFC3339Nano)
 	fiveHourStart := now.Add(-5 * time.Hour).Format(time.RFC3339Nano)
+	weekStart := billingWeekStart(now).Format(time.RFC3339Nano)
 	hourStart := now.Add(-time.Hour).Format(time.RFC3339Nano)
 	date := billingDate(now)
 	scope := `provider_id IN (SELECT provider_id FROM group_providers WHERE group_id=?)`
@@ -433,11 +526,14 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE `+scope+` AND created_at_utc>=? AND created_at_utc<=?`, groupID, minuteStart, nowText).Scan(&rpm); err != nil {
 		return nil, err
 	}
-	var fiveHour, daily, dailyAmount int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.created_at_utc>=? AND kr.created_at_utc<=?`, groupID, fiveHourStart, nowText).Scan(&fiveHour); err != nil {
+	var fiveHour, fiveHourAmount, daily, dailyAmount, weekly, weeklyAmount int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0),COALESCE(SUM(kr.charged_amount_microyuan+kr.reserved_amount_microyuan),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.created_at_utc>=? AND kr.created_at_utc<=?`, groupID, fiveHourStart, nowText).Scan(&fiveHour, &fiveHourAmount); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0),COALESCE(SUM(kr.charged_amount_microyuan+kr.reserved_amount_microyuan),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.billing_date_bj=? AND kr.created_at_utc<=?`, groupID, date, nowText).Scan(&daily, &dailyAmount); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0),COALESCE(SUM(kr.charged_amount_microyuan+kr.reserved_amount_microyuan),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.created_at_utc>=? AND kr.created_at_utc<=?`, groupID, weekStart, nowText).Scan(&weekly, &weeklyAmount); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE `+scope+` AND created_at_utc>=? AND created_at_utc<=? GROUP BY status`, groupID, hourStart, nowText)
@@ -472,17 +568,34 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 		"group_id":         groupID,
 		"generated_at_utc": nowText,
 		"rpm":              map[string]any{"used": rpm},
-		"five_hour":        map[string]any{"used_tokens": fiveHour},
-		"daily":            map[string]any{"used_tokens": daily, "amount_microyuan": dailyAmount},
+		"five_hour":        map[string]any{"used_tokens": fiveHour, "used_microyuan": fiveHourAmount},
+		"daily":            map[string]any{"used_tokens": daily, "used_microyuan": dailyAmount},
+		"weekly":           map[string]any{"used_tokens": weekly, "used_microyuan": weeklyAmount},
 		"last_hour":        map[string]any{"completed": outcomes["completed"], "failed": outcomes["failed"], "aborted": outcomes["aborted"], "rejected": outcomes["rejected"], "reserved": outcomes["reserved"], "error_rate": errorRate},
 		"active":           active,
 	}, nil
 }
 
+// windowUsage 汇总 key_reservations 在给定条件下的（token, 微元）用量。
+// 「未结算的预留也算已用」与限额判定口径保持一致，否则运维看到的数字会比
+// 实际生效的宽松。
+func (s *Store) windowUsage(ctx context.Context, extra string, args ...any) (int64, int64, error) {
+	query := `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted')`
+	if extra != "" {
+		query += " AND " + extra
+	}
+	var tokens, amount int64
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&tokens, &amount); err != nil {
+		return 0, 0, err
+	}
+	return tokens, amount, nil
+}
+
 // Overview returns metadata-only counters used by the administrator console.
 // It deliberately accepts limits as arguments so configuration remains outside
 // the store and no credentials or prompts can enter the response.
-func (s *Store) Overview(ctx context.Context, now time.Time, rpmLimit, fiveHourLimit, dailyLimit int64) (map[string]any, error) {
+// 限额为 0 表示该窗口不限，原样回传，由前端显示为「不限」。
+func (s *Store) Overview(ctx context.Context, now time.Time, limits QuotaLimits) (map[string]any, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -490,17 +603,23 @@ func (s *Store) Overview(ctx context.Context, now time.Time, rpmLimit, fiveHourL
 	nowText := now.Format(time.RFC3339Nano)
 	minuteStart := now.Add(-time.Minute).Format(time.RFC3339Nano)
 	fiveHourStart := now.Add(-5 * time.Hour).Format(time.RFC3339Nano)
+	weekStart := billingWeekStart(now).Format(time.RFC3339Nano)
 	hourStart := now.Add(-time.Hour)
 	date := billingDate(now)
 	var rpm int
-	var fiveHour, daily int64
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE created_at_utc>=? AND created_at_utc<=?`, minuteStart, nowText).Scan(&rpm); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND created_at_utc>=? AND created_at_utc<=?`, fiveHourStart, nowText).Scan(&fiveHour); err != nil {
+	fiveTokens, fiveAmount, err := s.windowUsage(ctx, `created_at_utc>=? AND created_at_utc<=?`, fiveHourStart, nowText)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(sum(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND billing_date_bj=? AND created_at_utc<=?`, date, nowText).Scan(&daily); err != nil {
+	dayTokens, dayAmount, err := s.windowUsage(ctx, `billing_date_bj=? AND created_at_utc<=?`, date, nowText)
+	if err != nil {
+		return nil, err
+	}
+	weekTokens, weekAmount, err := s.windowUsage(ctx, `created_at_utc>=? AND created_at_utc<=?`, weekStart, nowText)
+	if err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE created_at_utc>=? AND created_at_utc<=? GROUP BY status`, hourStart.Format(time.RFC3339Nano), nowText)
@@ -563,9 +682,10 @@ func (s *Store) Overview(ctx context.Context, now time.Time, rpmLimit, fiveHourL
 	}
 	return map[string]any{
 		"generated_at_utc": nowText,
-		"rpm":              map[string]any{"used": rpm, "limit": rpmLimit},
-		"five_hour":        map[string]any{"used_tokens": fiveHour, "limit": fiveHourLimit},
-		"daily":            map[string]any{"used_tokens": daily, "limit": dailyLimit},
+		"rpm":              map[string]any{"used": rpm, "limit": limits.RPMLimit},
+		"five_hour":        map[string]any{"used_tokens": fiveTokens, "limit": limits.Token5H, "used_microyuan": fiveAmount, "amount_limit": limits.Amount5H},
+		"daily":            map[string]any{"used_tokens": dayTokens, "limit": limits.TokenDaily, "used_microyuan": dayAmount, "amount_limit": limits.AmountDaily},
+		"weekly":           map[string]any{"used_tokens": weekTokens, "limit": limits.TokenWeekly, "used_microyuan": weekAmount, "amount_limit": limits.AmountWeekly},
 		"last_hour":        map[string]any{"completed": outcomes["completed"], "failed": outcomes["failed"], "aborted": outcomes["aborted"], "rejected": outcomes["rejected"], "reserved": outcomes["reserved"], "error_rate": errorRate},
 		"trend":            trend,
 		"recent":           recent,

@@ -42,17 +42,6 @@ type UpdateClientKey struct {
 	DisabledReason       *string
 }
 
-type KeyReservation struct {
-	ID                      int64
-	KeyID                   int64
-	ModelID                 int64
-	ReservedTokens          int64
-	ReservedAmountMicroyuan int64
-	ChargedTokens           int64
-	ChargedAmountMicroyuan  int64
-	Status                  string
-}
-
 func (s *Store) CreateClientKey(ctx context.Context, in NewClientKey) (ClientKey, error) {
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
@@ -213,7 +202,7 @@ func (s *Store) GetClientKey(ctx context.Context, id int64) (ClientKey, error) {
 	return scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,'') FROM client_keys WHERE id=?`, id))
 }
 
-// KeyUsageStat mirrors the quota-check aggregation in ReserveForKey: every
+// KeyUsageStat mirrors the quota-check aggregation in ReserveRequest: every
 // reservation counts, no matter how it finished, so the numbers operators see
 // match the limits actually enforced.
 type KeyUsageStat struct {
@@ -222,7 +211,8 @@ type KeyUsageStat struct {
 	Requests        int64
 }
 
-// KeyUsage returns consumed tokens and amount per key.
+// KeyUsage returns consumed tokens and amount per key. 与 ReserveRequest 的
+// 额度判定同口径：预留中的请求也算已用，否则运维看到的数字会比实际生效的宽松。
 func (s *Store) KeyUsage(ctx context.Context) (map[int64]KeyUsageStat, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT key_id,
 		COALESCE(SUM(charged_tokens+reserved_tokens),0),
@@ -414,110 +404,4 @@ func (s *Store) AuthorizedModels(ctx context.Context, token string) ([]Model, er
 		out = append(out, m)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) ReserveForKey(ctx context.Context, keyID, modelID, tokens, amount int64) (KeyReservation, error) {
-	s.reservationMu.Lock()
-	defer s.reservationMu.Unlock()
-	if keyID <= 0 || modelID <= 0 || tokens < 0 || amount < 0 {
-		return KeyReservation{}, errors.New("invalid reservation")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return KeyReservation{}, err
-	}
-	defer tx.Rollback()
-	var enabled, concurrency int
-	var tokenLimit, amountLimit sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT k.enabled,k.concurrency_limit,k.token_limit,k.amount_limit_microyuan FROM client_keys k WHERE k.id=?`, keyID).Scan(&enabled, &concurrency, &tokenLimit, &amountLimit); err != nil {
-		return KeyReservation{}, err
-	}
-	if enabled != 1 {
-		return KeyReservation{}, errors.New("client key is disabled")
-	}
-	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM key_reservations WHERE key_id=? AND status='reserved'`, keyID).Scan(&active); err != nil {
-		return KeyReservation{}, err
-	}
-	if active >= concurrency {
-		return KeyReservation{}, errors.New("concurrency limit exceeded")
-	}
-	var allowed int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE kg.key_id=?`, modelID, keyID).Scan(&allowed); err != nil {
-		return KeyReservation{}, err
-	}
-	if allowed == 0 {
-		return KeyReservation{}, errors.New("model is not authorized for key")
-	}
-	var usedTokens, usedAmount int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens+reserved_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status IN ('reserved','completed')`, keyID).Scan(&usedTokens, &usedAmount); err != nil {
-		return KeyReservation{}, err
-	}
-	if tokenLimit.Valid && (tokens > tokenLimit.Int64-usedTokens) {
-		return KeyReservation{}, errors.New("key token quota exceeded")
-	}
-	if amountLimit.Valid && (amount > amountLimit.Int64-usedAmount) {
-		return KeyReservation{}, errors.New("key amount quota exceeded")
-	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO key_reservations(key_id,model_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (?,?,?,?,?,?)`, keyID, modelID, tokens, amount, "reserved", nowUTC())
-	if err != nil {
-		return KeyReservation{}, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return KeyReservation{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return KeyReservation{}, err
-	}
-	return KeyReservation{ID: id, KeyID: keyID, ModelID: modelID, ReservedTokens: tokens, ReservedAmountMicroyuan: amount, Status: "reserved"}, nil
-}
-
-func (s *Store) SettleKey(ctx context.Context, reservationID, tokens, amount int64, status string) error {
-	s.reservationMu.Lock()
-	defer s.reservationMu.Unlock()
-	if reservationID <= 0 || tokens < 0 || amount < 0 {
-		return errors.New("invalid settlement")
-	}
-	if status != "completed" && status != "failed" && status != "aborted" && status != "rejected" {
-		return errors.New("invalid settlement status")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var keyID int64
-	var current string
-	if err := tx.QueryRowContext(ctx, `SELECT key_id,status FROM key_reservations WHERE id=?`, reservationID).Scan(&keyID, &current); err != nil {
-		return err
-	}
-	if current != "reserved" {
-		return errors.New("reservation already settled")
-	}
-	chargedTokens, chargedAmount := int64(0), int64(0)
-	if status == "completed" {
-		chargedTokens, chargedAmount = tokens, amount
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE key_reservations SET reserved_tokens=0,reserved_amount_microyuan=0,charged_tokens=?,charged_amount_microyuan=?,status=?,finished_at_utc=? WHERE id=? AND status='reserved'`, chargedTokens, chargedAmount, status, nowUTC(), reservationID)
-	if err != nil {
-		return err
-	}
-	if n, _ := result.RowsAffected(); n != 1 {
-		return errors.New("reservation already settled")
-	}
-	var totalTokens, totalAmount int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(charged_tokens),0),COALESCE(SUM(charged_amount_microyuan),0) FROM key_reservations WHERE key_id=? AND status='completed'`, keyID).Scan(&totalTokens, &totalAmount); err != nil {
-		return err
-	}
-	var tokenLimit, amountLimit sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT token_limit,amount_limit_microyuan FROM client_keys WHERE id=?`, keyID).Scan(&tokenLimit, &amountLimit); err != nil {
-		return err
-	}
-	if (tokenLimit.Valid && totalTokens >= tokenLimit.Int64) || (amountLimit.Valid && totalAmount >= amountLimit.Int64) {
-		if _, err := tx.ExecContext(ctx, `UPDATE client_keys SET enabled=0,disabled_reason='quota_exhausted',updated_at_utc=? WHERE id=?`, nowUTC(), keyID); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }

@@ -31,28 +31,27 @@ func TestNewKeyIsReturnedOnceAndStoredAsDigest(t *testing.T) {
 	}
 }
 
-func TestSettlementDisablesKeyAtTokenOrAmountLimitAndIsIdempotent(t *testing.T) {
-	repo := newTestStore(t)
-	p, _ := repo.CreateProvider(context.Background(), NewProvider{Name: "p", BaseURL: "https://provider.example", APIKey: "s"})
-	price := int64(100)
-	m, _ := repo.CreateModel(context.Background(), NewModel{ProviderID: p.ID, PublicName: "m", UpstreamName: "m", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
-	g, _ := repo.CreateModelGroup(context.Background(), NewModelGroup{Name: "g"})
-	_ = repo.ReplaceGroupProviders(context.Background(), g.ID, []int64{p.ID})
-	key, _ := repo.CreateClientKey(context.Background(), NewClientKey{Name: "k", ConcurrencyLimit: 1, TokenLimit: ptrInt64(10), AmountLimitMicroyuan: ptrInt64(1000)})
-	_ = repo.ReplaceKeyGroups(context.Background(), key.ID, []int64{g.ID})
-	r, err := repo.ReserveForKey(context.Background(), key.ID, m.ID, 10, 1000)
+// 结算必须幂等：同一笔预留被重复结算要报错，不能重复计费。
+// 注意这里刻意不再断言"Key 用满即自动停用"——v0.3.2 起已移除该行为（旧行为会
+// 让运维调大限额后 Key 依然用不了），额度判定改由每次请求时进行。
+func TestSettlementIsIdempotent(t *testing.T) {
+	repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+	reservation, err := repo.ReserveRequest(context.Background(), newReservationArgs(key.ID, model.ID, "request-idempotent", 10))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.SettleKey(context.Background(), r.ID, 10, 1000, "completed"); err != nil {
+	if err := repo.SettleRequest(context.Background(), reservation.ID, 3, 4, 0, 700, "completed"); err != nil {
 		t.Fatal(err)
 	}
-	current, _ := repo.GetClientKey(context.Background(), key.ID)
-	if current.Enabled || current.DisabledReason != "quota_exhausted" {
-		t.Fatalf("key remains active: %#v", current)
-	}
-	if err := repo.SettleKey(context.Background(), r.ID, 10, 1000, "completed"); err == nil {
+	if err := repo.SettleRequest(context.Background(), reservation.ID, 3, 4, 0, 700, "completed"); err == nil {
 		t.Fatal("double settlement accepted")
+	}
+	current, err := repo.GetClientKey(context.Background(), key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.Enabled {
+		t.Fatalf("settlement must not disable the key any more: %#v", current)
 	}
 }
 

@@ -49,7 +49,7 @@ func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, s
 	if len(admin) == 0 || admin[0] == nil {
 		// 无管理端（测试或纯转发实例）：其余路径仍交给公开接口分发。
 		mux.Handle("/", public)
-		return mux
+		return withAccessLog(mux)
 	}
 	mux.Handle("/admin", admin[0])
 	mux.Handle("/admin/", admin[0])
@@ -69,7 +69,7 @@ func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, s
 		}
 		http.NotFound(w, r)
 	})
-	return mux
+	return withAccessLog(mux)
 }
 
 // registerHealth 挂载两个免认证探针：

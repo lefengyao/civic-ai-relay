@@ -26,9 +26,10 @@ func TestEstimateInputTokensIsCalibratedToRealTokenizers(t *testing.T) {
 	for _, tc := range cases {
 		msg := `[{"role":"user","content":"` + tc.content + `"}]`
 		runes := float64(utf8.RuneCountInString(msg))
-		got := estimateInputTokens(ReserveInput{InputText: msg, StringFields: []string{msg}})
-		if float64(got) < runes*tc.lo || float64(got) > runes*tc.hi {
-			t.Fatalf("%s: estimate = %d, want within [%.0f, %.0f]（消息 %d 字符）",
+		// 断言只看"随内容增长"的那部分，先扣掉每条请求的固定开销。
+		got := float64(estimateInputTokens(ReserveInput{InputText: msg, StringFields: []string{msg}}) - perRequestOverheadTokens)
+		if got < runes*tc.lo || got > runes*tc.hi {
+			t.Fatalf("%s: estimate = %.0f, want within [%.0f, %.0f]（消息 %d 字符）",
 				tc.name, got, runes*tc.lo, runes*tc.hi, int(runes))
 		}
 	}
@@ -53,10 +54,16 @@ func TestEstimateInputTokensScalesLinearly(t *testing.T) {
 	}
 }
 
-// TestEstimateInputTokensNeverEmpty 空输入至少按 1 token 预留，避免空预留。
-func TestEstimateInputTokensNeverEmpty(t *testing.T) {
-	if got := estimateInputTokens(ReserveInput{}); got != 1 {
-		t.Fatalf("empty estimate = %d, want 1", got)
+// TestEstimateInputTokensAlwaysAddsPerRequestOverhead 每条请求都要带上分词器
+// 的固定开销（角色标记、分隔符等）。旧实现漏算它，空输入只留 1 token，短请求
+// 会被低估。
+func TestEstimateInputTokensAlwaysAddsPerRequestOverhead(t *testing.T) {
+	if got := estimateInputTokens(ReserveInput{}); got != perRequestOverheadTokens {
+		t.Fatalf("empty estimate = %d, want %d", got, perRequestOverheadTokens)
+	}
+	// 调用方给了明确 token 数时按原样采信，不再叠加开销。
+	if got := estimateInputTokens(ReserveInput{InputTokens: 7}); got != 7 {
+		t.Fatalf("explicit InputTokens estimate = %d, want 7", got)
 	}
 }
 

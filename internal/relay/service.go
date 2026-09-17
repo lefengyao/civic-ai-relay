@@ -155,7 +155,9 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	effective.InputPriceMicroyuan = applyRate(model.InputPriceMicroyuan, rate)
 	effective.OutputPriceMicroyuan = applyRate(model.OutputPriceMicroyuan, rate)
 	effective.CachedInputPriceMicroyuan = applyRate(model.CachedInputPriceMicroyuan, rate)
-	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 4096}
+	// 兜底配置只在未注入 settings 时生效（测试用）。额度项留 0 = 不限，
+	// 与出厂默认一致：限额是运维显式选择，不该由兜底值造成意外拒绝。
+	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 4096}
 	if s.settings != nil {
 		settings = s.settings()
 	}
@@ -190,10 +192,19 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		s.global.Release()
 		return nil, store.Model{}, ErrKeyConcurrencyExceeded
 	}
-	stringFields := make([]string, 0, len(req.Messages))
+	stringFields := make([]string, 0, len(req.Messages)+2)
 	for _, message := range req.Messages {
 		if encoded, marshalErr := json.Marshal(message); marshalErr == nil {
 			stringFields = append(stringFields, string(encoded))
+		}
+	}
+	// tools / functions / response_format 是 messages 之外独立的长文本，会被真实
+	// 分词器计入 prompt。旧实现漏算它们，带工具定义的编码类客户端会被显著低估。
+	for _, key := range []string{"tools", "functions", "response_format"} {
+		if value, ok := req.Payload[key]; ok && value != nil {
+			if encoded, marshalErr := json.Marshal(value); marshalErr == nil {
+				stringFields = append(stringFields, string(encoded))
+			}
 		}
 	}
 	reservation, err := s.store.ReserveRequest(ctx, store.ReserveInput{
@@ -201,7 +212,15 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		Stream: req.Stream, InputText: req.InputText, StringFields: stringFields,
 		OutputTokenCeiling: output, MaxOutputTokens: output,
 		InputPriceMicroyuan: valueOrZero(effective.InputPriceMicroyuan), OutputPriceMicroyuan: valueOrZero(effective.OutputPriceMicroyuan),
-		RPMLimit: int64(settings.RPMLimit), TokenLimit5H: settings.TokenLimit5H, TokenLimitDaily: settings.TokenLimitDaily,
+		Limits: store.QuotaLimits{
+			RPMLimit:     int64(settings.RPMLimit),
+			Token5H:      settings.TokenLimit5H,
+			TokenDaily:   settings.TokenLimitDaily,
+			TokenWeekly:  settings.TokenLimitWeekly,
+			Amount5H:     settings.AmountLimit5H,
+			AmountDaily:  settings.AmountLimitDaily,
+			AmountWeekly: settings.AmountLimitWeekly,
+		},
 	})
 	if err != nil {
 		s.keys.Release(key.ID)

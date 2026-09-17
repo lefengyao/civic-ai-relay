@@ -140,6 +140,33 @@ var migrations = []migration{
 		`DROP TABLE group_models`,
 		`CREATE INDEX idx_group_providers_provider ON group_providers(provider_id, group_id)`,
 	}},
+	// v9: 取消「Key 总配额用满即自动停用」。旧代码会把 Key 置为 enabled=0 +
+	// disabled_reason='quota_exhausted'，而调大限额后它不会自动恢复——运维看到
+	// 的是"额度明明还有，请求却说无法使用"，还得手工把 Key 启回来。额度判定已
+	// 改到每次请求时进行（欠费即拒，限额调大或窗口轮换后自动恢复），所以这里把
+	// 历史遗留的自动停用恢复成启用。手动停用（disabled_reason 为其它值）不动。
+	{version: 9, statements: []string{
+		`UPDATE client_keys SET enabled=1, disabled_reason='' WHERE disabled_reason='quota_exhausted'`,
+	}},
+	// v10: 分组可用性监测结果。每轮监测每个分组写一行（不是每个渠道一行——
+	// detail 里已经写清哪些渠道失败），组数×轮次才是行数增长量，很有限。
+	// 说明：本功能的定位是「发现并展示」，不改变服务行为，所以没有自动停用渠道
+	// 之类的副作用字段。
+	{version: 10, statements: []string{
+		`CREATE TABLE group_monitor_results (
+			id INTEGER PRIMARY KEY,
+			group_id INTEGER NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+			status TEXT NOT NULL,
+			detail TEXT NOT NULL DEFAULT '',
+			total_providers INTEGER NOT NULL DEFAULT 0,
+			failed_providers INTEGER NOT NULL DEFAULT 0,
+			latency_ms INTEGER NOT NULL DEFAULT 0,
+			trigger TEXT NOT NULL DEFAULT 'auto',
+			created_at_utc TEXT NOT NULL
+		)`,
+		`CREATE INDEX idx_group_monitor_latest ON group_monitor_results(group_id, id DESC)`,
+		`CREATE INDEX idx_group_monitor_time ON group_monitor_results(created_at_utc)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

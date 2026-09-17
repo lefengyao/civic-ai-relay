@@ -1,20 +1,27 @@
 # Civic Relay —— 单容器运行方案（默认配置：命名卷，跨平台零准备）
 #
+# 离线安装（推荐：服务器不需要联网构建）
+#   docker load -i civic-relay-<版本>-image.tar.gz
+#   docker compose up -d                 # 注意：不要加 --build
+# 或者现场构建（服务器能访问 Docker Hub 与 Go 模块代理时）
 #   docker compose up -d --build
-#   docker compose ps             # 等待 STATUS 变为 healthy
-#   docker compose logs -f
+# 等待状态变为 healthy：
+#   docker compose ps
 #
-# 首次启动会在卷内生成 relay.env 与一次性的 bootstrap-admin-key.txt：
-#   docker compose exec civic-relay cat /app/config/bootstrap-admin-key.txt
-# 取得管理员密钥后请删除该文件：
-#   docker compose exec civic-relay rm /app/config/bootstrap-admin-key.txt
+# 首次启动会在配置卷内生成 relay.env 与一次性的 bootstrap-admin-key.txt。
+# ⚠️ 镜像基于 distroless——**容器里没有 shell、也没有 cat/ls**，所以
+#    `docker compose exec civic-relay cat ...` 一定会失败。取密钥要用辅助容器：
+#   docker volume ls | grep civic-relay        # 先确认卷名（前缀 = compose 项目名 = 当前目录名）
+#   docker run --rm -v <卷名>:/c alpine cat /c/bootstrap-admin-key.txt
+#   docker run --rm -v <卷名>:/c alpine rm -f /c/bootstrap-admin-key.txt
+# 也可以直接用脚本：bash scripts/docker-ops.sh 管理员密钥 / 删密钥 / 备份 / 检查环境
 #
 # 需要把配置与数据库放到宿主机指定目录（便于备份/迁移/审计）时，叠加绑定卷覆盖文件：
 #   docker compose -f docker-compose.yml -f docker-compose.bind.yml up -d --build
 #
 # 端口默认绑定所有网卡（0.0.0.0:8000，等价 8000:8000），局域网内可用 http://<本机IP>:8000 访问。
 # 注意这是明文 HTTP：除非只用可信内网，否则应改为只绑本机（CIVIC_RELAY_BIND=127.0.0.1）
-# 并在前面挂 HTTPS 反向代理；另外 Windows 防火墙需放行入站 8000，否则局域网仍连不上。
+# 并在前面挂 HTTPS 反向代理。Linux 上还需放行入站 8000（ufw/firewalld + 云安全组）。
 # 若只想改宿主机端口，用 CIVIC_RELAY_PORT，不要改 relay.env 里的 PORT。
 
 services:

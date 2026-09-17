@@ -14,3 +14,6 @@ backups/
 bootstrap-admin-key.txt
 .superpowers/
 dist/
+# 本地联调工具：假上游 + 端到端脚本（_e2e/run_e2e.py）。不进仓库、不进发布包。
+_e2e/
+_check_admin.js

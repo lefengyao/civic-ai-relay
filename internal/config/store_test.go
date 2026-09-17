@@ -113,6 +113,23 @@ func TestSerializeEnvMappingSortsAndRoundTrips(t *testing.T) {
 	}
 }
 
+// 引导写入 relay.env 的出厂额度必须全部不限（0）。这里钉住它：旧版本写死
+// 5h=100000 / 日=20000，而预留要按「输入估算 + 输出上限」算，新部署的第一次
+// 编码类请求就会被 token_quota_exceeded 挡住——运维看到的是"明明还有余量却
+// 提示额度不足"。限额应当是运维的显式选择。
+func TestGeneratedSettingsLeaveQuotaWindowsUnlimited(t *testing.T) {
+	settings, err := GenerateInitialSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokens := settings.TokenLimits(); tokens != [3]int64{} {
+		t.Fatalf("bootstrap token limits = %v, want all zero (unlimited)", tokens)
+	}
+	if amounts := settings.AmountLimits(); amounts != [3]int64{} {
+		t.Fatalf("bootstrap amount limits = %v, want all zero (unlimited)", amounts)
+	}
+}
+
 func TestConfigStoreWriteIsAtomicAndPreservesUnknownValues(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "relay.env")

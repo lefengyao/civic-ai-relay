@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"civic-ai-relay/internal/relay"
+	"civic-ai-relay/internal/store"
 	"civic-ai-relay/internal/upstream"
 )
 
@@ -195,6 +196,9 @@ func (h *PublicHandler) stream(w http.ResponseWriter, r *http.Request, req relay
 
 func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 	status, code := http.StatusInternalServerError, "relay_error"
+	detail := err.Error()
+	var quota *store.QuotaError
+	var upstreamErr *upstream.Error
 	switch {
 	case errors.Is(err, relay.ErrUnauthorized):
 		status, code = http.StatusUnauthorized, "invalid_api_key"
@@ -204,13 +208,17 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 		status, code = http.StatusTooManyRequests, "rate_limit_exceeded"
 	case errors.Is(err, relay.ErrInvalidRequest):
 		status, code = http.StatusBadRequest, "invalid_request"
-	default:
-		var upstreamErr *upstream.Error
-		if errors.As(err, &upstreamErr) {
-			status, code = http.StatusBadGateway, upstreamErr.Code
+	case errors.As(err, &quota):
+		// 额度用满必须是 429 且带具体窗口与数字。旧实现没有这一分支，QuotaError
+		// 落到 default 返回 500 relay_error，客户端会当成服务端故障反复重试。
+		status, code = http.StatusTooManyRequests, quota.Code
+		if text := quota.Detail(); text != "" {
+			detail = text
 		}
+	case errors.As(err, &upstreamErr):
+		status, code = http.StatusBadGateway, upstreamErr.Code
 	}
-	writeErrorDetail(w, status, code, err.Error())
+	writeErrorDetail(w, status, code, detail)
 }
 
 func boolValue(value any) bool { result, _ := value.(bool); return result }

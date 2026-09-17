@@ -7,11 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"civic-ai-relay/internal/logging"
 )
 
 // SettingsError identifies a setting without echoing the supplied value.
@@ -39,30 +40,53 @@ func invalid(name string, cause error) error {
 // by Redacted and should not be logged. EncryptionKey is the base64 encoding
 // of exactly 32 random bytes.
 type Settings struct {
-	Host                   string
-	Port                   int
-	DBPath                 string
-	DocsEnabled            bool
-	AdminAPIKey            string
-	EncryptionKey          string
-	UpstreamBaseURL        string
-	UpstreamAPIKey         string
-	ModelAutoSync          bool
-	ModelSyncInterval      time.Duration
+	Host          string
+	Port          int
+	DBPath        string
+	AdminAPIKey   string
+	EncryptionKey string
+	// 注意：这里刻意不再有 UPSTREAM_BASE_URL / UPSTREAM_API_KEY —— 那是单上游
+	// 时代的遗留配置。现在渠道（含各自的地址与密钥）全部存在数据库里、由管理台
+	// 维护，密钥是加密存储的；留着这两个键会让人以为要在这里填上游，而它们既不
+	// 生效、还会把 Key 明文写进 relay.env。同理 DOCS_ENABLED 也已移除：服务端
+	// 从来没有 docs 路由，那个开关什么也不控制。
+	ModelAutoSync     bool
+	ModelSyncInterval time.Duration
+	// GroupMonitorInterval 是分组可用性监测的轮询间隔，0 = 关闭监测。
+	// 开启后每轮会对每个分组内启用中的渠道打一次上游 /v1/models（不产生
+	// token 费用），结果落库并展示在管理台，不改变任何服务行为。
+	GroupMonitorInterval   time.Duration
 	MemoryLimitMB          int
 	MaxBodyBytes           int64
 	MaxOutputTokens        int
 	MaxStreamDuration      time.Duration
 	GlobalConcurrencyLimit int
 	RPMLimit               int
-	TokenLimit5H           int64
-	TokenLimitDaily        int64
-	ConnectTimeout         time.Duration
-	ReadTimeout            time.Duration
-	WriteTimeout           time.Duration
-	PoolTimeout            time.Duration
-	RetentionDays          int
-	LogLevel               string
+	// 额度限额一律「0 = 不限」。窗口语义：5h 为滚动五小时；日/周为北京时间
+	// 自然日与自然周（周一 00:00 起）。出厂默认全部不限，避免新部署第一次
+	// 请求就被预留额度挡住；限额是运维显式选择，不是默认约束。
+	TokenLimit5H      int64
+	TokenLimitDaily   int64
+	TokenLimitWeekly  int64
+	AmountLimit5H     int64 // 微元
+	AmountLimitDaily  int64 // 微元
+	AmountLimitWeekly int64 // 微元
+	ConnectTimeout    time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	PoolTimeout       time.Duration
+	RetentionDays     int
+	LogLevel          string
+}
+
+// TokenLimits 返回三个 Token 窗口的限额（0 = 不限），顺序为 5h / 日 / 周。
+func (s Settings) TokenLimits() [3]int64 {
+	return [3]int64{s.TokenLimit5H, s.TokenLimitDaily, s.TokenLimitWeekly}
+}
+
+// AmountLimits 返回三个金额窗口的限额，单位微元（0 = 不限），顺序为 5h / 日 / 周。
+func (s Settings) AmountLimits() [3]int64 {
+	return [3]int64{s.AmountLimit5H, s.AmountLimitDaily, s.AmountLimitWeekly}
 }
 
 var settingName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -99,6 +123,11 @@ func Parse(values map[string]string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	// 级别名打错时直接拒绝保存/启动：静默退回 INFO 会让人以为「调成 DEBUG 了
+	// 怎么还是没日志」，而这恰恰是 LOG_LEVEL 之前那个「改了没反应」的老问题。
+	if _, levelErr := logging.ParseLevel(s.LogLevel); levelErr != nil {
+		return Settings{}, invalid("LOG_LEVEL", levelErr)
+	}
 	s.Port, err = positiveInt(values, "PORT", 8000)
 	if err != nil {
 		return Settings{}, err
@@ -107,24 +136,18 @@ func Parse(values map[string]string) (Settings, error) {
 		return Settings{}, invalid("PORT", errors.New("out of range"))
 	}
 
-	s.DocsEnabled, err = boolean(values, "DOCS_ENABLED", false)
+	// 自动同步默认**关闭**：它会定期访问所有启用渠道的上游、并向数据库写入新
+	// 模型，属于会改变现状的动作，应当由运维显式开启。引导模板同样写 false。
+	s.ModelAutoSync, err = boolean(values, "MODEL_AUTO_SYNC", false)
 	if err != nil {
 		return Settings{}, err
 	}
-	// Existing deployments defaulted background model synchronization on;
-	// first-start bootstrap explicitly writes it off until a provider is added.
-	s.ModelAutoSync, err = boolean(values, "MODEL_AUTO_SYNC", true)
-	if err != nil {
-		return Settings{}, err
-	}
-
-	s.UpstreamBaseURL, err = optionalURL(values, "UPSTREAM_BASE_URL")
-	if err != nil {
-		return Settings{}, err
-	}
-	s.UpstreamAPIKey = strings.TrimSpace(values["UPSTREAM_API_KEY"])
 
 	s.ModelSyncInterval, err = duration(values, "MODEL_SYNC_INTERVAL", 30*time.Minute, time.Minute)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.GroupMonitorInterval, err = intervalOrZero(values, "GROUP_MONITOR_INTERVAL", 30*time.Minute)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -152,11 +175,27 @@ func Parse(values map[string]string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	s.TokenLimit5H, err = positiveInt64(values, "TOKEN_LIMIT_5H", 100000)
+	s.TokenLimit5H, err = tokenLimit(values, "TOKEN_LIMIT_5H", 0)
 	if err != nil {
 		return Settings{}, err
 	}
-	s.TokenLimitDaily, err = positiveInt64(values, "TOKEN_LIMIT_DAILY", 20000)
+	s.TokenLimitDaily, err = tokenLimit(values, "TOKEN_LIMIT_DAILY", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.TokenLimitWeekly, err = tokenLimit(values, "TOKEN_LIMIT_WEEKLY", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.AmountLimit5H, err = amountLimit(values, "AMOUNT_LIMIT_5H", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.AmountLimitDaily, err = amountLimit(values, "AMOUNT_LIMIT_DAILY", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.AmountLimitWeekly, err = amountLimit(values, "AMOUNT_LIMIT_WEEKLY", 0)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -206,28 +245,6 @@ func textDefault(values map[string]string, name, fallback string) (string, error
 	return fallback, nil
 }
 
-func optionalURL(values map[string]string, name string) (string, error) {
-	value := strings.TrimSpace(values[name])
-	if value == "" {
-		return "", nil
-	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", invalid(name, err)
-	}
-	if parsed.Port() != "" {
-		port, portErr := strconv.Atoi(parsed.Port())
-		if portErr != nil || port < 1 || port > 65535 {
-			return "", invalid(name, portErr)
-		}
-	}
-	value = strings.TrimRight(value, "/")
-	if strings.HasSuffix(value, "/v1") {
-		value = strings.TrimSuffix(value, "/v1")
-	}
-	return value, nil
-}
-
 func boolean(values map[string]string, name string, fallback bool) (bool, error) {
 	raw, ok := values[name]
 	if !ok {
@@ -255,16 +272,84 @@ func positiveInt(values map[string]string, name string, fallback int) (int, erro
 	return value, nil
 }
 
-func positiveInt64(values map[string]string, name string, fallback int64) (int64, error) {
+// tokenLimit 解析 Token 窗口限额，单位 token。空值与 0 都表示不限。
+func tokenLimit(values map[string]string, name string, fallback int64) (int64, error) {
 	raw, ok := values[name]
 	if !ok {
 		return fallback, nil
 	}
-	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-	if err != nil || value <= 0 {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
 		return 0, invalid(name, err)
 	}
-	return value, nil
+	return parsed, nil
+}
+
+// amountLimit 解析金额窗口限额。配置单位是「元」（可带小数，如 5.5），
+// 内部一律换算成微元存储。空值与 0 都表示不限。
+func amountLimit(values map[string]string, name string, fallback int64) (int64, error) {
+	raw, ok := values[name]
+	if !ok {
+		return fallback, nil
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fallback, nil
+	}
+	yuan, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(yuan) || math.IsInf(yuan, 0) || yuan < 0 {
+		return 0, invalid(name, err)
+	}
+	if yuan == 0 {
+		return 0, nil
+	}
+	microyuan := yuan * 1e6
+	if microyuan > float64(math.MaxInt64) {
+		return 0, invalid(name, errors.New("out of range"))
+	}
+	return int64(math.Round(microyuan)), nil
+}
+
+// formatAmount 把微元还原成配置里使用的「元」表示，整数不补小数位。
+func formatAmount(microyuan int64) string {
+	if microyuan == 0 {
+		return "0"
+	}
+	return strconv.FormatFloat(float64(microyuan)/1e6, 'f', -1, 64)
+}
+
+// intervalOrZero 解析「可以关闭」的轮询间隔：0 或 "0s" 表示关闭该功能。
+// 与 duration 的区别只在允许零值——duration 要求严格为正，用它解析
+// GROUP_MONITOR_INTERVAL 会导致「关掉监测」这个正常配置被判为非法。
+func intervalOrZero(values map[string]string, name string, fallback time.Duration) (time.Duration, error) {
+	raw, ok := values[name]
+	if !ok {
+		return fallback, nil
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fallback, nil
+	}
+	if value == "0" {
+		return 0, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		// 纯数字按分钟解释，与其它时长配置保持一致
+		numeric, numErr := strconv.ParseFloat(value, 64)
+		if numErr != nil || math.IsNaN(numeric) || math.IsInf(numeric, 0) {
+			return 0, invalid(name, err)
+		}
+		parsed = time.Duration(numeric * float64(time.Minute))
+	}
+	if parsed < 0 {
+		return 0, invalid(name, errors.New("must not be negative"))
+	}
+	return parsed, nil
 }
 
 func duration(values map[string]string, name string, fallback, numericUnit time.Duration) (time.Duration, error) {
@@ -321,7 +406,6 @@ func (s Settings) EnvMap() map[string]string {
 	values := map[string]string{
 		"ADMIN_API_KEY":            s.AdminAPIKey,
 		"DB_PATH":                  s.DBPath,
-		"DOCS_ENABLED":             strconv.FormatBool(s.DocsEnabled),
 		"GLOBAL_CONCURRENCY_LIMIT": strconv.Itoa(s.GlobalConcurrencyLimit),
 		"HOST":                     s.Host,
 		"LOG_LEVEL":                s.LogLevel,
@@ -330,14 +414,17 @@ func (s Settings) EnvMap() map[string]string {
 		"MEMORY_LIMIT_MB":          strconv.Itoa(s.MemoryLimitMB),
 		"MODEL_AUTO_SYNC":          strconv.FormatBool(s.ModelAutoSync),
 		"MODEL_SYNC_INTERVAL":      s.ModelSyncInterval.String(),
+		"GROUP_MONITOR_INTERVAL":   s.GroupMonitorInterval.String(),
 		"PORT":                     strconv.Itoa(s.Port),
 		"RELAY_ENCRYPTION_KEY":     s.EncryptionKey,
 		"RETENTION_DAYS":           strconv.Itoa(s.RetentionDays),
 		"RPM_LIMIT":                strconv.Itoa(s.RPMLimit),
 		"TOKEN_LIMIT_5H":           strconv.FormatInt(s.TokenLimit5H, 10),
 		"TOKEN_LIMIT_DAILY":        strconv.FormatInt(s.TokenLimitDaily, 10),
-		"UPSTREAM_API_KEY":         s.UpstreamAPIKey,
-		"UPSTREAM_BASE_URL":        s.UpstreamBaseURL,
+		"TOKEN_LIMIT_WEEKLY":       strconv.FormatInt(s.TokenLimitWeekly, 10),
+		"AMOUNT_LIMIT_5H":          formatAmount(s.AmountLimit5H),
+		"AMOUNT_LIMIT_DAILY":       formatAmount(s.AmountLimitDaily),
+		"AMOUNT_LIMIT_WEEKLY":      formatAmount(s.AmountLimitWeekly),
 		"UPSTREAM_CONNECT_TIMEOUT": s.ConnectTimeout.String(),
 		"UPSTREAM_POOL_TIMEOUT":    s.PoolTimeout.String(),
 		"UPSTREAM_READ_TIMEOUT":    s.ReadTimeout.String(),
@@ -359,7 +446,7 @@ func (s Settings) Redacted() map[string]any {
 	for name, value := range s.EnvMap() {
 		values[name] = value
 	}
-	for _, name := range []string{"ADMIN_API_KEY", "RELAY_ENCRYPTION_KEY", "UPSTREAM_API_KEY"} {
+	for _, name := range []string{"ADMIN_API_KEY", "RELAY_ENCRYPTION_KEY"} {
 		values[name] = map[string]bool{"is_configured": strings.TrimSpace(s.EnvMap()[name]) != ""}
 	}
 	return values
@@ -377,9 +464,6 @@ func (s Settings) RestartOnlyChanges(next Settings) []string {
 	}
 	if s.DBPath != next.DBPath {
 		changes = append(changes, "DB_PATH")
-	}
-	if s.DocsEnabled != next.DocsEnabled {
-		changes = append(changes, "DOCS_ENABLED")
 	}
 	return changes
 }

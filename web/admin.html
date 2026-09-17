@@ -70,6 +70,10 @@ main{flex:1;overflow-y:auto;padding:26px 32px 48px}
 .stat .label{color:var(--muted);font-size:12px;margin-bottom:6px}
 .stat .value{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
 .stat .hint{font-size:12px;color:var(--muted);margin-top:4px}
+.quota-row{display:flex;justify-content:space-between;gap:10px;font-size:13px;color:var(--text);margin-top:5px;font-variant-numeric:tabular-nums}
+.quota-row span:first-child{color:var(--muted);font-size:12px}
+.quota-row span:last-child{font-variant-numeric:tabular-nums}
+.quota-row.over span:last-child{color:var(--red);font-weight:500}
 .bar{height:5px;border-radius:3px;background:var(--accent-soft);margin-top:10px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--accent);border-radius:3px;transition:width .6s ease}
 .bar i.warn{background:var(--amber)}
@@ -85,6 +89,17 @@ tbody tr:hover{background:#f8faff}
 .usage-bar{display:inline-block;width:90px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;vertical-align:middle;margin:3px 6px 0 0}
 .usage-bar i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width .4s ease}
 .usage-bar i.full{background:var(--red)}
+/* 卡片标题行：标题在左、操作在右 */
+.card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.card-head h3{margin:0}
+/* 分组可用性监测：小圆点 + 文字，绿/黄/红/灰四态 */
+.mon-badge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;white-space:nowrap}
+.mon-dot{width:8px;height:8px;border-radius:50%;flex:none;display:inline-block}
+.mon-dot.ok{background:var(--green)}
+.mon-dot.warn{background:var(--amber)}
+.mon-dot.err{background:var(--red)}
+.mon-dot.off{background:var(--muted)}
+.mon-detail{font-size:11.5px;color:var(--muted);margin-top:3px;max-width:460px;line-height:1.5}
 .empty{color:var(--muted);text-align:center;padding:26px 0}
 .tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500}
 .tag.ok{background:var(--green-soft);color:var(--green)}
@@ -104,6 +119,7 @@ tbody tr:hover{background:#f8faff}
 /* ── 表单 ─────────────────────────── */
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;align-items:end}
 .field label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
+.field .hint{display:block;font-size:12px;color:var(--muted);margin-top:5px;line-height:1.5}
 .form-actions{margin-top:14px;display:flex;gap:10px;align-items:center}
 details.add-box{margin-bottom:18px}
 details.add-box summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:8px;background:var(--accent-soft);color:var(--accent);padding:9px 16px;border-radius:9px;font-weight:500;transition:background .18s;user-select:none}
@@ -132,7 +148,7 @@ details .card{margin-bottom:0}
 
 /* ── Toast / 弹窗 ─────────────────── */
 #toasts{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px}
-.toast{background:#1c2433;color:#fff;padding:11px 18px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.25);font-size:13.5px;animation:toastIn .28s cubic-bezier(.34,1.4,.64,1) both;max-width:340px}
+.toast{background:#1c2433;color:#fff;padding:11px 18px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.25);font-size:13.5px;line-height:1.55;animation:toastIn .28s cubic-bezier(.34,1.4,.64,1) both;max-width:340px}
 .toast.err{background:var(--red)}
 .toast.ok{background:var(--green)}
 .toast.out{animation:toastOut .25s ease both}
@@ -217,7 +233,7 @@ details .card{margin-bottom:0}
         <div class="card"><form id="provider-form">
           <div class="form-grid">
             <div class="field"><label>名称</label><input name="name" required placeholder="例如 OpenAI 官方"></div>
-            <div class="field"><label>上游地址（HTTPS）</label><input name="base_url" required placeholder="https://api.example.com/v1"></div>
+            <div class="field"><label>上游地址</label><input name="base_url" type="url" required placeholder="http://172.17.0.1:6000 或 https://api.example.com/v1"><span class="hint">必须带 http:// 或 https://。容器访问宿主机上的服务要用网桥网关 IP（如 172.17.0.1），填 127.0.0.1 只会指向容器自己</span></div>
             <div class="field"><label>上游 API Key</label><input name="api_key" type="password" required placeholder="sk-..."></div>
           </div>
           <div class="form-actions"><button class="btn">添加供应商</button><span class="sub" style="color:var(--muted);font-size:12px">Key 将使用 AES-256-GCM 加密存储</span></div>
@@ -238,7 +254,16 @@ details .card{margin-bottom:0}
           <div class="form-actions"><button class="btn">创建模型组</button></div>
         </form></div>
       </details>
-      <div class="card"><h3>模型组列表</h3><div id="group-data"></div></div>
+      <div class="card">
+        <div class="card-head">
+          <h3>模型组列表</h3>
+          <div class="form-actions" style="margin:0">
+            <span id="monitor-state" class="sub" style="font-size:12.5px;color:var(--muted)"></span>
+            <button class="btn-ghost btn-sm" id="monitor-all">立即检测全部</button>
+          </div>
+        </div>
+        <div id="group-data"></div>
+      </div>
     </section>
 
     <!-- 客户端 Key -->
@@ -308,7 +333,7 @@ function toast(msg, type = "") {
   el.className = "toast " + type;
   el.textContent = msg;
   $("toasts").appendChild(el);
-  setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 260); }, type === "err" ? 4200 : 2600);
+  setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 260); }, type === "err" ? 6000 : 2600);
 }
 
 async function api(path, options = {}) {
@@ -336,7 +361,7 @@ function setSvc(ok, text) {
 }
 
 /* ── 状态缓存 ── */
-const cache = { providers: [], models: [], groups: [], keys: [] };
+const cache = { providers: [], models: [], groups: [], keys: [], groupHealth: {} };
 
 /* ── 登录 ── */
 async function login() {
@@ -393,20 +418,41 @@ function statCard(label, value, hint, pct) {
   return `<div class="stat"><div class="label">${esc(label)}</div><div class="value">${value}</div><div class="hint">${hint}</div>` +
     (pct != null ? `<div class="bar"><i class="${cls}" style="width:${Math.min(pct, 100)}%"></i></div>` : "") + `</div>`;
 }
+/* 额度卡片：一个窗口同时显示 Token 与金额。限额 0 显示为「不限」。
+   进度条取两个指标里更紧张的那个；任一项已用满即标红并提示已欠费——判定口径
+   是「先欠费后停服」，所以「已用 >= 限额」正好等于「下一个请求会被拒」。 */
+function quotaCard(label, hint, w) {
+  if (!w) return "";
+  const tokens = Number(w.used_tokens || 0), tokenLimit = Number(w.limit || 0);
+  const amount = Number(w.used_microyuan || 0), amountLimit = Number(w.amount_limit || 0);
+  const pctOf = (used, limit) => limit > 0 ? used / limit * 100 : 0;
+  const pct = Math.max(pctOf(tokens, tokenLimit), pctOf(amount, amountLimit));
+  const tokenOver = tokenLimit > 0 && tokens >= tokenLimit;
+  const amountOver = amountLimit > 0 && amount >= amountLimit;
+  const overdrawn = tokenOver || amountOver;
+  const row = (name, used, limit, fmt, over) =>
+    `<div class="quota-row${over ? " over" : ""}"><span>${name}</span><span>${fmt(used)} / ${limit > 0 ? fmt(limit) : "不限"}</span></div>`;
+  const cls = overdrawn ? "full" : pct >= 80 ? "warn" : "";
+  return `<div class="stat"><div class="label">${esc(label)}</div>` +
+    row("Token", tokens, tokenLimit, fmtNum, tokenOver) +
+    row("金额", amount, amountLimit, fmtYuan, amountOver) +
+    `<div class="hint">${overdrawn ? `<span style="color:var(--red)">已欠费：新请求会被拒绝，调大限额或等窗口轮换后自动恢复</span>` : esc(hint)}</div>` +
+    (tokenLimit > 0 || amountLimit > 0 ? `<div class="bar"><i class="${cls}" style="width:${Math.min(pct, 100).toFixed(1)}%"></i></div>` : "") +
+    `</div>`;
+}
 async function loadOverview() {
   const d = await apiJSON("/admin/api/overview");
   ensureNameCaches();
   setSvc(true, "服务正常");
   const rpmPct = d.rpm.limit ? d.rpm.used / d.rpm.limit * 100 : 0;
-  const fivePct = d.five_hour.limit ? d.five_hour.used_tokens / d.five_hour.limit * 100 : 0;
-  const dailyPct = d.daily.limit ? d.daily.used_tokens / d.daily.limit * 100 : 0;
   const lh = d.last_hour || {};
   const errPct = Math.round((lh.error_rate || 0) * 100);
   const conc = d.concurrency || { active: 0, limit: "—" };
   $("stat-cards").innerHTML =
     statCard("RPM（每分钟请求）", `${fmtNum(d.rpm.used)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(d.rpm.limit)}</span>`, "全局滚动一分钟", rpmPct) +
-    statCard("5 小时 Token", fmtNum(d.five_hour.used_tokens), `限额 ${fmtNum(d.five_hour.limit)}`, fivePct) +
-    statCard("当日 Token（北京时间）", fmtNum(d.daily.used_tokens), `限额 ${fmtNum(d.daily.limit)}`, dailyPct) +
+    quotaCard("5 小时额度", "滚动 5 小时，含进行中请求的预留", d.five_hour) +
+    quotaCard("当日额度", "北京时间自然日，含进行中请求的预留", d.daily) +
+    quotaCard("本周额度", "北京时间自然周（周一起），含进行中请求的预留", d.weekly) +
     statCard("并发", `${fmtNum(conc.active)} <span style="font-size:13px;color:var(--muted)">/ ${esc(conc.limit)}</span>`, "当前进行中的请求", null) +
     statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null);
   const max = Math.max(1, ...(d.trend || []).map(t => t.count));
@@ -462,6 +508,8 @@ function openEdit(title, bodyHTML, onsave) {
   $("edit-body").innerHTML = bodyHTML;
   $("edit-modal").classList.add("on");
   $("edit-save").onclick = async () => {
+    const invalid = [...$("edit-body").querySelectorAll("input, select, textarea")].find(el => !el.checkValidity());
+    if (invalid) { invalid.reportValidity(); return; }
     try { await onsave(); $("edit-modal").classList.remove("on"); toast("已保存", "ok"); }
     catch (e) { toast(e.message, "err"); }
   };
@@ -648,7 +696,7 @@ window.editProvider = id => {
   if (!p) return;
   openEdit(`编辑供应商 #${id}`, `
     <div class="field"><label>名称</label><input id="ep-name" value="${esc(p.Name)}"></div>
-    <div class="field"><label>上游地址（HTTPS）</label><input id="ep-url" value="${esc(p.BaseURL)}"></div>
+    <div class="field"><label>上游地址</label><input id="ep-url" type="url" value="${esc(p.BaseURL)}"><span class="hint">必须带 http:// 或 https://。容器访问宿主机上的服务要用网桥网关 IP（如 172.17.0.1），填 127.0.0.1 只会指向容器自己</span></div>
     <div class="field"><label>新的上游 API Key（留空表示不变）</label><input id="ep-key" type="password" placeholder="${p.APIKeyConfigured ? "已配置，留空保持不变" : "尚未配置"}"></div>
     <label class="switch-row"><label class="switch"><input id="ep-enabled" type="checkbox" ${p.Enabled ? "checked" : ""}><span class="track"></span></label>启用该供应商</label>
   `, async () => {
@@ -683,15 +731,95 @@ function renderGroupChecks() {
   }).join("")
     : `<span style="color:var(--muted);font-size:13px">暂无启用中的供应商（渠道），请先在「供应商」页创建</span>`;
 }
+/* ── 分组可用性监测 ──────────────────────────────────────────
+   状态由后端判定，这里只负责呈现。区分「配置不可用」和「上游不可达」是刻意的：
+   前者要去配渠道/定价，后者要去查上游网络或密钥，处理动作完全不同。
+   注意 disabled 用灰色——分组被主动停用不是故障，不该跟红色混在一起。 */
+const MONITOR_STATUS = {
+  ok:                   { dot: "ok",   label: "可用" },
+  degraded:             { dot: "warn", label: "部分渠道不可达" },
+  upstream_unreachable: { dot: "err",  label: "全部渠道不可达" },
+  config_unavailable:   { dot: "err",  label: "配置不可用" },
+  disabled:             { dot: "off",  label: "已停用" },
+};
+function monStatus(status) { return MONITOR_STATUS[status] || { dot: "off", label: status || "未知" }; }
+function fmtAgo(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (!t) return "";
+  const sec = Math.max(0, (Date.now() - t) / 1000);
+  if (sec < 60) return "刚刚";
+  if (sec < 3600) return Math.floor(sec / 60) + " 分钟前";
+  if (sec < 86400) return Math.floor(sec / 3600) + " 小时前";
+  return Math.floor(sec / 86400) + " 天前";
+}
+function fmtInterval(ms) {
+  if (!ms) return "—";
+  if (ms < 60000) return Math.round(ms / 1000) + " 秒";
+  if (ms < 3600000) return Math.round(ms / 60000) + " 分钟";
+  return (ms / 3600000).toFixed(ms % 3600000 === 0 ? 0 : 1) + " 小时";
+}
+function monitorCell(r) {
+  if (!r) return `<span class="mon-badge"><i class="mon-dot off"></i>尚未检测</span>`;
+  const meta = monStatus(r.status);
+  const reach = r.total_providers ? `，${r.total_providers - r.failed_providers}/${r.total_providers} 渠道可达` : "";
+  return `<span class="mon-badge"><i class="mon-dot ${meta.dot}"></i>${esc(meta.label)}</span>` +
+    `<div class="mon-detail">${esc(r.detail)}${esc(reach)} · ${esc(fmtAgo(r.created_at_utc))}${r.trigger === "manual" ? " · 手动" : ""}</div>`;
+}
+function monitorHistoryTable(rows) {
+  if (!rows || !rows.length) {
+    return `<div class="empty">还没有监测记录。定时监测在「运行配置」的 GROUP_MONITOR_INTERVAL 里设置（填 0 关闭），也可以点上方「立即检测」。</div>`;
+  }
+  return `<table><thead><tr><th>时间</th><th>状态</th><th>渠道可达</th><th>耗时</th><th>说明</th></tr></thead><tbody>` +
+    rows.slice(0, 10).map(r => `<tr>
+      <td class="mono">${esc(fmtTime(r.created_at_utc))}</td>
+      <td><span class="mon-badge"><i class="mon-dot ${monStatus(r.status).dot}"></i>${esc(monStatus(r.status).label)}</span></td>
+      <td class="mono">${r.total_providers - r.failed_providers}/${r.total_providers}</td>
+      <td class="mono">${r.latency_ms}ms</td>
+      <td>${esc(r.detail)}${r.trigger === "manual" ? ` <span class="tag off">手动</span>` : ""}</td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+window.monitorGroup = async (id, btn) => {
+  const original = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "检测中…"; }
+  try {
+    await apiJSON(`/admin/api/groups/${id}/monitor`, { method: "POST" });
+    toast("检测完成", "ok");
+    await loadGroups();
+  } catch (e) { toast(e.message, "err"); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = original; } }
+};
 async function loadGroups() {
   const d = await apiJSON("/admin/api/groups");
   cache.groups = d.data || [];
   try { if (!cache.models.length) await ensureModels(); } catch {}
   try { if (!cache.providers.length) cache.providers = (await apiJSON("/admin/api/providers")).data || []; } catch {}
+  // 监测结果取不到不该挡住分组列表本身，失败就退化成「尚未检测」
+  let health = { data: {}, monitor_enabled: false, monitor_interval_ms: 0 };
+  try { health = await apiJSON("/admin/api/groups/health"); } catch {}
+  cache.groupHealth = health.data || {};
+  const state = $("monitor-state");
+  if (state) {
+    state.innerHTML = health.monitor_enabled
+      ? `定时监测：每 ${esc(fmtInterval(health.monitor_interval_ms))} 自动跑一轮`
+      : `定时监测已关闭 —— 在「运行配置」把 GROUP_MONITOR_INTERVAL 设为大于 0 的值即可开启`;
+  }
+  const all = $("monitor-all");
+  if (all) all.onclick = async e => {
+    const btn = e.currentTarget;
+    const original = btn.textContent;
+    btn.disabled = true; btn.textContent = "检测中…";
+    try {
+      const result = await apiJSON("/admin/api/groups/monitor", { method: "POST" });
+      toast(`已检测 ${result.monitored} 个分组`, "ok");
+      await loadGroups();
+    } catch (err) { toast(err.message, "err"); }
+    finally { btn.disabled = false; btn.textContent = original; }
+  };
   renderGroupChecks();
   if (!cache.groups.length) { $("group-data").innerHTML = `<div class="empty">还没有模型组，点击上方按钮创建</div>`; return; }
-  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
-    cache.groups.map(g => `<tr><td class="mono">${g.ID}</td><td><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td><button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="editGroup(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delGroup(${g.ID})">删除</button></td></tr>`).join("") + `</tbody></table>`;
+  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
+    cache.groups.map(g => `<tr><td class="mono">${g.ID}</td><td><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td style="white-space:nowrap"><button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="monitorGroup(${g.ID},this)">检测</button> <button class="btn-ghost btn-sm" onclick="editGroup(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delGroup(${g.ID})">删除</button></td></tr>`).join("") + `</tbody></table>`;
 }
 /* ── 分组概览：与全局概览同口径，但仅统计走该组内渠道的请求 ── */
 window.groupOverview = async id => {
@@ -701,15 +829,27 @@ window.groupOverview = async id => {
     const d = await apiJSON(`/admin/api/groups/${id}/overview`);
     const lh = d.last_hour || {};
     const errPct = Math.round((lh.error_rate || 0) * 100);
+    // 监测历史是附加信息，取不到不该让整个概览打不开
+    let history = [];
+    try { history = (await apiJSON(`/admin/api/groups/${id}/monitor`)).data || []; } catch {}
     return `<div class="stats">` +
       statCard("RPM（每分钟请求）", fmtNum(d.rpm.used), "本组渠道滚动一分钟", null) +
       statCard("5 小时 Token", fmtNum(d.five_hour.used_tokens), "本组渠道近 5 小时合计", null) +
       statCard("当日 Token（北京时间）", fmtNum(d.daily.used_tokens), "本组渠道当日合计", null) +
-      statCard("当日金额", fmtYuan(d.daily.amount_microyuan), "含进行中请求的预留金额", null) +
+      statCard("当日金额", fmtYuan(d.daily.used_microyuan), "含进行中请求的预留金额", null) +
+      statCard("本周 Token（北京时间，周一起）", fmtNum((d.weekly || {}).used_tokens), "本组渠道本周合计", null) +
+      statCard("本周金额", fmtYuan((d.weekly || {}).used_microyuan), "含进行中请求的预留金额", null) +
       statCard("进行中请求", fmtNum(d.active), "状态为进行中的请求", null) +
       statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null) +
       `</div>
-      <p style="color:var(--muted);font-size:12.5px;margin:4px 0 0">统计口径：仅计入通过本组包含渠道发起的请求；令牌与金额包含未结算的预留部分。限额为全局配置，分组本身不设限额。</p>`;
+      <p style="color:var(--muted);font-size:12.5px;margin:4px 0 0">统计口径：仅计入通过本组包含渠道发起的请求；令牌与金额包含未结算的预留部分。限额为全局配置（5 小时 / 当日 / 本周 × Token / 金额，0 表示不限），分组本身不设限额。</p>
+      <div class="card" style="margin:16px 0 0;box-shadow:none;padding:16px 18px">
+        <div class="card-head">
+          <h3 style="font-size:14px">可用性监测（最近 10 轮）</h3>
+          <button class="btn-ghost btn-sm" onclick="monitorGroup(${id},this).then(()=>$('go-refresh').click())">立即检测</button>
+        </div>
+        ${monitorHistoryTable(history)}
+      </div>`;
   };
   openManageModal(`分组概览 — ${esc(g.Name)}`, `<div class="form-actions" style="margin:0 0 10px"><button class="btn-ghost btn-sm" id="go-refresh">↻ 刷新</button></div><div id="go-body"><div class="skeleton"></div><div class="skeleton"></div></div>`);
   $("go-refresh").onclick = async () => { try { $("go-body").innerHTML = await render(); } catch (e) { $("go-body").innerHTML = `<div class="empty">${esc(e.message)}</div>`; } };
@@ -774,21 +914,27 @@ async function loadKeys() {
   if (!cache.keys.length) { $("key-data").innerHTML = `<div class="empty">还没有客户端 Key，点击上方按钮创建</div>`; return; }
   $("key-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>密钥标识 / 缩略</th><th>并发</th><th>Token 已用 / 限额</th><th>金额已用 / 限额</th><th>请求次数</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
     cache.keys.map(k => {
-      const pct = (used, limit) => limit == null ? null : Math.min(100, limit > 0 ? used / limit * 100 : 0);
-      const tp = pct(k.UsedTokens, k.TokenLimit), ap = pct(k.UsedAmountMicroyuan, k.AmountLimitMicroyuan);
-      const usageCell = (used, limit, fmt, p) =>
-        `${fmt(used)} <span style="color:var(--muted)">/ ${limit == null ? "不限" : fmt(limit)}</span>` +
-        (p == null ? "" : `<div class="usage-bar"><i style="width:${p.toFixed(1)}%" class="${p >= 90 ? "full" : ""}"></i></div><span style="font-size:11px;color:${p >= 90 ? "var(--red)" : "var(--muted)"}">${p.toFixed(0)}% 已用</span>`);
+      // limit 为空或 0 表示不限；已用 >= 限额即「已欠费」（判定口径：先欠费后停服，
+      // 所以欠费状态下新请求会被拒，但 Key 本身仍是启用状态、调大限额后自动恢复）。
+      const pct = (used, limit) => limit == null || limit <= 0 ? null : used / limit * 100;
+      const usedTokens = k.UsedTokens || 0, usedAmount = k.UsedAmountMicroyuan || 0;
+      const tokenOver = k.TokenLimit != null && k.TokenLimit > 0 && usedTokens >= k.TokenLimit;
+      const amountOver = k.AmountLimitMicroyuan != null && k.AmountLimitMicroyuan > 0 && usedAmount >= k.AmountLimitMicroyuan;
+      const overdrawn = tokenOver || amountOver;
+      const tp = pct(usedTokens, k.TokenLimit), ap = pct(usedAmount, k.AmountLimitMicroyuan);
+      const usageCell = (used, limit, fmt, p, over) =>
+        `${fmt(used)} <span style="color:var(--muted)">/ ${limit == null || limit <= 0 ? "不限" : fmt(limit)}</span>` +
+        (p == null ? "" : `<div class="usage-bar"><i style="width:${Math.min(p, 100).toFixed(1)}%" class="${p >= 90 ? "full" : ""}"></i></div><span style="font-size:11px;color:${over || p >= 90 ? "var(--red)" : "var(--muted)"}">${over ? "已欠费" : p.toFixed(0) + "% 已用"}</span>`);
       return `<tr>
       <td class="mono">${k.ID}</td><td><b>${esc(k.Name)}</b></td>
       <td class="mono">${k.TokenLabel ? esc(k.TokenLabel) : `<span style="color:var(--muted)">未记录</span>`}
         <div class="token-hint" id="hint-${k.ID}" title="密钥脱敏缩略，明文仅在创建/重置时显示一次">…</div>
       </td>
       <td>${k.ConcurrencyLimit}</td>
-      <td>${usageCell(k.UsedTokens || 0, k.TokenLimit, fmtNum, tp)}</td>
-      <td>${usageCell(k.UsedAmountMicroyuan || 0, k.AmountLimitMicroyuan, fmtYuan, ap)}</td>
+      <td>${usageCell(usedTokens, k.TokenLimit, fmtNum, tp, tokenOver)}</td>
+      <td>${usageCell(usedAmount, k.AmountLimitMicroyuan, fmtYuan, ap, amountOver)}</td>
       <td class="mono">${k.RequestCount || 0}</td>
-      <td>${k.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag err">${esc(k.DisabledReason || "停用")}</span>`}</td>
+      <td>${k.Enabled ? `<span class="tag ok">启用</span>${overdrawn ? `<span class="tag err">已欠费</span>` : ""}` : `<span class="tag err">${esc(k.DisabledReason || "停用")}</span>`}</td>
       <td style="white-space:nowrap"><label class="switch"><input type="checkbox" ${k.Enabled ? "checked" : ""} onchange="toggleKey(${k.ID},this)"><span class="track"></span></label> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="editKey(${k.ID})">编辑</button> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="rotateKey(${k.ID})">重置密钥</button> <button class="btn-danger btn-sm" style="margin-left:6px" onclick="delKey(${k.ID})">删除</button></td>
     </tr>`;}).join("") + `</tbody></table>`;
   loadKeyHints();
@@ -914,7 +1060,6 @@ const restartKeys = ["HOST", "PORT", "DB_PATH", "RELAY_ENCRYPTION_KEY"];
 const cfgLabels = {
   ADMIN_API_KEY:            "管理端 API 密钥 / Admin API key",
   DB_PATH:                  "数据库路径 / Database path",
-  DOCS_ENABLED:             "启用接口文档 / Enable API docs",
   GLOBAL_CONCURRENCY_LIMIT: "全局并发上限 / Global concurrency limit",
   HOST:                     "监听地址 / Listen address",
   LOG_LEVEL:                "日志级别 / Log level",
@@ -923,17 +1068,20 @@ const cfgLabels = {
   MEMORY_LIMIT_MB:          "内存上限 MB / Memory limit (MB)",
   MODEL_AUTO_SYNC:          "自动同步上游模型 / Auto model sync",
   MODEL_SYNC_INTERVAL:      "模型同步间隔 / Model sync interval",
+  GROUP_MONITOR_INTERVAL:   "分组可用性监测间隔（0 = 关闭；如 30m / 10m / 0）/ Group availability check interval",
   MAX_BODY_MB:              "请求体大小上限 MB / Max request body size (MB)",
   MAX_BODY_BYTES:           "请求体大小上限（字节） / Max request body size (bytes)",
   PORT:                     "监听端口 / Listen port",
   RELAY_ENCRYPTION_KEY:     "中转加密密钥 / Relay encryption key",
   RETENTION_DAYS:           "日志保留天数 / Log retention days",
   RPM_LIMIT:                "每分钟请求限额 / Requests-per-minute limit",
-  TOKEN_LIMIT_5H:           "5 小时 Token 限额 / 5-hour token limit",
-  TOKEN_LIMIT_DAILY:        "当日 Token 限额 / Daily token limit",
-  UPSTREAM_API_KEY:         "上游 API 密钥 / Upstream API key",
-  UPSTREAM_BASE_URL:        "上游服务地址 / Upstream base URL",
-  UPSTREAM_CONNECT_TIMEOUT: "上游连接超时 / Upstream connect timeout",
+  TOKEN_LIMIT_5H:           "5 小时 Token 限额（0 = 不限）/ 5-hour token limit",
+  TOKEN_LIMIT_DAILY:        "当日 Token 限额，北京时间（0 = 不限）/ Daily token limit",
+  TOKEN_LIMIT_WEEKLY:       "本周 Token 限额，周一起，北京时间（0 = 不限）/ Weekly token limit",
+  AMOUNT_LIMIT_5H:          "5 小时金额限额，单位元（0 = 不限）/ 5-hour amount limit in CNY",
+  AMOUNT_LIMIT_DAILY:       "当日金额限额，单位元（0 = 不限）/ Daily amount limit in CNY",
+  AMOUNT_LIMIT_WEEKLY:      "本周金额限额，单位元（0 = 不限）/ Weekly amount limit in CNY",
+  UPSTREAM_CONNECT_TIMEOUT: "上游连接超时（新建连接的超时，不是总时长）/ Upstream connect timeout",
   UPSTREAM_POOL_TIMEOUT:    "上游连接池超时 / Upstream pool timeout",
   UPSTREAM_READ_TIMEOUT:    "上游读取超时 / Upstream read timeout",
   UPSTREAM_WRITE_TIMEOUT:   "上游写入超时 / Upstream write timeout",
