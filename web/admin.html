@@ -145,6 +145,17 @@ details .card{margin-bottom:0}
 .pm-row input[type=text]{padding:5px 10px;font-size:12.5px}
 .pm-row .tag{margin-left:6px}
 .pm-empty{color:var(--muted);font-size:13px;text-align:center;padding:18px 0}
+/* ── 客户端接入信息弹窗 ── */
+.conn-row{display:grid;grid-template-columns:76px 1fr auto;gap:10px;align-items:center;margin-bottom:8px}
+.conn-row .k{color:var(--muted);font-size:12.5px}
+.conn-row code{background:#f4f6fb;border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-family:Consolas,monospace;font-size:12.5px;word-break:break-all}
+.conn-block{border:1px solid var(--border);border-radius:10px;background:#fafbfe;padding:10px 12px;font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;margin:0 0 8px}
+.conn-models{display:flex;flex-wrap:wrap;gap:6px}
+.conn-models .mono{background:#f4f6fb;border:1px solid var(--border);border-radius:999px;padding:3px 10px}
+.conn-note{font-size:12.5px;padding:8px 10px;border-radius:8px;margin-bottom:6px;line-height:1.55}
+.conn-note.err{background:var(--red-soft);color:var(--red)}
+.conn-note.warn{background:var(--amber-soft);color:var(--amber)}
+.conn-note.ok{background:var(--green-soft);color:var(--green)}
 
 /* ── Toast / 弹窗 ─────────────────── */
 #toasts{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px}
@@ -271,10 +282,18 @@ details .card{margin-bottom:0}
       <details class="add-box"><summary>＋ 创建客户端 Key</summary>
         <div class="card"><form id="key-form">
           <div class="form-grid">
+            <div class="field">
+              <label>接入方式</label>
+              <select name="auth_mode">
+                <option value="token">密钥（Authorization: Bearer crk_…）</option>
+                <option value="app">应用标识（客户端不保存任何密钥）</option>
+              </select>
+            </div>
             <div class="field"><label>名称</label><input name="name" required placeholder="例如 办公室共用"></div>
             <div class="field"><label>最大并发</label><input name="max_concurrency" type="number" min="1" value="1" required></div>
             <div class="field"><label>总 Token 限额（可选）</label><input name="token_limit" type="number" min="0" placeholder="留空表示不限"></div>
             <div class="field"><label>总金额限额（元，可选）</label><input name="money_limit" type="number" step="0.01" min="0" placeholder="留空表示不限"></div>
+            <div class="field"><label>令牌有效期（小时，留空 = 永久）</label><input name="ttl_hours" type="number" step="0.1" min="0" placeholder="如 24 = 一天后自动失效（防泄露/滥用）"></div>
           </div>
           <div class="field" style="margin-top:12px"><label>授权模型组</label><div class="check-list" id="key-group-checks"></div></div>
           <div class="form-actions"><button class="btn">创建 Key</button></div>
@@ -301,8 +320,8 @@ details .card{margin-bottom:0}
 
 <!-- Token 弹窗 -->
 <div id="modal"><div class="modal-box">
-  <h3 id="modal-title">🎉 Key 创建成功</h3>
-  <p>客户端明文密钥<b>只显示这一次</b>，请立即复制保存：</p>
+  <h3 id="modal-title">Key 创建成功</h3>
+  <p id="modal-desc">客户端明文密钥<b>只显示这一次</b>，请立即复制保存：</p>
   <div class="token-box"><code id="modal-token"></code><button class="btn" id="copy-token">复制</button></div>
   <div style="text-align:right;margin-top:18px"><button class="btn-ghost" id="modal-close">我已保存</button></div>
 </div></div>
@@ -902,6 +921,20 @@ $("group-form").onsubmit = async e => {
 };
 
 /* ── 客户端 Key ── */
+/* 短时令牌的剩余寿命。放在状态列里，运维一眼能看到哪些快到期 —— 到期后客户端会收到
+   401 token_expired，提前续期就不会中断业务（而"密钥失效"和"服务坏了"是两回事）。 */
+function humanLeft(secs) {
+  const s = Math.max(0, secs || 0);
+  return s >= 86400 ? Math.floor(s / 86400) + " 天"
+       : s >= 3600 ? Math.floor(s / 3600) + " 小时"
+       : Math.max(1, Math.floor(s / 60)) + " 分钟";
+}
+function expiryTag(k) {
+  if (k.ExpiresAtUTC == null) return `<div class="token-hint">令牌永久有效</div>`;
+  if (k.Expired) return `<div class="token-hint" style="color:var(--red)">令牌已过期</div>`;
+  const s = Math.max(0, k.ExpiresInSecs || 0);
+  return `<div class="token-hint"${s < 86400 ? ` style="color:var(--amber)"` : ""}>令牌 ${humanLeft(s)}后过期</div>`;
+}
 function renderKeyGroupChecks() {
   $("key-group-checks").innerHTML = cache.groups.filter(g => g.Enabled).map(g =>
     `<label class="check-item"><input type="checkbox" value="${g.ID}" onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(g.Name)}</span></label>`).join("")
@@ -912,7 +945,7 @@ async function loadKeys() {
   cache.keys = d.data || [];
   renderKeyGroupChecks();
   if (!cache.keys.length) { $("key-data").innerHTML = `<div class="empty">还没有客户端 Key，点击上方按钮创建</div>`; return; }
-  $("key-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>密钥标识 / 缩略</th><th>并发</th><th>Token 已用 / 限额</th><th>金额已用 / 限额</th><th>请求次数</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+  $("key-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>凭据</th><th>并发</th><th>Token 已用 / 限额</th><th>金额已用 / 限额</th><th>请求次数</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
     cache.keys.map(k => {
       // limit 为空或 0 表示不限；已用 >= 限额即「已欠费」（判定口径：先欠费后停服，
       // 所以欠费状态下新请求会被拒，但 Key 本身仍是启用状态、调大限额后自动恢复）。
@@ -927,15 +960,16 @@ async function loadKeys() {
         (p == null ? "" : `<div class="usage-bar"><i style="width:${Math.min(p, 100).toFixed(1)}%" class="${p >= 90 ? "full" : ""}"></i></div><span style="font-size:11px;color:${over || p >= 90 ? "var(--red)" : "var(--muted)"}">${over ? "已欠费" : p.toFixed(0) + "% 已用"}</span>`);
       return `<tr>
       <td class="mono">${k.ID}</td><td><b>${esc(k.Name)}</b></td>
-      <td class="mono">${k.TokenLabel ? esc(k.TokenLabel) : `<span style="color:var(--muted)">未记录</span>`}
-        <div class="token-hint" id="hint-${k.ID}" title="密钥脱敏缩略，明文仅在创建/重置时显示一次">…</div>
+      <td class="mono">${k.AuthMode === "app"
+        ? `<span class="tag ok" style="margin-bottom:3px">应用标识</span><div class="token-hint">${esc(k.PublicID || "")}</div>`
+        : `${k.TokenLabel ? esc(k.TokenLabel) : `<span style="color:var(--muted)">未记录</span>`}<div class="token-hint" id="hint-${k.ID}" title="密钥脱敏缩略，明文仅在创建/重置时显示一次">…</div>`}
       </td>
       <td>${k.ConcurrencyLimit}</td>
       <td>${usageCell(usedTokens, k.TokenLimit, fmtNum, tp, tokenOver)}</td>
       <td>${usageCell(usedAmount, k.AmountLimitMicroyuan, fmtYuan, ap, amountOver)}</td>
       <td class="mono">${k.RequestCount || 0}</td>
-      <td>${k.Enabled ? `<span class="tag ok">启用</span>${overdrawn ? `<span class="tag err">已欠费</span>` : ""}` : `<span class="tag err">${esc(k.DisabledReason || "停用")}</span>`}</td>
-      <td style="white-space:nowrap"><label class="switch"><input type="checkbox" ${k.Enabled ? "checked" : ""} onchange="toggleKey(${k.ID},this)"><span class="track"></span></label> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="editKey(${k.ID})">编辑</button> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="rotateKey(${k.ID})">重置密钥</button> <button class="btn-danger btn-sm" style="margin-left:6px" onclick="delKey(${k.ID})">删除</button></td>
+      <td>${k.Enabled ? `<span class="tag ok">启用</span>${overdrawn ? `<span class="tag err">已欠费</span>` : ""}` : `<span class="tag err">${esc(k.DisabledReason || "停用")}</span>`}${expiryTag(k)}</td>
+      <td style="white-space:nowrap"><label class="switch"><input type="checkbox" ${k.Enabled ? "checked" : ""} onchange="toggleKey(${k.ID},this)"><span class="track"></span></label> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="connectKey(${k.ID})">接入信息</button> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="editKey(${k.ID})">编辑</button> <button class="btn-ghost btn-sm" style="margin-left:6px" onclick="rotateKey(${k.ID})">重置密钥</button> <button class="btn-danger btn-sm" style="margin-left:6px" onclick="delKey(${k.ID})">删除</button></td>
     </tr>`;}).join("") + `</tbody></table>`;
   loadKeyHints();
 }
@@ -983,6 +1017,94 @@ async function loadKeyHints() {
     });
   } catch (e) { /* 缩略加载失败不影响主功能 */ }
 }
+/* ── 接入信息：把「其他软件该填什么」一次列全 ──
+   为什么需要它：明文密钥只在创建/重置时返回过一次（库里只存摘要），Base URL 与模型名
+   又分散在运行配置页和模型页，运维自己拼极易拼错（少带 /v1、填成上游模型名），而拼错
+   的表现是客户端 400/404 —— 从错误信息里看不出是填错了还是服务坏了。
+   模型清单由服务端用与公共 /v1/models 相同的那份 SQL 算出，因此与管理台所见一致。 */
+window.connectKey = async id => {
+  let d;
+  try { d = (await apiJSON(`/admin/api/keys/${id}/connection`)).data || {}; }
+  catch (e) { toast(e.message, "err"); return; }
+  const models = d.models || [];
+  const notes = [
+    ...(d.issues || []).map(x => `<div class="conn-note err">✕ ${esc(x)}</div>`),
+    ...(d.warnings || []).map(x => `<div class="conn-note warn">! ${esc(x)}</div>`),
+  ].join("");
+  const ok = d.ready ? `<div class="conn-note ok">✓ 该 Key 可用：已授权 ${models.length} 个模型</div>` : "";
+  // Base URL 是按「你访问管理台的方式」推断的；从本机打开管理台时它是回环地址，
+  // 其他设备照抄就连不上，必须点出来。
+  const loopback = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(d.base_url || "");
+  const loopNote = loopback
+    ? `<div class="conn-note warn">! 上面的 Base URL 是按你当前打开管理台的方式（本机回环）推断的。其他设备连接请把主机换成这台机器的局域网 IP，例如 http://10.190.164.209:8000/v1</div>`
+    : "";
+  const modelHTML = models.length
+    ? `<div class="conn-models">${models.map(m => `<span class="mono">${esc(m)}</span>`).join("")}</div>`
+    : `<span style="color:var(--muted);font-size:13px">无 —— 先给分组内渠道的模型定价并启用</span>`;
+  // 短时令牌的有效期：让运维在把令牌交出去之前就知道它什么时候会失效
+  const expiryText = d.expires_at_utc == null
+    ? "永久有效（不会自动失效）"
+    : d.expired
+      ? `已过期（${d.expires_at_utc} 到期）—— 客户端会收到 401 token_expired`
+      : `${d.expires_at_utc} 到期（还剩 ${humanLeft(d.expires_in_secs)}）`;
+  // 两种凭据的接入方式完全不同：密钥走 Authorization，应用标识走 X-App-Id。
+  // 提示语、复制按钮、curl 示例都要跟着变，否则照抄过去就是 401。
+  const isApp = d.auth_mode === "app";
+  const authHeader = isApp
+    ? `  -H "X-App-Id: ${d.app_id || "<应用标识>"}"`
+    : `  -H "Authorization: Bearer <你的客户端密钥>"`;
+  const howto = isApp
+    ? `Base URL 末尾的 <b>/v1</b> 不能少也不能重复；客户端把应用标识放进 <code>X-App-Id</code> 请求头即可 —— <b>不需要密钥，客户端里也没有密钥可被提取</b>。`
+    : `Base URL 末尾的 <b>/v1</b> 不能少也不能重复；密钥放在 <code>Authorization: Bearer</code> 头里，不是自定义请求头。`;
+  const credentialRow = isApp
+    ? `<div class="conn-row"><span class="k">应用标识</span><code id="conn-appid">${esc(d.app_id || "")}</code><button class="btn-ghost btn-sm" onclick="copyConn('conn-appid')">复制</button></div>`
+    : `<div class="conn-row"><span class="k">API Key</span><code id="conn-token">${esc(d.token_hint || "（未记录缩略）")}</code><button class="btn-ghost btn-sm" onclick="toast('明文密钥只在创建/重置那一次显示，库里只存摘要；需要明文请点「重置密钥」','err')">明文？</button></div>`;
+  const curl = [
+    `curl ${d.models_url || ""} \\`,
+    authHeader,
+    "",
+    `# 对话（模型名用下面列出的任何一个）`,
+    `curl ${d.chat_url || ""} \\`,
+    authHeader + " \\",
+    `  -H "Content-Type: application/json" \\`,
+    `  -d '{"model":"${models[0] || "<模型名>"}","messages":[{"role":"user","content":"你好"}]}'`,
+  ].join("\n");
+  openManageModal(`客户端接入信息 — ${esc(d.name || "Key #" + id)}`, `
+    <div class="pm-sec">
+      <h4>① 填进客户端的「自定义 OpenAI 兼容服务」</h4>
+      <p class="pm-hint">${howto}</p>
+      ${notes}${ok}${loopNote}
+      <div class="conn-row"><span class="k">Base URL</span><code id="conn-base">${esc(d.base_url || "")}</code><button class="btn-ghost btn-sm" onclick="copyConn('conn-base')">复制</button></div>
+      ${credentialRow}
+      <div class="conn-row"><span class="k">有效期</span><code>${esc(expiryText)}</code><span></span></div>
+      <div class="conn-row" style="align-items:start"><span class="k">模型名</span><div>${modelHTML}</div><button class="btn-ghost btn-sm" onclick="copyConn('conn-models')">复制全部</button></div>
+      <div id="conn-models" style="display:none">${esc(models.join("\n"))}</div>
+    </div>
+    <div class="pm-sec">
+      <h4>② 先在要接入的那台机器上自检</h4>
+      <p class="pm-hint">能返回 <code>{"object":"list",...}</code> 说明地址与密钥都对；<b>401</b> 是密钥不对，<b>404</b> 多半是 Base URL 少了 /v1。</p>
+      <div class="conn-block">${esc(curl)}</div>
+    </div>
+    <div class="pm-sec">
+      <h4>③ 注意</h4>
+      <p class="pm-hint">
+        · 这是明文 HTTP，只在可信内网使用；要跨公网请在前面挂 HTTPS 反向代理。<br>
+        · 上游渠道的 API Key 只存在服务端（AES-256-GCM 加密），客户端任何情况下都拿不到 —— 即使客户端凭据泄露，上游密钥也不会泄露。<br>
+        · 授权范围仅限「所属分组内渠道」下的模型，模型范围由分组决定；调分组即调权限。<br>
+        ${isApp
+          ? "· 这是<b>应用型凭据</b>：客户端里没有密钥，用户没有可提取的东西。代价是应用标识公开，<b>能访问到本网关的人都能调用</b> —— 保持网关只在可信网络内可达（内网 / 防火墙 / 反向代理鉴权），并给这个应用设好并发与额度上限。"
+          : "· 客户端密钥可随时「重置」吊销，重置后旧密钥立即失效。"}
+      </p>
+    </div>
+  `);
+};
+window.copyConn = async id => {
+  const text = ($(id) || {}).textContent || "";
+  if (!text) { toast("没有可复制的内容", "err"); return; }
+  try { await navigator.clipboard.writeText(text); toast("已复制到剪贴板", "ok"); }
+  catch { toast("浏览器拒绝了剪贴板访问，请手动选中复制", "err"); }
+};
+
 /* 重置密钥：旧 token 立即失效，新 token 只显示这一次 */
 window.rotateKey = async id => {
   const k = cache.keys.find(x => x.ID === id);
@@ -1011,6 +1133,10 @@ window.editKey = async id => {
       <div class="field"><label>最大并发</label><input id="ek-conc" type="number" min="1" value="${k.ConcurrencyLimit}"></div>
       <div class="field"><label>总 Token 限额（留空保持原值）</label><input id="ek-token" type="number" min="0" value="${k.TokenLimit ?? ""}"></div>
       <div class="field"><label>总金额限额（元，留空保持原值）</label><input id="ek-money" type="number" step="0.01" min="0" value="${k.AmountLimitMicroyuan == null ? "" : k.AmountLimitMicroyuan / 1e6}"></div>
+      <div class="field">
+        <label>令牌有效期（小时；留空保持原值，0 = 永久有效）</label>
+        <input id="ek-ttl" type="number" step="0.1" min="0" placeholder="${k.ExpiresAtUTC ? "当前到期 " + fmtTime(k.ExpiresAtUTC) + "，填数字即从现在起重新计时" : "当前：永久有效"}">
+      </div>
     </div>
     <div class="field" style="margin-top:12px"><label>授权模型组</label>${checkListHTML(items, groupIds, "暂无模型组，请先创建")}</div>
     <label class="switch-row" style="margin-top:4px"><label class="switch"><input id="ek-enabled" type="checkbox" ${k.Enabled ? "checked" : ""}><span class="track"></span></label>启用该 Key</label>
@@ -1019,6 +1145,9 @@ window.editKey = async id => {
     const body = { name: $("ek-name").value.trim(), enabled: $("ek-enabled").checked, concurrency_limit: conc > 0 ? conc : 1 };
     if ($("ek-token").value !== "") body.token_limit_total = Number($("ek-token").value);
     if ($("ek-money").value !== "") body.money_limit_yuan_total = Number($("ek-money").value);
+    // 有效期三态：留空 = 不动（防止"只改个名字"把有效期清掉）；0 = 改为永久；>0 = 从现在起重新计时（即续期）
+    const ttl = $("ek-ttl").value.trim();
+    if (ttl !== "") body.ttl_seconds = Math.max(0, Math.round(Number(ttl) * 3600));
     await apiJSON("/admin/api/keys/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     await apiJSON("/admin/api/keys/" + id + "/groups", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_ids: checkedIds($("edit-body")) }) });
     loadKeys();
@@ -1035,10 +1164,26 @@ $("key-form").onsubmit = async e => {
   const tl = f.get("token_limit"), ml = f.get("money_limit");
   if (tl) body.token_limit_total = Number(tl);
   if (ml) body.money_limit_yuan_total = Number(ml);
+  // 短时令牌：填小时数则从现在起倒计时，到期自动失效（留空 = 永久）
+  const th = f.get("ttl_hours");
+  if (th && Number(th) > 0) body.ttl_seconds = Math.round(Number(th) * 3600);
+  // 应用型凭据：服务端不生成任何可用密钥，客户端用公开的应用标识接入
+  if (f.get("auth_mode") === "app") body.keyless = true;
   try {
     const r = await apiJSON("/admin/api/keys", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     e.target.reset(); loadKeys();
-    if (r.token) { $("modal-token").textContent = r.token; $("modal").classList.add("on"); }
+    // 密钥型弹出「只显示这一次的密钥」，应用型弹出「应用标识」——两者共用一个弹窗，
+    // 文案必须跟着变，否则运维会一直等一个永远不会出现的密钥。
+    const shown = r.token || (r.data && r.data.PublicID) || "";
+    if (shown) {
+      const keyless = !r.token;
+      $("modal-title").textContent = keyless ? "应用型凭据已创建" : "Key 创建成功";
+      $("modal-desc").innerHTML = keyless
+        ? "客户端<b>不需要保存任何密钥</b>，用这个应用标识接入（公开值，可以写在客户端里）："
+        : "客户端明文密钥<b>只显示这一次</b>，请立即复制保存：";
+      $("modal-token").textContent = shown;
+      $("modal").classList.add("on");
+    }
   } catch (err) { toast(err.message, "err"); }
 };
 $("copy-token").onclick = async () => {

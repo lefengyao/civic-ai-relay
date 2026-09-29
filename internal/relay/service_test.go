@@ -7,11 +7,36 @@ import (
 	"net/http"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"civic-ai-relay/internal/config"
 	"civic-ai-relay/internal/secret"
 	"civic-ai-relay/internal/store"
 )
+
+// TestRequestContextAppliesMaxStreamDuration 钉住 MAX_STREAM_DURATION 真的作用到上游请求上
+// —— 它曾经只是个给后台回收循环看的数字，管理台里配了也不生效（线上长对话被上游客户端的
+// 340 秒总超时掐断，而这项配的是 30 分钟）。同时守住「0 = 不限」的口径：
+// 若对 0 也套 WithTimeout，会立刻超时，等于把所有请求打死。
+func TestRequestContextAppliesMaxStreamDuration(t *testing.T) {
+	service := &Service{settings: func() config.Settings { return config.Settings{MaxStreamDuration: 90 * time.Second} }}
+	ctx, cancel := service.requestContext(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("MAX_STREAM_DURATION > 0 时应当给上游请求设截止时间")
+	}
+	if remaining := time.Until(deadline); remaining > 90*time.Second || remaining < 80*time.Second {
+		t.Fatalf("截止时间与配置不符：剩余 %v", remaining)
+	}
+
+	unlimited := &Service{settings: func() config.Settings { return config.Settings{} }}
+	openCtx, openCancel := unlimited.requestContext(context.Background())
+	defer openCancel()
+	if _, ok := openCtx.Deadline(); ok {
+		t.Fatal("MAX_STREAM_DURATION = 0 表示不限，不应设置截止时间（否则会立即超时）")
+	}
+}
 
 type fakeClient struct {
 	chatErr error

@@ -668,6 +668,17 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 	writeAdminError(w, 405, "method_not_allowed")
 }
 
+// expiryFromTTL 把「还有多少秒到期」换算成绝对时间点。>0 才设有效期，其余
+// （nil / 0 / 负数）一律表示永久有效 —— 只有运维显式要求短时令牌时才该有到期时间，
+// 默认值不该让任何一个 Key 悄悄失效。
+func expiryFromTTL(seconds *int64) *time.Time {
+	if seconds == nil || *seconds <= 0 {
+		return nil
+	}
+	at := time.Now().UTC().Add(time.Duration(*seconds) * time.Second)
+	return &at
+}
+
 func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 	var p struct {
 		Name           string   `json:"name"`
@@ -675,6 +686,12 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 		TokenLimit     *int64   `json:"token_limit_total"`
 		MoneyLimitYuan *float64 `json:"money_limit_yuan_total"`
 		GroupIDs       []int64  `json:"group_ids"`
+		// TTLSeconds > 0 时创建为「短时令牌」：从现在起 N 秒后自动失效。
+		// 缺省 / 0 / 负数 = 永久有效（与升级前的行为一致）。
+		TTLSeconds *int64 `json:"ttl_seconds"`
+		// Keyless = true 时创建「应用型凭据」：**不存在可用密钥**，客户端用公开的
+		// 应用标识（请求头 X-App-Id）接入。给「软件里不能保存密钥」的客户端用。
+		Keyless bool `json:"keyless"`
 	}
 	if json.NewDecoder(r.Body).Decode(&p) != nil {
 		writeAdminError(w, 400, "invalid_request")
@@ -688,7 +705,7 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 		v := int64(*p.MoneyLimitYuan*1000000 + 0.5)
 		money = &v
 	}
-	k, err := h.repo.CreateClientKey(r.Context(), store.NewClientKey{Name: p.Name, ConcurrencyLimit: p.MaxConcurrency, TokenLimit: p.TokenLimit, AmountLimitMicroyuan: money})
+	k, err := h.repo.CreateClientKey(r.Context(), store.NewClientKey{Name: p.Name, ConcurrencyLimit: p.MaxConcurrency, TokenLimit: p.TokenLimit, AmountLimitMicroyuan: money, ExpiresAt: expiryFromTTL(p.TTLSeconds), Keyless: p.Keyless})
 	if err == nil && len(p.GroupIDs) > 0 {
 		err = h.repo.ReplaceKeyGroups(r.Context(), k.ID, p.GroupIDs)
 	}
@@ -710,18 +727,35 @@ func (h *AdminHandler) keysList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 消耗口径与限额检查一致：所有预留（含未结算）都计入
+	now := time.Now().UTC()
 	items := make([]map[string]any, 0, len(data))
 	for _, k := range data {
 		stat := usage[k.ID]
-		items = append(items, map[string]any{
+		// AuthMode 让前端一眼分清「拿密钥接的」还是「拿应用标识接的」——
+		// 两者的接入信息完全不同，混在一起会让人去找一个并不存在的密钥。
+		authMode := "token"
+		if k.Keyless() {
+			authMode = "app"
+		}
+		item := map[string]any{
 			"ID": k.ID, "Name": k.Name, "TokenLabel": k.TokenLabel,
+			"AuthMode": authMode, "PublicID": k.PublicID,
 			"Enabled": k.Enabled, "ConcurrencyLimit": k.ConcurrencyLimit,
 			"TokenLimit": k.TokenLimit, "AmountLimitMicroyuan": k.AmountLimitMicroyuan,
 			"DisabledReason":      k.DisabledReason,
 			"UsedTokens":          stat.Tokens,
 			"UsedAmountMicroyuan": stat.AmountMicroyuan,
 			"RequestCount":        stat.Requests,
-		})
+			// 短时令牌：前端据此显示「剩余 X 天」/「已过期」，无需自己算时间差
+			"Expired":       k.Expired(now),
+			"ExpiresAtUTC":  nil,
+			"ExpiresInSecs": nil,
+		}
+		if k.ExpiresAt != nil {
+			item["ExpiresAtUTC"] = k.ExpiresAt.UTC().Format(time.RFC3339)
+			item["ExpiresInSecs"] = int64(k.ExpiresAt.Sub(now).Seconds())
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, 200, map[string]any{"data": items})
 }
@@ -767,6 +801,15 @@ func (h *AdminHandler) keyItem(w http.ResponseWriter, r *http.Request, raw strin
 		writeJSON(w, 200, map[string]any{"data": value, "token": value.Token})
 		return
 	}
+	// 接入信息：把「其他软件该填什么」一次算清楚，供运维直接照抄。
+	if len(parts) == 2 && parts[1] == "connection" {
+		if r.Method != http.MethodGet {
+			writeAdminError(w, 405, "method_not_allowed")
+			return
+		}
+		h.keyConnection(w, r, id)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "groups" {
 		if r.Method == http.MethodGet {
 			ids, err := h.repo.KeyGroupIDs(r.Context(), id)
@@ -804,12 +847,23 @@ func (h *AdminHandler) keyItem(w http.ResponseWriter, r *http.Request, raw strin
 		Concurrency    *int     `json:"concurrency_limit"`
 		TokenLimit     *int64   `json:"token_limit_total"`
 		MoneyLimitYuan *float64 `json:"money_limit_yuan_total"`
+		// 续期 / 改有效期：>0 = 从现在起 N 秒后过期（续期就是再传一次）；
+		// 0 或负数 = 改为永久有效；缺省（nil）= 不动。三者必须分得开，
+		// 否则「只改个名字」会把有效期顺手清掉。
+		TTLSeconds *int64 `json:"ttl_seconds"`
 	}
 	if json.NewDecoder(r.Body).Decode(&p) != nil {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
 	in := store.UpdateClientKey{Name: p.Name, Enabled: p.Enabled}
+	if p.TTLSeconds != nil {
+		if *p.TTLSeconds > 0 {
+			in.ExpiresAt = expiryFromTTL(p.TTLSeconds)
+		} else {
+			in.ClearExpiresAt = true
+		}
+	}
 	if p.Concurrency != nil {
 		in.ConcurrencyLimit = p.Concurrency
 	}
@@ -827,6 +881,151 @@ func (h *AdminHandler) keyItem(w http.ResponseWriter, r *http.Request, raw strin
 	}
 	writeJSON(w, 200, map[string]any{"data": value})
 }
+
+// keyConnection 汇总「其他软件接入这个 Key 需要填什么」。
+//
+// 为什么要这个接口：客户端 Key 的明文只在创建/重置时返回一次，之后运维手里只剩
+// 脱敏缩略；Base URL 与模型名又分散在运行配置页和模型页。让运维自己拼极易拼错
+// （Base URL 少带 /v1、模型名填成上游名），而拼错的后果是客户端报 400/404 ——
+// 从错误信息里根本看不出是「填错了」还是「服务坏了」。
+//
+// 模型清单与公共 /v1/models 走同一份 SQL（store 侧 authorizedModelsSelect），
+// 所以不会出现「管理台说已授权、客户端却拉不到」这种最难查的漂移。
+func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, keyID int64) {
+	key, err := h.repo.GetClientKey(r.Context(), keyID)
+	if err != nil {
+		writeAdminError(w, 404, "not_found")
+		return
+	}
+	models, err := h.repo.AuthorizedModelsForKey(r.Context(), keyID)
+	if err != nil {
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	groupIDs, err := h.repo.KeyGroupIDs(r.Context(), keyID)
+	if err != nil {
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	// 分组详情拿不到时降级为「只有 ID」，不影响接入信息整体可用。
+	groups := make([]map[string]any, 0, len(groupIDs))
+	enabledGroups := 0
+	if catalog, err := h.repo.ListModelGroups(r.Context()); err == nil {
+		index := make(map[int64]store.ModelGroup, len(catalog))
+		for _, g := range catalog {
+			index[g.ID] = g
+		}
+		for _, id := range groupIDs {
+			g, ok := index[id]
+			if !ok {
+				groups = append(groups, map[string]any{"id": id, "name": "", "enabled": false, "rate_milli": store.DefaultGroupRateMilli})
+				continue
+			}
+			if g.Enabled {
+				enabledGroups++
+			}
+			groups = append(groups, map[string]any{"id": g.ID, "name": g.Name, "enabled": g.Enabled, "rate_milli": g.RateMilli})
+		}
+	} else {
+		enabledGroups = len(groupIDs)
+		for _, id := range groupIDs {
+			groups = append(groups, map[string]any{"id": id, "name": "", "enabled": true, "rate_milli": store.DefaultGroupRateMilli})
+		}
+	}
+
+	names := make([]string, 0, len(models))
+	for _, m := range models {
+		names = append(names, m.PublicName)
+	}
+
+	// token 明文无法从库里还原（只存 HMAC 摘要），所以这里只给脱敏缩略；
+	// 运维需要明文时唯一途径是「重置密钥」。
+	tokenHint := ""
+	if hints, err := h.repo.KeyTokenHints(r.Context()); err == nil {
+		tokenHint = hints[keyID]
+	}
+
+	// issues = 会直接导致客户端连不上的问题；warnings = 不影响连通性但值得知道。
+	now := time.Now().UTC()
+	issues := make([]string, 0, 4)
+	warnings := make([]string, 0, 3)
+	if !key.Enabled {
+		issues = append(issues, "该 Key 已停用：客户端会收到 401 invalid_api_key")
+	}
+	// 短时令牌到期与「Key 被停用」是两回事：前者客户端换令牌即可恢复，
+	// 后者要找管理员启用。错误码也刻意不同（token_expired vs invalid_api_key）。
+	if key.Expired(now) {
+		issues = append(issues, "该令牌已过期：客户端会收到 401 token_expired，请在管理台续期（编辑里重设有效期）")
+	} else if key.ExpiresAt != nil && key.ExpiresAt.Sub(now) < 24*time.Hour {
+		warnings = append(warnings, "该令牌将在 24 小时内过期，记得提前续期")
+	}
+	if len(groupIDs) == 0 {
+		issues = append(issues, "该 Key 未绑定任何分组：客户端拉不到模型，对话返回 400 model_not_allowed")
+	} else if enabledGroups == 0 {
+		issues = append(issues, "所属分组已全部停用：授权模型为空")
+	} else if enabledGroups < len(groupIDs) {
+		warnings = append(warnings, "部分分组已停用，这些分组下的模型不会授权给该 Key")
+	}
+	if len(names) == 0 {
+		issues = append(issues, "没有可用模型：分组内渠道下要有「已启用且已定价」的模型，客户端 /v1/models 才会返回内容")
+	}
+	authMode := "token"
+	if key.Keyless() {
+		authMode = "app"
+		// 应用型凭据的边界必须写在运维看得见的地方：客户端里没有密钥可提取，
+		// 但应用标识是公开的 —— 真正的门是「谁能访问到这个网关」。
+		warnings = append(warnings, "应用型凭据：客户端不需要密钥（用请求头 X-App-Id 接入）。"+
+			"应用标识是公开的，能访问到本网关的人都能调用，请把网关限制在可信网络内（内网 / 防火墙 / 反向代理鉴权）。")
+	}
+
+	base := clientBaseURL(r)
+	// 短时令牌的有效期：null 表示永久有效（前端据此显示「永久」而不是「已过期」）
+	var expiresAtUTC, expiresInSecs any
+	if key.ExpiresAt != nil {
+		expiresAtUTC = key.ExpiresAt.UTC().Format(time.RFC3339)
+		expiresInSecs = int64(key.ExpiresAt.Sub(now).Seconds())
+	}
+	writeJSON(w, 200, map[string]any{"data": map[string]any{
+		"key_id":          key.ID,
+		"name":            key.Name,
+		"enabled":         key.Enabled,
+		"token_hint":      tokenHint,
+		"token_label":     key.TokenLabel,
+		"token_visible":   false,
+		"auth_mode":       authMode,
+		"app_id":          key.PublicID,
+		"expired":         key.Expired(now),
+		"expires_at_utc":  expiresAtUTC,
+		"expires_in_secs": expiresInSecs,
+		"groups":          groups,
+		"models":          names,
+		"base_url":        base,
+		"models_url":      base + "/models",
+		"chat_url":        base + "/chat/completions",
+		"issues":          issues,
+		"warnings":        warnings,
+		"ready":           len(issues) == 0,
+	}})
+}
+
+// clientBaseURL 按当前请求推断客户端该填的 Base URL。反向代理后面的对外地址
+// 没法从 Host 得知（运维可能正从 127.0.0.1 打开管理台），所以这里给的是「按访问
+// 管理台的方式」立刻能用的默认值，前端会提示可以改成对外地址。
+func clientBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+		scheme = proto
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return scheme + "://" + host + "/v1"
+}
+
 func (h *AdminHandler) requestsList(w http.ResponseWriter, r *http.Request) {
 	data, err := h.repo.RecentRequests(r.Context(), 50)
 	if err != nil {

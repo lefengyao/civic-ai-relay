@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -27,7 +28,10 @@ type ClientFactory interface {
 }
 
 type Request struct {
-	Token               string
+	Token string
+	// AppID 是公开的应用标识（请求头 X-App-Id），用于「应用型凭据」——
+	// 客户端里不存任何密钥的接入方式。与 Token 二选一，同给时以 Token 为准。
+	AppID               string
 	Model               string
 	Messages            []any
 	Payload             map[string]any
@@ -64,12 +68,53 @@ func (s *Service) Ready(ctx context.Context) error {
 	return s.store.Ping(ctx)
 }
 
-func (s *Service) Models(ctx context.Context, token string) ([]store.Model, error) {
-	key, err := s.store.AuthenticateClientKey(ctx, token)
-	if err != nil || !key.Enabled {
-		return nil, ErrUnauthorized
+// authenticate 把「客户端如何证明自己」统一成一条记录：密钥（Bearer）或应用标识
+// （X-App-Id）。
+//
+// 密钥优先，但**失败时回落到应用标识**：不少 OpenAI 兼容客户端会强制发送
+// Authorization 头（哪怕里面填的是占位符），此时不该把同时给出的合法应用标识一起
+// 废掉。这不降低安全性 —— 应用标识本来就是可以单独使用的凭据，能拿它调用的人
+// 本来就能调用。
+//
+// 两种凭据都可能因「到期」失败，这对客户端是不同于「凭据不对」的信号，所以
+// 单独返回 ErrTokenExpired。
+func (s *Service) authenticate(ctx context.Context, token, appID string) (store.ClientKey, error) {
+	token, appID = strings.TrimSpace(token), strings.TrimSpace(appID)
+	if token != "" {
+		key, err := s.store.AuthenticateClientKey(ctx, token)
+		switch {
+		case err == nil:
+			if !key.Enabled {
+				return key, ErrUnauthorized
+			}
+			return key, nil
+		case errors.Is(err, store.ErrClientKeyExpired):
+			return key, ErrTokenExpired
+		case appID == "":
+			return store.ClientKey{}, ErrUnauthorized
+		}
+		// 密钥无效但还有应用标识：继续往下试，不把两者一起判死
 	}
-	return s.store.AuthorizedModels(ctx, token)
+	key, err := s.store.AuthenticateClientApp(ctx, appID)
+	if errors.Is(err, store.ErrClientKeyExpired) {
+		return key, ErrTokenExpired
+	}
+	if err != nil {
+		return store.ClientKey{}, ErrUnauthorized
+	}
+	if !key.Enabled {
+		return key, ErrUnauthorized
+	}
+	return key, nil
+}
+
+func (s *Service) Models(ctx context.Context, token, appID string) ([]store.Model, error) {
+	key, err := s.authenticate(ctx, token, appID)
+	if err != nil {
+		return nil, err
+	}
+	// 认证已确认启用，这里按 Key ID 取授权模型（与公共 /v1/models、管理台接入信息同一份口径）
+	return s.store.AuthorizedModelsForKey(ctx, key.ID)
 }
 
 // PreviewProviderModels fetches the upstream model catalog for a provider via
@@ -126,14 +171,16 @@ func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
 }
 
 func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, error) {
-	if s == nil || s.store == nil || s.clients == nil || strings.TrimSpace(req.Model) == "" || strings.TrimSpace(req.Token) == "" {
+	// 两种凭据二选一：密钥（Bearer crk_…）或公开的应用标识（X-App-Id）
+	if s == nil || s.store == nil || s.clients == nil || strings.TrimSpace(req.Model) == "" ||
+		(strings.TrimSpace(req.Token) == "" && strings.TrimSpace(req.AppID) == "") {
 		return nil, store.Model{}, ErrInvalidRequest
 	}
-	key, err := s.store.AuthenticateClientKey(ctx, req.Token)
-	if err != nil || !key.Enabled {
-		return nil, store.Model{}, ErrUnauthorized
+	key, err := s.authenticate(ctx, req.Token, req.AppID)
+	if err != nil {
+		return nil, store.Model{}, err
 	}
-	models, err := s.store.AuthorizedModels(ctx, req.Token)
+	models, err := s.store.AuthorizedModelsForKey(ctx, key.ID)
 	if err != nil {
 		return nil, store.Model{}, err
 	}
@@ -268,6 +315,10 @@ func (s *Service) Chat(ctx context.Context, req Request) ([]byte, error) {
 	payload := copyPayload(req.Payload)
 	payload["model"] = model.UpstreamName
 	payload["stream"] = false
+	// 非流式同样要有界：上游客户端已不再设总超时，这里套上同一个上限，
+	// 避免「响应头回来了但 body 永远发不完」把连接和并发槽一直占着。
+	ctx, cancel := s.requestContext(ctx)
+	defer cancel()
 	data, err := client.ChatJSON(ctx, payload)
 	if err != nil {
 		_ = lease.Close(ctx, Outcome{Status: "failed"})
@@ -301,12 +352,45 @@ func (s *Service) Stream(ctx context.Context, req Request) (*http.Response, *Lea
 	payload := copyPayload(req.Payload)
 	payload["model"] = model.UpstreamName
 	payload["stream"] = true
-	response, err := client.Stream(ctx, payload)
+	// 这是「这条流能跑多久」的唯一约束（上游客户端已不再带总超时）。
+	// cancel 交给响应体：调用方本来就会 defer Body.Close()，不会漏 timer。
+	upstreamCtx, cancel := s.requestContext(ctx)
+	response, err := client.Stream(upstreamCtx, payload)
 	if err != nil {
+		cancel()
+		// 用**原始** ctx 结算：upstreamCtx 可能已因超时失效，用它写库会失败，
+		// 预留就得不到结算而要靠 reaper 兜底。
 		_ = lease.Close(ctx, Outcome{Status: "failed"})
 		return nil, nil, store.Model{}, err
 	}
+	response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
 	return response, lease, model, nil
+}
+
+// requestContext 给上游请求套上 MAX_STREAM_DURATION 的上限（流式与非流式共用）。
+// 0 或负数表示不限，与其它配置项「0 = 不限」的口径一致。
+func (s *Service) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s == nil || s.settings == nil {
+		return context.WithCancel(ctx)
+	}
+	if limit := s.settings().MaxStreamDuration; limit > 0 {
+		return context.WithTimeout(ctx, limit)
+	}
+	return context.WithCancel(ctx)
+}
+
+// cancelOnClose 把「释放超时 context」绑到响应体上：调用方本来就会 defer Close()，
+// 这样既不会漏掉 cancel（导致 timer 与上游连接泄漏），也不必要求每个调用点都记得它。
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.once.Do(c.cancel)
+	return err
 }
 
 func copyPayload(input map[string]any) map[string]any {

@@ -69,17 +69,24 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
+// appIdentifier 读取公开的应用标识（X-App-Id）。它不是密钥，只是告诉服务端
+// 「我是哪个应用」——给那些**不能保存密钥**的客户端用（密钥写在客户端里迟早被提取）。
+// 与 Bearer 二选一，同给时以密钥为准。
+func appIdentifier(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-App-Id"))
+}
+
 func (h *PublicHandler) models(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	token := bearer(r)
-	if token == "" {
+	token, appID := bearer(r), appIdentifier(r)
+	if token == "" && appID == "" {
 		writeError(w, http.StatusUnauthorized, "invalid_api_key")
 		return
 	}
-	models, err := h.service.Models(r.Context(), token)
+	models, err := h.service.Models(r.Context(), token, appID)
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -96,8 +103,8 @@ func (h *PublicHandler) chatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	token := bearer(r)
-	if token == "" {
+	token, appID := bearer(r), appIdentifier(r)
+	if token == "" && appID == "" {
 		writeError(w, http.StatusUnauthorized, "invalid_api_key")
 		return
 	}
@@ -124,7 +131,7 @@ func (h *PublicHandler) chatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "messages_required")
 		return
 	}
-	req := relay.Request{Token: token, Model: model, Payload: payload, InputText: messageText(payload["messages"]), Stream: boolValue(payload["stream"]), MaxTokens: intValue(payload["max_tokens"]), MaxCompletionTokens: intValue(payload["max_completion_tokens"])}
+	req := relay.Request{Token: token, AppID: appID, Model: model, Payload: payload, InputText: messageText(payload["messages"]), Stream: boolValue(payload["stream"]), MaxTokens: intValue(payload["max_tokens"]), MaxCompletionTokens: intValue(payload["max_completion_tokens"])}
 	if messages, ok := payload["messages"].([]any); ok {
 		req.Messages = messages
 	}
@@ -202,6 +209,11 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, relay.ErrUnauthorized):
 		status, code = http.StatusUnauthorized, "invalid_api_key"
+	case errors.Is(err, relay.ErrTokenExpired):
+		// 短时令牌到期：同样是 401，但错误码不同 —— 客户端据此能提示「令牌过期，
+		// 请换新的」，而不是把「凭据不对」和「该续期了」混为一谈反复重试。
+		status, code = http.StatusUnauthorized, "token_expired"
+		detail = "客户端令牌已过期，请向管理员申请新的令牌"
 	case errors.Is(err, relay.ErrModelNotAllowed):
 		status, code = http.StatusBadRequest, "model_not_allowed"
 	case errors.Is(err, relay.ErrGlobalConcurrencyExceeded), errors.Is(err, relay.ErrKeyConcurrencyExceeded):

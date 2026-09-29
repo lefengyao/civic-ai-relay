@@ -33,8 +33,8 @@ func (h *PublicHandler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	token := bearer(r)
-	if token == "" {
+	token, appID := bearer(r), appIdentifier(r)
+	if token == "" && appID == "" {
 		writeError(w, http.StatusUnauthorized, "invalid_api_key")
 		return
 	}
@@ -85,7 +85,7 @@ func (h *PublicHandler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 	for i, m := range messages {
 		relayMessages[i] = m
 	}
-	req := relay.Request{Token: token, Model: model, Payload: payload, Messages: relayMessages, InputText: string(encoded), Stream: stream, MaxTokens: intValue(body["max_output_tokens"])}
+	req := relay.Request{Token: token, AppID: appID, Model: model, Payload: payload, Messages: relayMessages, InputText: string(encoded), Stream: stream, MaxTokens: intValue(body["max_output_tokens"])}
 	if stream {
 		h.responsesStream(w, r, req, model)
 		return

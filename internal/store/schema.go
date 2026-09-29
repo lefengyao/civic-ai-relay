@@ -167,6 +167,25 @@ var migrations = []migration{
 		`CREATE INDEX idx_group_monitor_latest ON group_monitor_results(group_id, id DESC)`,
 		`CREATE INDEX idx_group_monitor_time ON group_monitor_results(created_at_utc)`,
 	}},
+	// v11: 客户端 Key 支持有效期（短时令牌）。expires_at_utc 为 NULL = 永久有效，
+	// 与升级前的行为完全一致，所以历史 Key 不会因为这次迁移突然失效——「必须有
+	// 效期」是运维的显式选择，不该由迁移代劳。判定在认证路径上做（AuthenticateClientKey），
+	// 过期返回 401 token_expired，与 invalid_api_key（无效/停用）区分开，客户端据此
+	// 能判断是「该换新令牌了」还是「这个令牌根本不对」。
+	{version: 11, statements: []string{
+		`ALTER TABLE client_keys ADD COLUMN expires_at_utc TEXT`,
+		`CREATE INDEX idx_client_keys_expiry ON client_keys(expires_at_utc)`,
+	}},
+	// v12: 应用型凭据 ——「客户端里不存在密钥」的接入方式。
+	// public_id 非空表示该记录用请求头 X-App-Id 接入，且 **没有可用的密钥**：
+	// token_digest 里是创建时即丢弃的随机值，没有任何人知道它的明文。客户端里没有
+	// 可提取的东西，用户也就无法把凭据带到应用外去用。
+	// ⚠️ 代价必须说清楚：应用标识是公开的（就写在客户端里），知道它的人都能调用，
+	// 所以真正的安全边界落在「谁能访问到这个网关」上（内网、防火墙、反代鉴权）。
+	{version: 12, statements: []string{
+		`ALTER TABLE client_keys ADD COLUMN public_id TEXT`,
+		`CREATE UNIQUE INDEX idx_client_keys_public_id ON client_keys(public_id) WHERE public_id IS NOT NULL`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

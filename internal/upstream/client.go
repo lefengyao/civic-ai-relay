@@ -54,7 +54,16 @@ func New(baseURL, apiKey string, connect, read, write, pool time.Duration) *Clie
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		apiKey:  strings.TrimSpace(apiKey),
-		http:    &http.Client{Transport: transport, Timeout: connect + read + write},
+		// ⚠️ 刻意**不设** http.Client.Timeout。它是「整个请求」的总超时，**包含读取
+		// 响应体的全部时间**，对流式回答等于一道固定的硬闸：默认 connect+read+write
+		// = 10+300+30 = 340 秒，任何超过它的流式对话都会在那一刻被无声掐断，
+		// 而记录里只留下 upstream_status=200 + 零 token 的 failed，运维完全看不出
+		// 是超时（2026-09-25 线上真实故障）。服务端配的 MAX_STREAM_DURATION 也因此
+		// 形同虚设。现在职责拆开：
+		//   - 「上游迟迟不响应」由 Transport.ResponseHeaderTimeout（connect+read）拦；
+		//   - 「这条流跑太久」由 MAX_STREAM_DURATION 在 relay 层用 context 拦；
+		//   - 「客户端断开」由请求自己的 ctx 取消。
+		http: &http.Client{Transport: transport},
 	}
 }
 

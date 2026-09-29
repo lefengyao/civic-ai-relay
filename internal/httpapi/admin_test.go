@@ -322,3 +322,239 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 		t.Fatal(get.Body.String())
 	}
 }
+
+// TestAdminKeyConnectionTellsClientsWhatToFill 钉住「接入信息」接口。
+//
+// 它是运维把其他软件接进来的唯一入口：必须一次给全「填什么」（Base URL、密钥标识、
+// 模型名），模型清单与公共 /v1/models 同源，并在客户端一定连不上时说明原因 ——
+// 否则运维只能靠客户端返回的 400/404 反推，而这两类错误从信息上看不出成因。
+// 同时钉住它绝不回显明文密钥与上游密钥。
+func TestAdminKeyConnectionTellsClientsWhatToFill(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+
+	provider := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", adminKey,
+		map[string]any{"name": "p", "base_url": "https://provider.example", "api_key": "upstream-secret"})
+	var created struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(provider.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	providerID := created.Data.ID
+
+	model := adminRequest(t, handler, http.MethodPost, "/admin/api/models", adminKey,
+		map[string]any{"provider_id": providerID, "public_name": "p/chat", "upstream_name": "chat", "input_price": 1, "output_price": 2, "enabled": true})
+	if model.Code != http.StatusCreated {
+		t.Fatal(model.Body.String())
+	}
+
+	group := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey,
+		map[string]any{"name": "客户端组", "rate": 1, "provider_ids": []int64{providerID}})
+	if group.Code != http.StatusCreated {
+		t.Fatal(group.Body.String())
+	}
+	if err := json.Unmarshal(group.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	groupID := created.Data.ID
+
+	createdKey := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey,
+		map[string]any{"name": "其他软件", "max_concurrency": 2, "group_ids": []int64{groupID}})
+	if createdKey.Code != http.StatusCreated {
+		t.Fatal(createdKey.Body.String())
+	}
+	var keyCreated struct {
+		Token string `json:"token"`
+		Data  struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdKey.Body.Bytes(), &keyCreated); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := "/admin/api/keys/" + strconv.FormatInt(keyCreated.Data.ID, 10)
+	path := keyPath + "/connection"
+
+	var payload struct {
+		Data struct {
+			BaseURL   string   `json:"base_url"`
+			ModelsURL string   `json:"models_url"`
+			ChatURL   string   `json:"chat_url"`
+			Models    []string `json:"models"`
+			Issues    []string `json:"issues"`
+			Ready     bool     `json:"ready"`
+			TokenHint string   `json:"token_hint"`
+			Groups    []struct {
+				ID   int64  `json:"id"`
+				Name string `json:"name"`
+			} `json:"groups"`
+		} `json:"data"`
+	}
+	decode := func(response *httptest.ResponseRecorder) {
+		t.Helper()
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	response := adminRequest(t, handler, http.MethodGet, path, adminKey, nil)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	decode(response)
+	if !payload.Data.Ready || len(payload.Data.Issues) != 0 {
+		t.Fatalf("配置齐全时应当可直接接入：%s", response.Body.String())
+	}
+	// 管理台是从 example.com 访问的，Base URL 必须按这个来源推断，派生地址要自洽
+	if payload.Data.BaseURL != "http://example.com/v1" ||
+		payload.Data.ModelsURL != payload.Data.BaseURL+"/models" ||
+		payload.Data.ChatURL != payload.Data.BaseURL+"/chat/completions" {
+		t.Fatalf("Base URL 或派生地址不对：%s", response.Body.String())
+	}
+	if len(payload.Data.Models) != 1 || payload.Data.Models[0] != "p/chat" {
+		t.Fatalf("模型清单应与公共 /v1/models 一致：%v", payload.Data.Models)
+	}
+	if len(payload.Data.Groups) != 1 || payload.Data.Groups[0].Name != "客户端组" {
+		t.Fatalf("分组信息缺失：%s", response.Body.String())
+	}
+	// 库里只有摘要，接口只能给脱敏缩略；明文与上游密钥都不得出现
+	if payload.Data.TokenHint == "" || strings.Contains(response.Body.String(), keyCreated.Token) {
+		t.Fatalf("密钥标识缺失或泄露明文：%s", response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "upstream-secret") {
+		t.Fatal("接入信息泄露了上游密钥")
+	}
+
+	// 停用 Key：要点明客户端会收到 401，而不是让运维去猜
+	if off := adminRequest(t, handler, http.MethodPut, keyPath, adminKey, map[string]any{"enabled": false}); off.Code != http.StatusOK {
+		t.Fatal(off.Body.String())
+	}
+	response = adminRequest(t, handler, http.MethodGet, path, adminKey, nil)
+	decode(response)
+	if payload.Data.Ready || !containsText(payload.Data.Issues, "已停用") {
+		t.Fatalf("Key 停用后应提示 401：%v", payload.Data.Issues)
+	}
+
+	// 停用分组：授权模型归零，要提示去配渠道/定价
+	if off := adminRequest(t, handler, http.MethodPut, "/admin/api/groups/"+strconv.FormatInt(groupID, 10), adminKey, map[string]any{"enabled": false}); off.Code != http.StatusOK {
+		t.Fatal(off.Body.String())
+	}
+	response = adminRequest(t, handler, http.MethodGet, path, adminKey, nil)
+	decode(response)
+	if len(payload.Data.Models) != 0 || !containsText(payload.Data.Issues, "分组已全部停用") {
+		t.Fatalf("分组停用后应提示无可授权模型：%v %v", payload.Data.Models, payload.Data.Issues)
+	}
+
+	// 路由必须落在 keyItem 里：未知 Key 是 404，写方法是 405，
+	// 而不是被 ParseInt 当成无效 ID 判成 400。
+	if missing := adminRequest(t, handler, http.MethodGet, "/admin/api/keys/999999/connection", adminKey, nil); missing.Code != http.StatusNotFound {
+		t.Fatal(missing.Code, missing.Body.String())
+	}
+	if badMethod := adminRequest(t, handler, http.MethodPost, path, adminKey, map[string]any{}); badMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatal(badMethod.Code, badMethod.Body.String())
+	}
+}
+
+func containsText(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAdminKeyTTLThreeStates 钉住管理端「短时令牌」有效期的三种语义必须分得开：
+// 缺省（不动）/ 0（改为永久）/ >0（从现在起重新计时，即续期）。
+// 混在一起最典型的后果是「只改个名字」把短时令牌变成永久令牌 —— 这类静默的安全
+// 降级不会有任何报错，只能靠测试挡住。
+func TestAdminKeyTTLThreeStates(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey,
+		map[string]any{"name": "短时令牌", "max_concurrency": 1, "ttl_seconds": 3600})
+	if created.Code != http.StatusCreated {
+		t.Fatal(created.Body.String())
+	}
+	var createdBody struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdBody); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := "/admin/api/keys/" + strconv.FormatInt(createdBody.Data.ID, 10)
+
+	type keyRow struct {
+		ID            int64 `json:"ID"`
+		Expired       bool  `json:"Expired"`
+		ExpiresAtUTC  any   `json:"ExpiresAtUTC"`
+		ExpiresInSecs any   `json:"ExpiresInSecs"`
+	}
+	readRow := func() keyRow {
+		t.Helper()
+		listed := adminRequest(t, handler, http.MethodGet, "/admin/api/keys", adminKey, nil)
+		var body struct {
+			Data []keyRow `json:"data"`
+		}
+		if err := json.Unmarshal(listed.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range body.Data {
+			if row.ID == createdBody.Data.ID {
+				return row
+			}
+		}
+		t.Fatalf("列表里找不到 Key #%d", createdBody.Data.ID)
+		return keyRow{}
+	}
+
+	row := readRow()
+	if row.ExpiresAtUTC == nil || row.Expired {
+		t.Fatalf("新建的短时令牌应有到期时间且未过期：%+v", row)
+	}
+	if secs, ok := row.ExpiresInSecs.(float64); !ok || secs < 3500 || secs > 3700 {
+		t.Fatalf("剩余秒数应约为 3600，实际 %v", row.ExpiresInSecs)
+	}
+
+	// 缺省：只改名字，有效期必须原样保留
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath, adminKey, map[string]any{"name": "改个名"}); resp.Code != http.StatusOK {
+		t.Fatal(resp.Body.String())
+	}
+	if row = readRow(); row.ExpiresAtUTC == nil {
+		t.Fatal("只改名字不应清掉有效期")
+	}
+
+	// 0 → 改为永久
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath, adminKey, map[string]any{"ttl_seconds": 0}); resp.Code != http.StatusOK {
+		t.Fatal(resp.Body.String())
+	}
+	if row = readRow(); row.ExpiresAtUTC != nil || row.Expired {
+		t.Fatalf("ttl_seconds=0 应改为永久有效：%+v", row)
+	}
+
+	// 设 1 秒后到期：列表要标「已过期」，接入信息要提前讲清客户端会收到什么
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath, adminKey, map[string]any{"ttl_seconds": 1}); resp.Code != http.StatusOK {
+		t.Fatal(resp.Body.String())
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if row = readRow(); !row.Expired {
+		t.Fatalf("到期后应标记为已过期：%+v", row)
+	}
+	conn := adminRequest(t, handler, http.MethodGet, keyPath+"/connection", adminKey, nil)
+	if !strings.Contains(conn.Body.String(), "token_expired") || !strings.Contains(conn.Body.String(), `"ready":false`) {
+		t.Fatalf("接入信息应说明已过期并置 ready=false：%s", conn.Body.String())
+	}
+
+	// 续期：再传一次正向 ttl（TTLSeconds>0 即「从现在起重新计时」）
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath, adminKey, map[string]any{"ttl_seconds": 7200}); resp.Code != http.StatusOK {
+		t.Fatal(resp.Body.String())
+	}
+	row = readRow()
+	if row.Expired || row.ExpiresAtUTC == nil {
+		t.Fatalf("续期后应恢复有效：%+v", row)
+	}
+}

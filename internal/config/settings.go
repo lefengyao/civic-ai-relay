@@ -455,7 +455,7 @@ func (s Settings) Redacted() map[string]any {
 // RestartOnlyChanges lists only settings that require a process restart.
 // Ordering is stable so callers can produce deterministic API responses.
 func (s Settings) RestartOnlyChanges(next Settings) []string {
-	changes := make([]string, 0, 4)
+	changes := make([]string, 0, 8)
 	if s.Host != next.Host {
 		changes = append(changes, "HOST")
 	}
@@ -464,6 +464,21 @@ func (s Settings) RestartOnlyChanges(next Settings) []string {
 	}
 	if s.DBPath != next.DBPath {
 		changes = append(changes, "DB_PATH")
+	}
+	// 上游超时在构建应用时就按**值**交给 Registry 与 HTTP 客户端了，运行中改只是
+	// 写回 relay.env，不重启不生效。从前这里漏了这几项，管理台会显示「已即时生效」，
+	// 运维据此以为调大了读超时 —— 实际还在用旧值，排查时极难想到。
+	if s.ConnectTimeout != next.ConnectTimeout {
+		changes = append(changes, "UPSTREAM_CONNECT_TIMEOUT")
+	}
+	if s.ReadTimeout != next.ReadTimeout {
+		changes = append(changes, "UPSTREAM_READ_TIMEOUT")
+	}
+	if s.WriteTimeout != next.WriteTimeout {
+		changes = append(changes, "UPSTREAM_WRITE_TIMEOUT")
+	}
+	if s.PoolTimeout != next.PoolTimeout {
+		changes = append(changes, "UPSTREAM_POOL_TIMEOUT")
 	}
 	return changes
 }
