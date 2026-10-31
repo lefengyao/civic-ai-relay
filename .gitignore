@@ -10,6 +10,8 @@ backups/
 *.key
 *.exe
 *.exe~
+# 本机交叉编译的 Linux 二进制（构建产物，用 scripts/build_deploy_bundle.py 生成）
+civic-relay-linux-amd64
 bootstrap-admin-key.txt
 .superpowers/
 dist/

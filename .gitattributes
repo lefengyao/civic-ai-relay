@@ -1,0 +1,6 @@
+# 仓库内 blob 与检出工作区一律 LF。
+#
+# 本机 core.autocrlf=true 会在检出时把 LF 转成 CRLF：一次重新 checkout 就能把
+# 整个工作区改掉，并与 Linux 部署服务器上的同名文件产生纯行尾差异——逐文件比对
+# 时会显示「全部不同」，掩盖真正的代码差异（这次整合就踩到了）。
+* text=auto eol=lf
