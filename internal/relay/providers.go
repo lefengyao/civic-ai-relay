@@ -13,14 +13,20 @@ import (
 )
 
 type Registry struct {
-	store                      *store.Store
-	mu                         sync.Mutex
-	clients                    map[int64]*upstream.Client
-	connect, read, write, pool time.Duration
+	store   *store.Store
+	mu      sync.Mutex
+	clients map[int64]*upstream.Client
+	options upstream.Options
 }
 
 func NewRegistry(repo *store.Store, connect, read, write, pool time.Duration) *Registry {
-	return &Registry{store: repo, clients: make(map[int64]*upstream.Client), connect: connect, read: read, write: write, pool: pool}
+	return NewRegistryWithOptions(repo, upstream.Options{
+		ConnectTimeout: connect, ReadTimeout: read, WriteTimeout: write, PoolTimeout: pool,
+	})
+}
+
+func NewRegistryWithOptions(repo *store.Store, options upstream.Options) *Registry {
+	return &Registry{store: repo, clients: make(map[int64]*upstream.Client), options: options}
 }
 
 func (r *Registry) forProvider(ctx context.Context, providerID int64) (*upstream.Client, error) {
@@ -40,7 +46,7 @@ func (r *Registry) forProvider(ctx context.Context, providerID int64) (*upstream
 	if err != nil {
 		return nil, err
 	}
-	client := upstream.New(provider.BaseURL, key, r.connect, r.read, r.write, r.pool)
+	client := upstream.NewWithProtocol(provider.BaseURL, key, provider.Protocol, r.options)
 	r.clients[providerID] = client
 	return client, nil
 }

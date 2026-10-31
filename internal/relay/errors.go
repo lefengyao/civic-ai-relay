@@ -11,4 +11,5 @@ var (
 	ErrGlobalConcurrencyExceeded = errors.New("global concurrency limit exceeded")
 	ErrKeyConcurrencyExceeded    = errors.New("client key concurrency limit exceeded")
 	ErrInvalidRequest            = errors.New("invalid relay request")
+	ErrSettlementUnavailable     = errors.New("settlement capacity unavailable")
 )

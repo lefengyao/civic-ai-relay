@@ -8,12 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"civic-ai-relay/internal/config"
+	"civic-ai-relay/internal/logging"
+	"civic-ai-relay/internal/requestmeta"
 	"civic-ai-relay/internal/store"
 	"civic-ai-relay/internal/upstream"
 )
@@ -39,6 +44,7 @@ type Request struct {
 	MaxTokens           int64
 	MaxCompletionTokens int64
 	Stream              bool
+	Protocol            string
 }
 
 type Outcome struct {
@@ -48,6 +54,16 @@ type Outcome struct {
 	CachedInputTokens int64
 	AmountMicroyuan   int64
 	HTTPStatus        int
+	ErrorCode         string
+	FailureStage      string
+	UsageSource       string
+	Protocol          string
+	IncompleteReason  string
+	ClientRequestID   string
+	DurationMS        *int64
+	HeaderMS          *int64
+	FirstEventMS      *int64
+	LastUpstreamMS    *int64
 }
 
 type Service struct {
@@ -56,6 +72,11 @@ type Service struct {
 	settings func() config.Settings
 	global   *Gate
 	keys     *KeyGates
+	active   ActiveReservations
+	pending  Reconciler
+	mu       sync.Mutex
+	upstream map[int64]activeUpstream
+	draining bool
 }
 
 // Ready reports whether the relay can serve traffic: the encrypted SQLite
@@ -137,17 +158,24 @@ func NewService(repo *store.Store, clients ClientFactory, settings func() config
 	if settings != nil && settings().GlobalConcurrencyLimit > 0 {
 		limit = settings().GlobalConcurrencyLimit
 	}
-	return &Service{store: repo, clients: clients, settings: settings, global: NewGate(limit), keys: NewKeyGates()}
+	return &Service{store: repo, clients: clients, settings: settings, global: NewGate(limit), keys: NewKeyGates(), upstream: make(map[int64]activeUpstream)}
 }
 
 type Lease struct {
-	service     *Service
-	reservation store.RequestReservation
-	keyID       int64
-	token       string
-	model       store.Model
-	mu          sync.Mutex
-	released    bool
+	service         *Service
+	reservation     store.RequestReservation
+	keyID           int64
+	token           string
+	clientRequestID string
+	protocol        string
+	streamed        bool
+	model           store.Model
+	quote           PriceSnapshot
+	mu              sync.Mutex
+	outcomeFrozen   bool
+	settled         bool
+	frozenOutcome   Outcome
+	releaseOnce     sync.Once
 }
 
 func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
@@ -155,22 +183,105 @@ func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
 		return nil
 	}
 	l.mu.Lock()
-	if l.released {
-		l.mu.Unlock()
+	defer l.mu.Unlock()
+	if l.settled {
 		return nil
 	}
-	l.released = true
-	l.mu.Unlock()
-	if outcome.Status == "" {
-		outcome.Status = "completed"
+	if !l.outcomeFrozen {
+		if outcome.Status == "" {
+			outcome.Status = "completed"
+		}
+		l.frozenOutcome = outcome
+		l.outcomeFrozen = true
 	}
-	err := l.service.store.SettleRequest(ctx, l.reservation.ID, outcome.InputTokens, outcome.OutputTokens, outcome.CachedInputTokens, outcome.AmountMicroyuan, outcome.Status)
-	l.service.keys.Release(l.keyID)
-	l.service.global.Release()
-	return err
+	outcome = l.frozenOutcome
+	if outcome.ClientRequestID == "" {
+		outcome.ClientRequestID = l.clientRequestID
+	}
+	if trace := requestmeta.FromContext(ctx); trace != nil {
+		if outcome.ClientRequestID == "" {
+			outcome.ClientRequestID = trace.ClientID
+		}
+		snapshot := trace.Snapshot(time.Now())
+		if outcome.DurationMS == nil {
+			outcome.DurationMS = snapshot.DurationMS
+		}
+		if outcome.HeaderMS == nil {
+			outcome.HeaderMS = snapshot.HeaderMS
+		}
+		if outcome.FirstEventMS == nil {
+			outcome.FirstEventMS = snapshot.FirstEventMS
+		}
+		if outcome.LastUpstreamMS == nil {
+			outcome.LastUpstreamMS = snapshot.LastUpstreamMS
+		}
+	}
+	// Keep the enriched outcome (client correlation and elapsed-time snapshot)
+	// in the frozen copy so settlement retries use exactly the same values even
+	// when their retry context has been canceled or no longer carries Trace.
+	l.frozenOutcome = outcome
+	cleanup, cancel := settlementContext(ctx)
+	defer cancel()
+	settlement := store.Settlement{
+		Status: outcome.Status, InputTokens: outcome.InputTokens, OutputTokens: outcome.OutputTokens,
+		CachedInputTokens: outcome.CachedInputTokens, AmountMicroyuan: outcome.AmountMicroyuan,
+		UpstreamStatus: outcome.HTTPStatus, ErrorCode: outcome.ErrorCode,
+		FailureStage: outcome.FailureStage, UsageSource: outcome.UsageSource, Protocol: outcome.Protocol,
+		IncompleteReason: outcome.IncompleteReason,
+		ClientRequestID:  outcome.ClientRequestID,
+		DurationMS:       outcome.DurationMS, HeaderMS: outcome.HeaderMS,
+		FirstEventMS: outcome.FirstEventMS, LastUpstreamMS: outcome.LastUpstreamMS,
+	}
+	err := settleWithRetry(cleanup, func(attemptCtx context.Context) error {
+		return l.service.store.FinishReservation(attemptCtx, l.reservation.ID, settlement)
+	})
+	if err != nil {
+		l.service.pending.Add(l)
+		l.service.active.Remove(l.reservation.ID)
+		l.service.forgetUpstream(l.reservation.ID)
+		logging.Errorf("request_settlement_failed request_id=%s status=%s error_code=%s failure_stage=%s upstream_status=%d", l.reservation.RequestID, outcome.Status, outcome.ErrorCode, outcome.FailureStage, outcome.HTTPStatus)
+		return err
+	}
+	logging.Infof("request_complete request_id=%s protocol=%s status=%s streamed=%t model_id=%d provider_id=%d upstream_status=%d usage_source=%s input_tokens=%d output_tokens=%d cached_input_tokens=%d duration_ms=%s upstream_header_ms=%s post_header_ms=%s first_content_ms=%s last_upstream_ms=%s", l.reservation.RequestID, outcome.Protocol, outcome.Status, l.streamed, l.model.ID, l.model.ProviderID, outcome.HTTPStatus, outcome.UsageSource, outcome.InputTokens, outcome.OutputTokens, outcome.CachedInputTokens, formatMillis(outcome.DurationMS), formatMillis(outcome.HeaderMS), postHeaderMillis(outcome.DurationMS, outcome.HeaderMS), formatMillis(outcome.FirstEventMS), formatMillis(outcome.LastUpstreamMS))
+	l.settled = true
+	l.service.pending.Remove(l.reservation.ID)
+	l.service.active.Remove(l.reservation.ID)
+	l.service.forgetUpstream(l.reservation.ID)
+	l.releaseOnce.Do(func() {
+		l.service.keys.Release(l.keyID)
+		l.service.global.Release()
+	})
+	return nil
+}
+
+func (l *Lease) RequestID() string {
+	if l == nil {
+		return ""
+	}
+	return l.reservation.RequestID
+}
+
+func (l *Lease) Protocol() string {
+	if l == nil || l.protocol == "" {
+		return "chat"
+	}
+	return l.protocol
+}
+
+// LeaseInputTokens returns the input token estimate captured when the
+// reservation was created. It is used only when a streaming upstream omits
+// prompt usage from its terminal event.
+func (l *Lease) LeaseInputTokens() int64 {
+	if l == nil {
+		return 0
+	}
+	return l.reservation.InputTokens
 }
 
 func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, error) {
+	if s != nil && s.isDraining() {
+		return nil, store.Model{}, ErrSettlementUnavailable
+	}
 	// 两种凭据二选一：密钥（Bearer crk_…）或公开的应用标识（X-App-Id）
 	if s == nil || s.store == nil || s.clients == nil || strings.TrimSpace(req.Model) == "" ||
 		(strings.TrimSpace(req.Token) == "" && strings.TrimSpace(req.AppID) == "") {
@@ -194,14 +305,6 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	if model.ID == 0 {
 		return nil, store.Model{}, ErrModelNotAllowed
 	}
-	rate, err := s.store.KeyModelRateMilli(ctx, key.ID, model.ID)
-	if err != nil {
-		return nil, store.Model{}, err
-	}
-	effective := model
-	effective.InputPriceMicroyuan = applyRate(model.InputPriceMicroyuan, rate)
-	effective.OutputPriceMicroyuan = applyRate(model.OutputPriceMicroyuan, rate)
-	effective.CachedInputPriceMicroyuan = applyRate(model.CachedInputPriceMicroyuan, rate)
 	// 兜底配置只在未注入 settings 时生效（测试用）。额度项留 0 = 不限，
 	// 与出厂默认一致：限额是运维显式选择，不该由兜底值造成意外拒绝。
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 4096}
@@ -233,7 +336,14 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		output = int64(settings.MaxOutputTokens)
 	}
 	if !s.global.TryAcquire() {
+		if len(s.pending.IDs()) > 0 || s.isDraining() {
+			return nil, store.Model{}, ErrSettlementUnavailable
+		}
 		return nil, store.Model{}, ErrGlobalConcurrencyExceeded
+	}
+	if s.isDraining() {
+		s.global.Release()
+		return nil, store.Model{}, ErrSettlementUnavailable
 	}
 	if !s.keys.TryAcquire(key.ID, key.ConcurrencyLimit) {
 		s.global.Release()
@@ -254,11 +364,18 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 			}
 		}
 	}
+	ledgerRequestID := requestID()
+	clientRequestID := ""
+	if trace := requestmeta.FromContext(ctx); trace != nil {
+		ledgerRequestID = trace.ID
+		clientRequestID = trace.ClientID
+	}
+	periodStart, _ := time.Parse(time.RFC3339, settings.PeriodLimitStart)
 	reservation, err := s.store.ReserveRequest(ctx, store.ReserveInput{
-		RequestID: requestID(), KeyID: key.ID, ModelID: model.ID, ProviderID: model.ProviderID,
+		RequestID: ledgerRequestID, KeyID: key.ID, ModelID: model.ID, ProviderID: model.ProviderID,
 		Stream: req.Stream, InputText: req.InputText, StringFields: stringFields,
 		OutputTokenCeiling: output, MaxOutputTokens: output,
-		InputPriceMicroyuan: valueOrZero(effective.InputPriceMicroyuan), OutputPriceMicroyuan: valueOrZero(effective.OutputPriceMicroyuan),
+		InputPriceMicroyuan: valueOrZero(model.InputPriceMicroyuan), OutputPriceMicroyuan: valueOrZero(model.OutputPriceMicroyuan),
 		Limits: store.QuotaLimits{
 			RPMLimit:     int64(settings.RPMLimit),
 			Token5H:      settings.TokenLimit5H,
@@ -267,6 +384,8 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 			Amount5H:     settings.AmountLimit5H,
 			AmountDaily:  settings.AmountLimitDaily,
 			AmountWeekly: settings.AmountLimitWeekly,
+			TokenPeriod:  settings.TokenLimitPeriod, AmountPeriod: settings.AmountLimitPeriod,
+			PeriodDays: settings.PeriodLimitDays, PeriodStart: periodStart,
 		},
 	})
 	if err != nil {
@@ -278,7 +397,14 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		}
 		return nil, store.Model{}, err
 	}
-	return &Lease{service: s, reservation: reservation, keyID: key.ID, token: req.Token, model: effective}, effective, nil
+	quote := priceSnapshot(reservation)
+	effective := quote.effective(model)
+	s.active.Register(reservation.ID)
+	protocol := strings.TrimSpace(req.Protocol)
+	if protocol == "" {
+		protocol = "chat"
+	}
+	return &Lease{service: s, reservation: reservation, keyID: key.ID, token: req.Token, model: effective, quote: quote, clientRequestID: clientRequestID, protocol: protocol, streamed: req.Stream}, effective, nil
 }
 
 // applyRate scales a per-million-token price by a group multiplier expressed in
@@ -289,6 +415,10 @@ func applyRate(price *int64, rateMilli int64) *int64 {
 	}
 	if rateMilli <= 0 {
 		rateMilli = 1000
+	}
+	if *price > math.MaxInt64/rateMilli {
+		n := int64(math.MaxInt64)
+		return &n
 	}
 	n := *price * rateMilli / 1000
 	return &n
@@ -301,6 +431,20 @@ func valueOrZero(value *int64) int64 {
 	return *value
 }
 
+func formatMillis(value *int64) string {
+	if value == nil {
+		return "-"
+	}
+	return strconv.FormatInt(*value, 10)
+}
+
+func postHeaderMillis(duration, header *int64) string {
+	if duration == nil || header == nil || *duration < *header {
+		return "-"
+	}
+	return strconv.FormatInt(*duration-*header, 10)
+}
+
 func (s *Service) Chat(ctx context.Context, req Request) ([]byte, error) {
 	req.Stream = false
 	lease, model, err := s.Begin(ctx, req)
@@ -309,8 +453,7 @@ func (s *Service) Chat(ctx context.Context, req Request) ([]byte, error) {
 	}
 	client, err := s.clients.ForProvider(ctx, model.ProviderID)
 	if err != nil {
-		_ = lease.Close(ctx, Outcome{Status: "failed"})
-		return nil, err
+		return nil, lease.closeAfterFailure(ctx, err)
 	}
 	payload := copyPayload(req.Payload)
 	payload["model"] = model.UpstreamName
@@ -319,52 +462,147 @@ func (s *Service) Chat(ctx context.Context, req Request) ([]byte, error) {
 	// 避免「响应头回来了但 body 永远发不完」把连接和并发槽一直占着。
 	ctx, cancel := s.requestContext(ctx)
 	defer cancel()
+	s.setUpstream(lease.reservation.ID, cancel, nil)
 	data, err := client.ChatJSON(ctx, payload)
+	if trace := requestmeta.FromContext(ctx); trace != nil && len(data) > 0 {
+		trace.MarkUpstream()
+	}
 	if err != nil {
-		_ = lease.Close(ctx, Outcome{Status: "failed"})
-		return nil, err
+		return nil, lease.closeAfterFailure(ctx, err)
 	}
 	usage := struct {
 		Usage upstream.Usage `json:"usage"`
 	}{}
 	if json.Unmarshal(data, &usage) != nil {
-		_ = lease.Close(ctx, Outcome{Status: "failed"})
-		return nil, &upstream.Error{Code: "upstream_response_invalid"}
+		return nil, lease.closeAfterFailure(ctx, &upstream.Error{Code: "upstream_response_invalid", Status: http.StatusOK})
 	}
 	amount := PriceUsage(usage.Usage, model)
-	if err := lease.Close(ctx, Outcome{Status: "completed", InputTokens: int64(usage.Usage.PromptTokens), OutputTokens: int64(usage.Usage.CompletionTokens), CachedInputTokens: int64(usage.Usage.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: 200}); err != nil {
-		return nil, err
+	if err := lease.Close(ctx, Outcome{Status: "completed", InputTokens: int64(usage.Usage.PromptTokens), OutputTokens: int64(usage.Usage.CompletionTokens), CachedInputTokens: int64(usage.Usage.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: http.StatusOK, UsageSource: "upstream", Protocol: lease.protocol}); err != nil {
+		return nil, errors.Join(ErrSettlementUnavailable, err)
 	}
 	return data, nil
 }
 
 func (s *Service) Stream(ctx context.Context, req Request) (*http.Response, *Lease, store.Model, error) {
-	req.Stream = true
-	lease, model, err := s.Begin(ctx, req)
+	prepared, err := s.PrepareStream(ctx, req)
 	if err != nil {
 		return nil, nil, store.Model{}, err
 	}
-	client, err := s.clients.ForProvider(ctx, model.ProviderID)
+	response, err := prepared.Open()
 	if err != nil {
-		_ = lease.Close(ctx, Outcome{Status: "failed"})
-		return nil, nil, store.Model{}, err
+		prepared.Cancel()
+		return nil, nil, store.Model{}, prepared.Lease.closeAfterFailure(ctx, err)
+	}
+	return response, prepared.Lease, prepared.Model, nil
+}
+
+type PreparedStream struct {
+	Lease             *Lease
+	Model             store.Model
+	Open              func() (*http.Response, error)
+	Cancel            context.CancelFunc
+	HeartbeatInterval time.Duration
+}
+
+// PrepareStream reserves once, then leaves the upstream request to Open so
+// the HTTP handler can flush a comment before waiting for response headers.
+func (s *Service) PrepareStream(ctx context.Context, req Request) (*PreparedStream, error) {
+	req.Stream = true
+	lease, model, err := s.Begin(ctx, req)
+	if err != nil {
+		return nil, err
 	}
 	payload := copyPayload(req.Payload)
 	payload["model"] = model.UpstreamName
 	payload["stream"] = true
-	// 这是「这条流能跑多久」的唯一约束（上游客户端已不再带总超时）。
-	// cancel 交给响应体：调用方本来就会 defer Body.Close()，不会漏 timer。
-	upstreamCtx, cancel := s.requestContext(ctx)
-	response, err := client.Stream(upstreamCtx, payload)
-	if err != nil {
-		cancel()
-		// 用**原始** ctx 结算：upstreamCtx 可能已因超时失效，用它写库会失败，
-		// 预留就得不到结算而要靠 reaper 兜底。
-		_ = lease.Close(ctx, Outcome{Status: "failed"})
-		return nil, nil, store.Model{}, err
+	var heartbeat, maxDuration time.Duration
+	if s.settings != nil {
+		settings := s.settings()
+		heartbeat = settings.SSEHeartbeatInterval
+		maxDuration = settings.MaxStreamDuration
 	}
-	response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
-	return response, lease, model, nil
+	var upstreamCtx context.Context
+	var cancel context.CancelFunc
+	if maxDuration > 0 {
+		upstreamCtx, cancel = context.WithTimeout(ctx, maxDuration)
+	} else {
+		upstreamCtx, cancel = context.WithCancel(ctx)
+	}
+	s.setUpstream(lease.reservation.ID, cancel, nil)
+	var bodyMu sync.Mutex
+	var body io.ReadCloser
+	var openMu sync.Mutex
+	opened := false
+	prepared := &PreparedStream{Lease: lease, Model: model, HeartbeatInterval: heartbeat}
+	prepared.Cancel = func() {
+		cancel()
+		bodyMu.Lock()
+		activeBody := body
+		bodyMu.Unlock()
+		if activeBody != nil {
+			_ = activeBody.Close()
+		}
+	}
+	prepared.Open = func() (*http.Response, error) {
+		openMu.Lock()
+		if opened {
+			openMu.Unlock()
+			return nil, errors.New("prepared stream already opened")
+		}
+		opened = true
+		openMu.Unlock()
+		if err := upstreamCtx.Err(); err != nil {
+			return nil, err
+		}
+		client, err := s.clients.ForProvider(upstreamCtx, model.ProviderID)
+		if err != nil {
+			return nil, err
+		}
+		response, err := client.Stream(upstreamCtx, payload)
+		if err != nil {
+			return nil, err
+		}
+		if response == nil || response.Body == nil {
+			return nil, &upstream.Error{Code: "upstream_response_invalid"}
+		}
+		response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
+		bodyMu.Lock()
+		body = response.Body
+		bodyMu.Unlock()
+		if err := upstreamCtx.Err(); err != nil {
+			_ = response.Body.Close()
+			return nil, err
+		}
+		s.setUpstream(lease.reservation.ID, cancel, response.Body)
+		return response, nil
+	}
+	return prepared, nil
+}
+
+func upstreamFailure(err error) (int, string) {
+	var upstreamErr *upstream.Error
+	if errors.As(err, &upstreamErr) {
+		return upstreamErr.Status, upstreamErr.Code
+	}
+	if errors.Is(err, context.Canceled) {
+		return 0, "client_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return 0, "request_duration_exceeded"
+	}
+	return 0, "upstream_connection_failed"
+}
+
+func (l *Lease) closeAfterFailure(ctx context.Context, upstreamErr error) error {
+	statusCode, code := upstreamFailure(upstreamErr)
+	status := "failed"
+	if code == "client_canceled" {
+		status = "aborted"
+	}
+	if err := l.Close(ctx, Outcome{Status: status, HTTPStatus: statusCode, ErrorCode: code, FailureStage: "upstream", UsageSource: "unknown", Protocol: l.protocol}); err != nil {
+		return errors.Join(ErrSettlementUnavailable, upstreamErr, err)
+	}
+	return upstreamErr
 }
 
 // requestContext 给上游请求套上 MAX_STREAM_DURATION 的上限（流式与非流式共用）。
@@ -385,12 +623,15 @@ type cancelOnClose struct {
 	io.ReadCloser
 	cancel context.CancelFunc
 	once   sync.Once
+	err    error
 }
 
 func (c *cancelOnClose) Close() error {
-	err := c.ReadCloser.Close()
-	c.once.Do(c.cancel)
-	return err
+	c.once.Do(func() {
+		c.err = c.ReadCloser.Close()
+		c.cancel()
+	})
+	return c.err
 }
 
 func copyPayload(input map[string]any) map[string]any {
@@ -427,13 +668,34 @@ func PriceUsage(usage upstream.Usage, model store.Model) int64 {
 	if cached > prompt {
 		cached = prompt
 	}
-	return pricePart(prompt-cached, input) + pricePart(cached, cachedPrice) + pricePart(int64(usage.CompletionTokens), output)
+	parts := []int64{
+		pricePart(prompt-cached, input),
+		pricePart(cached, cachedPrice),
+		pricePart(int64(usage.CompletionTokens), output),
+	}
+	var total int64
+	for _, part := range parts {
+		if part > math.MaxInt64-total {
+			return math.MaxInt64
+		}
+		total += part
+	}
+	return total
 }
 func pricePart(tokens, price int64) int64 {
 	if tokens <= 0 || price <= 0 {
 		return 0
 	}
-	return (tokens*price + 999999) / 1000000
+	var product, quotient, remainder big.Int
+	product.Mul(big.NewInt(tokens), big.NewInt(price))
+	quotient.QuoRem(&product, big.NewInt(1_000_000), &remainder)
+	if remainder.Sign() > 0 {
+		quotient.Add(&quotient, big.NewInt(1))
+	}
+	if !quotient.IsInt64() {
+		return math.MaxInt64
+	}
+	return quotient.Int64()
 }
 
 func (s *Service) ActiveGlobal() int {

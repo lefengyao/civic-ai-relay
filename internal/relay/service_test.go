@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"civic-ai-relay/internal/config"
+	"civic-ai-relay/internal/requestmeta"
 	"civic-ai-relay/internal/secret"
 	"civic-ai-relay/internal/store"
+	"civic-ai-relay/internal/upstream"
 )
 
 // TestRequestContextAppliesMaxStreamDuration 钉住 MAX_STREAM_DURATION 真的作用到上游请求上
@@ -38,6 +40,18 @@ func TestRequestContextAppliesMaxStreamDuration(t *testing.T) {
 	}
 }
 
+func TestNonStreamingChatDoesNotReportAFirstEventTime(t *testing.T) {
+	service, _, key := serviceFixture(t, &fakeClient{})
+	trace := requestmeta.NewTrace("relay-nonstream", "", "chat", time.Now())
+	ctx := requestmeta.WithTrace(context.Background(), trace)
+	if _, err := service.Chat(ctx, Request{Token: key.Token, Model: "public-model", MaxTokens: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := trace.Snapshot(time.Now()).FirstEventMS; got != nil {
+		t.Fatalf("non-streaming response has no observable first event, got %dms", *got)
+	}
+}
+
 type fakeClient struct {
 	chatErr error
 	calls   int
@@ -59,6 +73,10 @@ func (f *fakeFactory) ForProvider(context.Context, int64) (UpstreamClient, error
 }
 
 func serviceFixture(t *testing.T, client *fakeClient) (*Service, *store.Store, store.ClientKey) {
+	return serviceFixturePath(t, client, filepath.Join(t.TempDir(), "relay.db"))
+}
+
+func serviceFixturePath(t *testing.T, client *fakeClient, path string) (*Service, *store.Store, store.ClientKey) {
 	t.Helper()
 	raw := make([]byte, 32)
 	for i := range raw {
@@ -68,7 +86,7 @@ func serviceFixture(t *testing.T, client *fakeClient) (*Service, *store.Store, s
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo, err := store.Open(filepath.Join(t.TempDir(), "relay.db"), box)
+	repo, err := store.Open(path, box)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +116,59 @@ func serviceFixture(t *testing.T, client *fakeClient) (*Service, *store.Store, s
 	settings := config.Settings{GlobalConcurrencyLimit: 2, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 32}
 	service := NewService(repo, &fakeFactory{client: client}, func() config.Settings { return settings })
 	return service, repo, k
+}
+
+func TestFailedSettlementReconcilesFrozenOutcome(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	service, repo, key := serviceFixturePath(t, &fakeClient{}, path)
+	service.settings = func() config.Settings {
+		return config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 32}
+	}
+	ctx := context.Background()
+	lease, _, err := service.Begin(ctx, Request{Token: key.Token, Model: "public-model", MaxTokens: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(ctx, Outcome{Status: "aborted", ErrorCode: "client_canceled"}); err == nil {
+		t.Fatal("expected settlement failure while database is closed")
+	}
+	if len(service.PendingReservationIDs()) != 1 || len(service.ActiveReservationIDs()) != 0 || service.ActiveGlobal() != 1 {
+		t.Fatalf("pending=%v active=%v global=%d", service.PendingReservationIDs(), service.ActiveReservationIDs(), service.ActiveGlobal())
+	}
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = byte(i + 1)
+	}
+	box, err := secret.New(base64.StdEncoding.EncodeToString(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	service.store = reopened
+	if _, _, err := service.Begin(ctx, Request{Token: key.Token, Model: "public-model", MaxTokens: 1}); !errors.Is(err, ErrSettlementUnavailable) {
+		t.Fatalf("new request err=%v, want settlement unavailable", err)
+	}
+	settled, err := service.ReconcilePending(ctx)
+	if err != nil || settled != 1 {
+		t.Fatalf("reconciled=%d err=%v", settled, err)
+	}
+	if err := lease.Close(ctx, Outcome{Status: "completed", AmountMicroyuan: 99}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := reopened.RecentRequests(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0]["status"] != "aborted" || rows[0]["amount_microyuan"] != int64(0) || service.ActiveGlobal() != 0 {
+		t.Fatalf("rows=%v global=%d", rows, service.ActiveGlobal())
+	}
 }
 
 func ptr(v int64) *int64 { return &v }
@@ -168,5 +239,34 @@ func TestBeginAppliesGroupRateMultiplier(t *testing.T) {
 	}
 	if *stored.InputPriceMicroyuan != 1000 {
 		t.Fatalf("stored price mutated: %d", *stored.InputPriceMicroyuan)
+	}
+}
+
+func TestLeaseQuoteSurvivesPriceUpdate(t *testing.T) {
+	service, repo, key := serviceFixture(t, &fakeClient{})
+	ctx := context.Background()
+	lease, model, err := service.Begin(ctx, Request{Token: key.Token, Model: "public-model", MaxTokens: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	price := int64(2_000_000)
+	if _, err := repo.UpdateModel(ctx, model.ID, store.UpdateModel{InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price}); err != nil {
+		t.Fatal(err)
+	}
+	if got := PriceUsage(upstream.Usage{PromptTokens: 1}, lease.model); got != 1 {
+		t.Fatalf("in-flight quote = %d, want old price 1", got)
+	}
+	if err := lease.Close(ctx, Outcome{Status: "aborted"}); err != nil {
+		t.Fatal(err)
+	}
+	next, nextModel, err := service.Begin(ctx, Request{Token: key.Token, Model: "public-model", MaxTokens: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := PriceUsage(upstream.Usage{PromptTokens: 1}, nextModel); got != 2 {
+		t.Fatalf("next quote = %d, want new price 2", got)
+	}
+	if err := next.Close(ctx, Outcome{Status: "aborted"}); err != nil {
+		t.Fatal(err)
 	}
 }

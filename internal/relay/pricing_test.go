@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"math"
 	"testing"
 
 	"civic-ai-relay/internal/store"
@@ -14,6 +15,15 @@ func usage(prompt, cached, completion int) upstream.Usage {
 	u.TotalTokens = prompt + completion
 	u.PromptTokensDetails.CachedTokens = cached
 	return u
+}
+
+func TestPriceUsageSaturatesInsteadOfWrapping(t *testing.T) {
+	high := int64(math.MaxInt64 / 2)
+	model := store.Model{InputPriceMicroyuan: &high, OutputPriceMicroyuan: &high}
+	got := PriceUsage(upstream.Usage{PromptTokens: 3_000_000, CompletionTokens: 3_000_000}, model)
+	if got != math.MaxInt64 {
+		t.Fatalf("overflowed price became %d, want saturated MaxInt64", got)
+	}
 }
 
 func iptr(v int64) *int64 { return &v }
