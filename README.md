@@ -9,6 +9,7 @@ Civic Relay 是一个单进程 Go 服务，将多个 OpenAI 兼容上游统一�
 - `GET /v1/models`：只返回当前客户端 Key 被授权的启用且已定价模型。
 - `POST /v1/chat/completions`：支持普通 JSON 和流式 SSE。
 - `POST /v1/responses`：OpenAI Responses API 兼容层——请求转换为 chat/completions 转发上游，支持 `instructions`、字符串或数组 `input`、`max_output_tokens`、流式（标准 response.created/output_text.delta/response.completed 事件序列）；计费与 chat/completions 同口径。暂不支持工具调用。
+- 每个响应带服务端生成的 `X-Request-Id`；错误体和流内终态复用该 ID。客户端可用 `X-Client-Request-Id` 作为关联标签，管理端请求诊断页按 `request_id` 查看真实上游状态、错误码、失败阶段、usage 来源和耗时。
 - 每个模型独立计价（输入/输出/缓存输入分别计价，单位：元/百万 token）。
 - 缓存输入计费：解析上游 `usage.prompt_tokens_details.cached_tokens`，命中部分按「缓存输入单价」计费；未配置时回退输入价，填 0 表示缓存免费。非流式与流式共用同一计价实现（`relay.PriceUsage`）。
 - 每个模型组独立倍率（`rate_milli` 千分比，1000 = 1.0×）；请求时取 Key 所属启用分组中包含该模型所属**渠道**的最大倍率，模型原始单价存库不改写，只在预留与结算时折算（缓存单价同样受倍率约束）。
@@ -23,7 +24,7 @@ Civic Relay 是一个单进程 Go 服务，将多个 OpenAI 兼容上游统一�
 ### 配额与限制
 
 - 模型组**管理渠道**：组内挂供应商（渠道），授权模型 = 组内渠道下所有已定价启用模型（去重并集）；「查看 / 编辑」弹窗内展示每个成员渠道的模型与输入/输出/缓存单价。
-- **额度维度**：`5 小时 / 当日 / 本周` × `Token / 金额` 共 6 项，加上 RPM、Key 并发与 Key 总 Token/金额；全部在 SQLite 事务中判定。5 小时为**滚动窗口**，日/周为**北京时间自然日与自然周（周一起）**。
+- **额度维度**：`5 小时 / 当日 / 本周` × `Token / 金额`，并支持自定义周期 Token/金额限额。自定义周期生效期间不计入周限额，周期结束后周限额从周期结束时刻开始统计；全部在 SQLite 事务中判定。5 小时为**滚动窗口**，日/周为**北京时间自然日与自然周（周一起）**。
 - **不限**：额度项填 `0`（或留空）表示不限；出厂默认全部不限，新部署不会因为一个出厂限额就在第一次请求被拒。
 - **先欠费后停服**：判定只看「该窗口是否已用满」，不再要求「已用 + 本次预留 ≤ 限额」。只要还有余量就放行，哪怕本次请求会让它略微超出；用到限额之后才拒绝后续请求。限额调大或窗口轮换后**自动恢复**，无需人工干预。
 - 额度拒绝返回 **429** 并带具体窗口与数字（`token_quota_exceeded` / `amount_quota_exceeded` / `key_token_quota_exceeded` / `key_amount_quota_exceeded`），不会被误当成服务端故障而触发客户端重试。
@@ -31,7 +32,7 @@ Civic Relay 是一个单进程 Go 服务，将多个 OpenAI 兼容上游统一�
 - 运维加固：启动时及每 5 分钟自动回收崩溃残留的预留（防止并发槽位与 5h 配额永久泄漏）；每日按 `RETENTION_DAYS` 自动清理过期账目；HTTP 服务带读超时（Slowloris 防护）与空闲连接回收；SIGINT/SIGTERM 优雅停机，先排空在途请求（含 SSE 流）再落盘退出；RSS 超过 `MEMORY_LIMIT_MB` 时拒绝新公共请求并中止进行中的流；提供免认证的 `GET /healthz`（进程存活，不触达数据库）与 `GET /readyz`（数据库就绪）探针，可直接用于容器与反向代理健康检查；启动日志打印构建版本（`civic-relay <version> (commit <hash>, built <date>)`），便于确认线上运行的镜像版本。
 - 管理端「运行配置」保存后原子写回 relay.env 并**热应用**（配额、输出上限、并发闸门、内存保护、日志级别、监测与同步间隔都即时生效）；仅 `HOST`/`PORT`/`DB_PATH` 需要重启（换 `RELAY_ENCRYPTION_KEY` 也必须重启）。渠道密钥轮换或地址修改后上游连接缓存自动驱逐。
 - 自动同步上游模型：`MODEL_AUTO_SYNC`（默认**关闭**）+ `MODEL_SYNC_INTERVAL`（默认 `30m`）。开启后按间隔遍历所有启用渠道拉取模型目录，把上游新增的模型导入进来。导入的模型一律是**停用 + 未定价**，需要运维定价并启用后才会授权给客户端——自动同步只负责「发现」，不绕过定价环节，也不会悄悄改变对外可用的模型列表。
-- **流式时长由 `MAX_STREAM_DURATION` 决定**（默认 30 分钟，`0` = 不限，**改完即时生效**）：上游 HTTP 客户端**刻意不设总超时**。v0.3.7 修复了一个线上缺陷——旧实现用 `http.Client.Timeout = connect+read+write`（默认 340 秒）作为**整个请求（含读取响应体）**的总超时，任何超过它的流式回答都会被无声掐断，记录里只留下 `upstream_status=200` + 零 token 的 `failed`，运维完全看不出是超时；而当时 `MAX_STREAM_DURATION` 根本没作用到请求上。现在「等上游响应」由 `UPSTREAM_READ_TIMEOUT`（默认 300s）管，「流能跑多久」由 `MAX_STREAM_DURATION` 管。⚠️ 四个 `UPSTREAM_*_TIMEOUT` 改完需**重启容器**才生效（管理台会提示）。
+- **流式时长由 `MAX_STREAM_DURATION` 决定**（默认 30 分钟，`0` = 不限，**改完即时生效**）：上游 HTTP 客户端**刻意不设总超时**。响应头等待由 `UPSTREAM_HEADER_TIMEOUT` 控制（留空时沿用 `connect + read` 兼容计算），`UPSTREAM_IDLE_TIMEOUT` 控制上游流的空闲间隔，`SSE_HEARTBEAT_INTERVAL` 控制下行保活注释。Chat 流只有 `[DONE]` 才计为 completed，Responses 流使用 `response.completed` / `response.incomplete` / `response.failed` 终态；请求记录保留真实 upstream status 和失败阶段。⚠️ 上游连接/头/读写/池超时在进程启动时应用，修改后需重启容器。
 - 分级日志：`LOG_LEVEL`（`DEBUG` / `INFO` / `WARN` / `ERROR`，默认 `INFO`，写错会在保存/启动阶段被拒）。调到 `DEBUG` 会额外输出**逐请求访问日志**（方法、路径、状态码、耗时、来源地址），用来回答「客户端说报错了，但容器日志里什么都没有」。访问日志**不记查询串、不记请求头、不记请求体**——有客户端会把密钥放在 `?api_key=`，提示词也属于用户隐私，与本项目「账本只存元数据」的口径一致。
 - 已删除的遗留配置：`UPSTREAM_BASE_URL` / `UPSTREAM_API_KEY`（单上游时代遗留，渠道现已全部存在数据库里、密钥加密存储）与 `DOCS_ENABLED`（服务端从来没有 docs 路由）。旧 relay.env 里残留的这几行会被当作未知键保留但不再读取。
 - 管理端概览按窗口同时展示 Token 与金额的「已用 / 限额」，已用满时标红提示**已欠费**；Key 列表实时展示已用 Token / 已用金额 / 请求次数（口径与限额检查一致，含未结算预留）。
@@ -50,6 +51,11 @@ Civic Relay 是一个单进程 Go 服务，将多个 OpenAI 兼容上游统一�
 - 监测**只发现与展示，不改变任何服务行为**：不会自动停用渠道、不会拒绝请求。分组列表支持「立即检测全部」，单个分组支持「检测」，概览弹窗内可看最近 10 轮历史，都不必等定时轮询。
 - 四类资源均支持删除：删除供应商级联删除其模型；历史账单金额一律保留；重复删除返回 404。
 - 根路径 `/` 302 跳转到 `/admin/`。
+
+### 外部 WASM 插件
+
+管理台的「WASM 插件」页支持上传、校验、启用、停用、启动和删除外部插件包。插件包为 ZIP，包含 `manifest.json` 与 `module.wasm`；启动时由 wazero 在无宿主导入的独立实例中执行，清单可声明入口、权限和内存/超时上限。插件默认保存到 `PLUGIN_DIR=data/plugins`，该目录位于数据卷内。完整接口见 [docs/admin-api.md](docs/admin-api.md)。
+- **请求诊断**：管理端「请求日志」支持状态、渠道、模型、协议、时间和 request ID 筛选，游标加载更多，并可查看单条请求的真实上游状态、错误码、失败阶段、usage 来源、报价与耗时快照。
 
 ## 本地启动
 

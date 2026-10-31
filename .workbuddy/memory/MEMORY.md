@@ -61,3 +61,12 @@
 - 宝塔下站点配置在 `/www/server/panel/vhost/nginx/*.conf`，错误日志在 `/www/wwwlogs/*.error.log`。
 - ⚠️ 排障命令要**一条一条、单行、不用 `\` 续行、不用 python3**（宝塔终端整块粘贴会错位；CentOS 系可能没 python3，统计用 `grep -o | sort | uniq -c`）。
 - ⚠️ `docker run -v <不存在的卷>:/c` 会**静默创建空卷**：取管理员密钥前先 `docker volume ls | grep civic-relay` 确认卷名，否则拿到空串后一路 401。
+
+## 通过 OpsHelper MCP 远程运维（2026-10-18 建立）
+- 三台机器可经 ServerOpsHelper MCP 执行 SSH：`阿里云2c2g`（114.55.54.195:22，即生产机）、`1c1g`/`4c8g-5年`（103.236.71.248:10023/:10090）。
+- **MCP 传不了二进制**：`exec_command` 是 SSH，`write_file`/`read_file` 是 SFTP **且仅 UTF-8 文本**。传镜像/二进制不能靠我拼 base64 参数（等于要我输出数 MB token）。
+- 服务器出网白名单实测：GitHub / filebin.net / golang.google.cn 通；Docker Hub、gcr.io、mirror.gcr.io 全不通；0x0.st 已关闭匿名上传，catbox/filebin/bashupload 本机不可达（本机只有 GitHub 双向可写）。
+- **可行的镜像传输通道**：临时 git 仓库 push 到 `lefengyao/civic-ai-relay` 的短命分支 → 服务器 `git clone --depth 1 -b` → `docker load` → 删分支/清 `/tmp`。sha256 必须双向核对。副作用：blob 留在 GitHub 对象库（删分支不 gc）。
+- 本机拉基础镜像用 `mirror.gcr.io/library/<name>` 再 `docker tag` 成 Dockerfile 里的原名；服务器侧镜像加速器 `https://docker.1ms.run` 很慢（go 镜像 300s 拉不完）。
+- 升级姿势固化：`cd /opt/civic-relay` → `docker compose stop` → 停机后 tar 两卷到 `backups/`（一致备份，此时无 -wal/-shm）→ 改 `.env` 版本 → `docker compose up -d` → `healthz`+`readyz`+公网三处核版本。旧镜像标签保留作回滚。
+- 升级前先核对：`dist/` 里的最新发布包是否落后于工作区（v0.3.7 就落后于 10/3、10/7 的改动）。
