@@ -71,7 +71,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # 运行阶段基于 distroless（无 shell、无包管理器），在那里无法执行 RUN/mkdir，
 # 所以两个可写目录必须在本阶段造好，连属主一起 COPY 过去。
 # 命名卷首次挂载时会继承镜像内目录的属主，容器才能以 UID 65532 写入。
-RUN mkdir -p /out/config /out/data /out/zoneinfo/Asia \
+RUN mkdir -p /out/config /out/data /out/data/plugins /out/zoneinfo/Asia \
  && cp /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt \
  && cp /usr/share/zoneinfo/Asia/Shanghai /out/zoneinfo/Asia/Shanghai \
  && cp /usr/share/zoneinfo/UTC /out/zoneinfo/UTC

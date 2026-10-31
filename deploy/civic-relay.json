@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "profile": {
+    "id": "civic-relay",
+    "label": "Civic Relay",
+    "capabilities": { "deployment": true, "containerControl": true, "releaseCatalog": false },
+    "container": {
+      "containerNameDefault": "civic-relay",
+      "imageRepository": "civic-relay",
+      "imageManagerLabel": "civic-relay-manager=true",
+      "ownershipLabel": "civic-relay-manager-owned",
+      "targetPort": 8000
+    },
+    "defaults": { "installDir": "/opt/civic-relay", "hostPort": 8000, "containerPort": 8000, "sudo": false },
+    "package": {
+      "requiredFiles": ["Dockerfile.relay", ".dockerignore", "go.mod", "go.sum", "cmd/", "internal/", "web/"],
+      "buildCommand": "docker build -f Dockerfile.relay（由部署器执行的多阶段 Go 构建）",
+      "healthPath": "/healthz",
+      "dockerfileName": "Dockerfile.relay",
+      "useImageHealthcheck": true
+    },
+    "volumes": [
+      { "source": "civic-relay_civic-relay-config", "target": "/app/config" },
+      { "source": "civic-relay_civic-relay-data", "target": "/app/data" }
+    ],
+    "buildArgs": { "RUNTIME_IMAGE": "scratch" }
+  }
+}

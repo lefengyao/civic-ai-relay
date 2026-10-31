@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "civic-relay",
+  "name": "Civic Relay",
+  "version": "1.0.0",
+  "entry": "panel.js",
+  "site": "site.json",
+  "permissions": ["ui.panel", "site.readStatus", "site.logs"]
+}

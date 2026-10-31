@@ -15,17 +15,21 @@ zip 越小上传越快；构建上下文干净也避免把本机垃圾带进镜�
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import datetime as _dt
 import os
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-INCLUDE_FILES = ("Dockerfile.relay", "go.mod", "go.sum")
+INCLUDE_FILES = ("Dockerfile.relay", ".dockerignore", "go.mod", "go.sum")
 INCLUDE_DIRS = ("cmd", "internal", "web")
 
 # 目录内跳过的名字：隐藏目录与 Go 构建的本地产物。
-SKIP_DIR_NAMES = {".workbuddy", "__debug_bin*", "testdata"}
+SKIP_DIR_NAMES = {"testdata", "test-data", "__pycache__", "node_modules", "data", "backups"}
+SKIP_FILE_PATTERNS = ("*_test.go", "*.test.js", "*.spec.js", "relay.env", ".env*",
+                      "bootstrap-admin-key.txt", "*.db", "*.db-*", "*.pem", "*.key",
+                      "*.exe", "*.dll", "*.log")
 
 
 def _collect_files() -> list[tuple[str, str]]:
@@ -45,10 +49,10 @@ def _collect_files() -> list[tuple[str, str]]:
         for current, dirnames, filenames in os.walk(base):
             dirnames[:] = [
                 d for d in dirnames
-                if not d.startswith(".") and d not in SKIP_DIR_NAMES
+                if not d.startswith(".") and not d.startswith("__debug_bin") and d not in SKIP_DIR_NAMES
             ]
             for filename in filenames:
-                if filename.startswith("."):
+                if filename.startswith(".") or any(fnmatch.fnmatch(filename.lower(), pattern) for pattern in SKIP_FILE_PATTERNS):
                     continue
                 disk = os.path.join(current, filename)
                 arc = os.path.relpath(disk, ROOT).replace(os.sep, "/")
@@ -75,6 +79,10 @@ def main() -> None:
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         for arc, disk in sorted(entries):
             bundle.write(disk, arc)
+
+    with zipfile.ZipFile(output) as bundle:
+        if bundle.testzip() is not None:
+            raise SystemExit('源码 ZIP 校验失败')
 
     size_kb = os.path.getsize(output) / 1024
     print(f"已生成 {output}")
