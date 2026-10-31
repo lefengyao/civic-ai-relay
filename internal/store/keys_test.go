@@ -33,7 +33,7 @@ func TestNewKeyIsReturnedOnceAndStoredAsDigest(t *testing.T) {
 	}
 }
 
-// 结算必须幂等：同一笔预留被重复结算要报错，不能重复计费。
+// 结算必须幂等：同一笔预留的相同结果可以重复提交，不能重复计费。
 // 注意这里刻意不再断言"Key 用满即自动停用"——v0.3.2 起已移除该行为（旧行为会
 // 让运维调大限额后 Key 依然用不了），额度判定改由每次请求时进行。
 func TestSettlementIsIdempotent(t *testing.T) {
@@ -45,8 +45,8 @@ func TestSettlementIsIdempotent(t *testing.T) {
 	if err := repo.SettleRequest(context.Background(), reservation.ID, 3, 4, 0, 700, "completed"); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.SettleRequest(context.Background(), reservation.ID, 3, 4, 0, 700, "completed"); err == nil {
-		t.Fatal("double settlement accepted")
+	if err := repo.SettleRequest(context.Background(), reservation.ID, 3, 4, 0, 700, "completed"); err != nil {
+		t.Fatalf("same settlement should be idempotent: %v", err)
 	}
 	current, err := repo.GetClientKey(context.Background(), key.ID)
 	if err != nil {

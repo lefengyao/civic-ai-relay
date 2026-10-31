@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -90,5 +91,56 @@ func TestStoreCloseIsIdempotent(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("second Close() = %v", err)
+	}
+}
+
+func TestV12MigrationCanReopenWithoutChangingLegacyRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v12.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_utc TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range migrations {
+		if migration.version > 12 {
+			break
+		}
+		for _, statement := range migration.statements {
+			if _, err := legacy.Exec(statement); err != nil {
+				t.Fatalf("v%d: %v", migration.version, err)
+			}
+		}
+		if _, err := legacy.Exec(`INSERT INTO schema_migrations(version,applied_at_utc) VALUES (?, 'old')`, migration.version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := legacy.Exec(`INSERT INTO requests(request_id,status,input_tokens,amount_microyuan,created_at_utc) VALUES ('legacy','completed',3,7,'2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		repo, err := Open(path, testBox(t))
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		rows, err := repo.RecentRequests(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0]["request_id"] != "legacy" || rows[0]["amount_microyuan"] != int64(7) ||
+			rows[0]["usage_source"] != "unknown" || rows[0]["quote_rate_milli"] != nil {
+			t.Fatalf("legacy row changed: %v", rows)
+		}
+		var count int
+		if err := repo.db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE version=13`).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("v13 migration count=%d err=%v", count, err)
+		}
+		if err := repo.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

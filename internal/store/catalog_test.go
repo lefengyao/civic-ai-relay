@@ -43,6 +43,21 @@ func TestProviderKeyIsEncryptedAndNeverListed(t *testing.T) {
 	}
 }
 
+func TestProviderProtocolDefaultsAndCanBeChanged(t *testing.T) {
+	repo := newTestStore(t)
+	provider, err := repo.CreateProvider(context.Background(), NewProvider{Name: "default", BaseURL: "https://provider.example", APIKey: "secret"})
+	if err != nil || provider.Protocol != "openai" {
+		t.Fatalf("created provider = %#v err=%v", provider, err)
+	}
+	updated, err := repo.UpdateProvider(context.Background(), provider.ID, UpdateProvider{Protocol: "anthropic"})
+	if err != nil || updated.Protocol != "anthropic" {
+		t.Fatalf("updated provider = %#v err=%v", updated, err)
+	}
+	if _, err := repo.UpdateProvider(context.Background(), provider.ID, UpdateProvider{Protocol: "unknown"}); err == nil {
+		t.Fatal("unknown provider protocol accepted")
+	}
+}
+
 func TestProviderURLValidationAndUpdatePreservesOrRotatesSecret(t *testing.T) {
 	repo := newTestStore(t)
 	if _, err := repo.CreateProvider(context.Background(), NewProvider{Name: "bad", BaseURL: "http://remote.example", APIKey: "x"}); err == nil {

@@ -150,6 +150,90 @@ func TestWeeklyTokenWindowBlocksAfterItIsSpent(t *testing.T) {
 	}
 }
 
+func TestPeriodQuotaCompletionHandsOffToWeeklyWindow(t *testing.T) {
+	repo, key, model := newReservationFixture(t, 1_000_000, 1_000_000)
+	setConcurrency(t, repo, key.ID, 8)
+	args := newReservationArgs(key.ID, model.ID, "period-1", 600)
+	args.Limits.TokenPeriod = 50
+	args.Limits.TokenWeekly = 1000
+	args.Limits.PeriodStart = time.Now().UTC().Add(-time.Hour)
+	args.Limits.PeriodDays = 3
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("first period request must pass: %v", err)
+	}
+	args.RequestID = "weekly-after-period-1"
+	args.StartedAt = args.StartedAt.Add(time.Millisecond)
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("weekly handoff should allow the next request: %v", err)
+	}
+	args.RequestID = "weekly-after-period-2"
+	args.StartedAt = args.StartedAt.Add(time.Millisecond)
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("weekly quota should allow use below its cap: %v", err)
+	}
+	args.RequestID = "weekly-after-period-3"
+	args.StartedAt = args.StartedAt.Add(time.Millisecond)
+	_, err := repo.ReserveRequest(context.Background(), args)
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "weekly" {
+		t.Fatalf("err = %v, want weekly quota after period", err)
+	}
+}
+
+func TestPeriodAmountQuotaCompletionHandsOffToWeeklyWindow(t *testing.T) {
+	repo, key, model := newReservationFixture(t, 1_000_000, 1_000_000)
+	setConcurrency(t, repo, key.ID, 8)
+	args := newReservationArgs(key.ID, model.ID, "period-amount-1", 600)
+	args.Limits.TokenPeriod = 1_000_000
+	args.Limits.AmountPeriod = 1
+	args.Limits.TokenWeekly = 1_000_000
+	args.Limits.AmountWeekly = 1
+	args.Limits.PeriodStart = time.Now().UTC().Add(-time.Hour)
+	args.Limits.PeriodDays = 3
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("first period request must pass: %v", err)
+	}
+	args.RequestID = "weekly-after-period-amount-1"
+	args.StartedAt = args.StartedAt.Add(time.Millisecond)
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("amount handoff should allow the first weekly request: %v", err)
+	}
+	args.RequestID = "weekly-after-period-amount-2"
+	args.StartedAt = args.StartedAt.Add(time.Millisecond)
+	_, err := repo.ReserveRequest(context.Background(), args)
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "amount_quota_exceeded" {
+		t.Fatalf("err = %v, want weekly amount_quota_exceeded after period amount handoff", err)
+	}
+}
+
+func TestExpiredPeriodHandsOffToWeeklyWindow(t *testing.T) {
+	repo, key, model := newReservationFixture(t, 1_000_000, 1_000_000)
+	setConcurrency(t, repo, key.ID, 8)
+	now := time.Now().UTC()
+	args := newReservationArgs(key.ID, model.ID, "period-before-expiry", 600)
+	args.Limits.TokenPeriod = 1_000_000
+	args.Limits.TokenWeekly = 50
+	args.Limits.PeriodStart = now.Add(-25 * time.Hour)
+	args.Limits.PeriodDays = 1
+	args.StartedAt = args.Limits.PeriodStart.Add(time.Hour)
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("request inside period must pass: %v", err)
+	}
+	args.RequestID = "weekly-after-expiry-1"
+	args.StartedAt = now
+	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+		t.Fatalf("first request after period expiry must start weekly accounting: %v", err)
+	}
+	args.RequestID = "weekly-after-expiry-2"
+	args.StartedAt = now.Add(time.Millisecond)
+	_, err := repo.ReserveRequest(context.Background(), args)
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "token_quota_exceeded" {
+		t.Fatalf("err = %v, want weekly token_quota_exceeded after period expiry", err)
+	}
+}
+
 func TestDailyAmountWindowBlocksAfterItIsSpent(t *testing.T) {
 	repo, key, model := newReservationFixture(t, 1_000_000, 1_000_000)
 	setConcurrency(t, repo, key.ID, 8)
@@ -313,6 +397,25 @@ func TestGroupOverviewScopesToGroupProviders(t *testing.T) {
 	}
 	if _, err := repo.GroupOverview(context.Background(), 0, time.Now().UTC()); err == nil {
 		t.Fatal("expected error for invalid group ID")
+	}
+}
+
+func TestOverviewIncludesModelCallCounts(t *testing.T) {
+	repo, key, model := newReservationFixture(t, 100000, 100000000)
+	reservation, err := repo.ReserveRequest(context.Background(), newReservationArgs(key.ID, model.ID, "request-model-count", 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SettleRequest(context.Background(), reservation.ID, 5, 5, 0, 0, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := repo.Overview(context.Background(), time.Now().UTC(), QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, ok := overview["model_calls"].([]map[string]any)
+	if !ok || len(models) != 1 || models[0]["model_id"] != model.ID || models[0]["count"] != int64(1) {
+		t.Fatalf("model_calls=%#v", overview["model_calls"])
 	}
 }
 

@@ -16,22 +16,38 @@ type Provider struct {
 	ID               int64
 	Name             string
 	BaseURL          string
+	Protocol         string
 	Enabled          bool
 	APIKeyConfigured bool
 }
 
 type NewProvider struct {
-	Name    string
-	BaseURL string
-	APIKey  string
-	Enabled bool
+	Name     string
+	BaseURL  string
+	APIKey   string
+	Protocol string
+	Enabled  bool
 }
 
 type UpdateProvider struct {
-	Name    string
-	BaseURL string
-	APIKey  string
-	Enabled *bool
+	Name     string
+	BaseURL  string
+	APIKey   string
+	Protocol string
+	Enabled  *bool
+}
+
+func normalizeProviderProtocol(raw string) (string, error) {
+	protocol := strings.ToLower(strings.TrimSpace(raw))
+	if protocol == "" {
+		return "openai", nil
+	}
+	switch protocol {
+	case "openai", "anthropic", "gemini":
+		return protocol, nil
+	default:
+		return "", fmt.Errorf("不支持的供应商协议 %q：可选 openai、anthropic、gemini", raw)
+	}
 }
 
 // SetProviderCacheEvictor registers a callback invoked after a provider's
@@ -113,6 +129,10 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	if err != nil {
 		return Provider{}, err
 	}
+	protocol, err := normalizeProviderProtocol(in.Protocol)
+	if err != nil {
+		return Provider{}, err
+	}
 	ciphertext, err := s.box.Seal(apiKey)
 	if err != nil {
 		return Provider{}, fmt.Errorf("上游 API Key 加密失败（请检查 RELAY_ENCRYPTION_KEY 是否有效）：%v", err)
@@ -120,7 +140,7 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	enabled := 1
 	// New providers are enabled by default; disabled state can be set using UpdateProvider.
 	now := nowUTC()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO providers(name,base_url,api_key_ciphertext,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?)`, name, baseURL, []byte(ciphertext), enabled, now, now)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO providers(name,base_url,protocol,api_key_ciphertext,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?)`, name, baseURL, protocol, []byte(ciphertext), enabled, now, now)
 	if err != nil {
 		return Provider{}, friendlyProviderWriteError(err, name)
 	}
@@ -128,16 +148,16 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	if err != nil {
 		return Provider{}, err
 	}
-	return Provider{ID: id, Name: name, BaseURL: baseURL, Enabled: true, APIKeyConfigured: true}, nil
+	return Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: true, APIKeyConfigured: true}, nil
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider) (Provider, error) {
 	if id <= 0 {
 		return Provider{}, errors.New("供应商 ID 不合法")
 	}
-	var currentName, currentURL, currentCipher string
+	var currentName, currentURL, currentProtocol, currentCipher string
 	var currentEnabled int
-	if err := s.db.QueryRowContext(ctx, `SELECT name,base_url,api_key_ciphertext,enabled FROM providers WHERE id=?`, id).Scan(&currentName, &currentURL, &currentCipher, &currentEnabled); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT name,base_url,protocol,api_key_ciphertext,enabled FROM providers WHERE id=?`, id).Scan(&currentName, &currentURL, &currentProtocol, &currentCipher, &currentEnabled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Provider{}, fmt.Errorf("供应商 #%d 不存在（可能已被删除，请刷新页面）", id)
 		}
@@ -154,6 +174,14 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 		if err != nil {
 			return Provider{}, err
 		}
+	}
+	protocol := currentProtocol
+	if strings.TrimSpace(in.Protocol) != "" {
+		normalized, protocolErr := normalizeProviderProtocol(in.Protocol)
+		if protocolErr != nil {
+			return Provider{}, protocolErr
+		}
+		protocol = normalized
 	}
 	ciphertext := currentCipher
 	apiKey := strings.TrimSpace(in.APIKey)
@@ -173,19 +201,19 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 			enabled = 0
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,api_key_ciphertext=?,enabled=?,updated_at_utc=? WHERE id=?`, name, baseURL, []byte(ciphertext), enabled, nowUTC(), id); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,protocol=?,api_key_ciphertext=?,enabled=?,updated_at_utc=? WHERE id=?`, name, baseURL, protocol, []byte(ciphertext), enabled, nowUTC(), id); err != nil {
 		return Provider{}, friendlyProviderWriteError(err, name)
 	}
 	// 轮换密钥或修改地址后，缓存的 upstream client 已过期，必须驱逐重建；
 	// 否则旧凭据/旧地址会一直用到进程重启。
-	if s.providerCacheEvict != nil && (rotated || baseURL != currentURL) {
+	if s.providerCacheEvict != nil && (rotated || baseURL != currentURL || protocol != currentProtocol) {
 		s.providerCacheEvict(id)
 	}
-	return Provider{ID: id, Name: name, BaseURL: baseURL, Enabled: enabled == 1, APIKeyConfigured: s.providerConfigured(ciphertext)}, nil
+	return Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: enabled == 1, APIKeyConfigured: s.providerConfigured(ciphertext)}, nil
 }
 
 func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,base_url,enabled,api_key_ciphertext FROM providers ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext FROM providers ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +224,7 @@ func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
 		var p Provider
 		var enabled int
 		var ciphertext string
-		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &enabled, &ciphertext); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.Protocol, &enabled, &ciphertext); err != nil {
 			return nil, err
 		}
 		p.Enabled, p.APIKeyConfigured = enabled == 1, s.providerConfigured(ciphertext)
@@ -209,7 +237,7 @@ func (s *Store) GetProvider(ctx context.Context, id int64) (Provider, error) {
 	var p Provider
 	var enabled int
 	var ciphertext string
-	if err := s.db.QueryRowContext(ctx, `SELECT id,name,base_url,enabled,api_key_ciphertext FROM providers WHERE id=?`, id).Scan(&p.ID, &p.Name, &p.BaseURL, &enabled, &ciphertext); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext FROM providers WHERE id=?`, id).Scan(&p.ID, &p.Name, &p.BaseURL, &p.Protocol, &enabled, &ciphertext); err != nil {
 		return Provider{}, err
 	}
 	p.Enabled, p.APIKeyConfigured = enabled == 1, s.providerConfigured(ciphertext)

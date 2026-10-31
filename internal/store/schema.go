@@ -186,6 +186,57 @@ var migrations = []migration{
 		`ALTER TABLE client_keys ADD COLUMN public_id TEXT`,
 		`CREATE UNIQUE INDEX idx_client_keys_public_id ON client_keys(public_id) WHERE public_id IS NOT NULL`,
 	}},
+	{version: 13, statements: []string{
+		`ALTER TABLE requests ADD COLUMN error_code TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN failure_stage TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE requests ADD COLUMN protocol TEXT NOT NULL DEFAULT 'chat'`,
+		`ALTER TABLE requests ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN incomplete_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN duration_ms INTEGER`,
+		`ALTER TABLE requests ADD COLUMN upstream_header_ms INTEGER`,
+		`ALTER TABLE requests ADD COLUMN first_event_ms INTEGER`,
+		`ALTER TABLE requests ADD COLUMN last_upstream_ms INTEGER`,
+		`ALTER TABLE requests ADD COLUMN quote_input_microyuan INTEGER`,
+		`ALTER TABLE requests ADD COLUMN quote_output_microyuan INTEGER`,
+		`ALTER TABLE requests ADD COLUMN quote_cached_microyuan INTEGER`,
+		`ALTER TABLE requests ADD COLUMN quote_rate_milli INTEGER`,
+		`CREATE TRIGGER prevent_active_reservation_delete BEFORE DELETE ON key_reservations
+			WHEN OLD.status='reserved'
+			BEGIN SELECT RAISE(ABORT, 'active reservation must be settled before deletion'); END`,
+		`CREATE INDEX idx_requests_status_id ON requests(status, id)`,
+		`CREATE INDEX idx_requests_provider_id ON requests(provider_id, id)`,
+		`CREATE INDEX idx_requests_model_id ON requests(model_id, id)`,
+		`CREATE INDEX idx_requests_protocol_id ON requests(protocol, id)`,
+		`CREATE INDEX idx_requests_created_id ON requests(created_at_utc, id)`,
+	}},
+	{version: 14, statements: []string{
+		`CREATE TABLE civic_plugins (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			version TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			package_path TEXT NOT NULL UNIQUE,
+			wasm_sha256 TEXT NOT NULL,
+			manifest_json TEXT NOT NULL,
+			permissions_json TEXT NOT NULL DEFAULT '[]',
+			limits_json TEXT NOT NULL DEFAULT '{}',
+			enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+			status TEXT NOT NULL DEFAULT 'installed',
+			last_error TEXT NOT NULL DEFAULT '',
+			installed_at_utc TEXT NOT NULL,
+			updated_at_utc TEXT NOT NULL,
+			last_started_at_utc TEXT,
+			last_stopped_at_utc TEXT,
+			start_count INTEGER NOT NULL DEFAULT 0 CHECK (start_count >= 0),
+			failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0)
+		)`,
+		`CREATE INDEX idx_civic_plugins_enabled ON civic_plugins(enabled, id)`,
+	}},
+	{version: 15, statements: []string{
+		`ALTER TABLE providers ADD COLUMN protocol TEXT NOT NULL DEFAULT 'openai'`,
+		`CREATE INDEX idx_providers_protocol_enabled ON providers(protocol, enabled, id)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {
