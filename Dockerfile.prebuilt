@@ -11,14 +11,15 @@
 # 镜像体积恒定在 ~38MB，不再随迭代次数叠加。
 #
 # 为什么不用 Dockerfile.relay：它是多阶段构建，build 阶段要拉
-# golang:1.27-bookworm，而部署服务器访问不到 Docker Hub。二进制在本机
-# 用 go build 产出后上传为 civic-bin.new，这里只负责组装运行层。
+# golang:1.27-bookworm，而部署服务器既访问不到 Docker Hub、也没有 Go 工具链。
+# 二进制由本机 scripts/build_deploy_bundle.sh 交叉编译产出（名为 civic-bin），
+# 这里只负责组装运行层。完整步骤见 docs/deploy-prebuilt.md。
 #
 #   docker build -f Dockerfile.prebuilt -t civic-relay:<版本> .
 #   sed -i 's/^CIVIC_RELAY_VERSION=.*/CIVIC_RELAY_VERSION=<版本>/' .env
 #   docker compose up -d          # 不要加 --build，那会走 Dockerfile.relay
 FROM civic-relay-runtime:base
 
-COPY --chmod=755 civic-bin.new /civic-relay
+COPY --chmod=755 civic-bin /civic-relay
 
 ENTRYPOINT ["/civic-relay"]
