@@ -3,6 +3,7 @@ module civic-ai-relay
 go 1.27
 
 require (
+	github.com/tetratelabs/wazero v1.9.0
 	golang.org/x/sys v0.43.0
 	modernc.org/sqlite v1.49.1
 )

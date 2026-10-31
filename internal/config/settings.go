@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -43,6 +44,7 @@ type Settings struct {
 	Host          string
 	Port          int
 	DBPath        string
+	PluginDir     string
 	AdminAPIKey   string
 	EncryptionKey string
 	// 注意：这里刻意不再有 UPSTREAM_BASE_URL / UPSTREAM_API_KEY —— 那是单上游
@@ -65,18 +67,32 @@ type Settings struct {
 	// 额度限额一律「0 = 不限」。窗口语义：5h 为滚动五小时；日/周为北京时间
 	// 自然日与自然周（周一 00:00 起）。出厂默认全部不限，避免新部署第一次
 	// 请求就被预留额度挡住；限额是运维显式选择，不是默认约束。
-	TokenLimit5H      int64
-	TokenLimitDaily   int64
-	TokenLimitWeekly  int64
-	AmountLimit5H     int64 // 微元
-	AmountLimitDaily  int64 // 微元
-	AmountLimitWeekly int64 // 微元
-	ConnectTimeout    time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	PoolTimeout       time.Duration
-	RetentionDays     int
-	LogLevel          string
+	TokenLimit5H          int64
+	TokenLimitDaily       int64
+	TokenLimitWeekly      int64
+	AmountLimit5H         int64 // 微元
+	AmountLimitDaily      int64 // 微元
+	AmountLimitWeekly     int64 // 微元
+	PeriodLimitDays       int
+	TokenLimitPeriod      int64
+	AmountLimitPeriod     int64 // 微元
+	PeriodLimitStart      string
+	ConnectTimeout        time.Duration
+	HeaderTimeout         time.Duration
+	ReadTimeout           time.Duration
+	WriteTimeout          time.Duration
+	PoolTimeout           time.Duration
+	UpstreamIdleTimeout   time.Duration
+	UpstreamUserAgent     string
+	UpstreamSessionHeader string
+	SSEHeartbeatInterval  time.Duration
+	RetentionDays         int
+	LogLevel              string
+	// CORSAllowedOrigins 控制浏览器跨域访问的放行策略：
+	// "*"（默认）＝全部放行；"off"＝不下发任何 CORS 头；
+	// 逗号分隔的来源白名单＝仅精确匹配的来源放行。运行时逐请求读取，
+	// 管理台修改后立即生效（无需重启）。
+	CORSAllowedOrigins string
 }
 
 // TokenLimits 返回三个 Token 窗口的限额（0 = 不限），顺序为 5h / 日 / 周。
@@ -116,6 +132,10 @@ func Parse(values map[string]string) (Settings, error) {
 		return Settings{}, err
 	}
 	s.DBPath, err = textDefault(values, "DB_PATH", "data/relay.db")
+	if err != nil {
+		return Settings{}, err
+	}
+	s.PluginDir, err = textDefault(values, "PLUGIN_DIR", "data/plugins")
 	if err != nil {
 		return Settings{}, err
 	}
@@ -163,7 +183,7 @@ func Parse(values map[string]string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
-	s.MaxStreamDuration, err = duration(values, "MAX_STREAM_DURATION", 1800*time.Second, time.Second)
+	s.MaxStreamDuration, err = durationOrZero(values, "MAX_STREAM_DURATION", 1800*time.Second, time.Second)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -199,7 +219,37 @@ func Parse(values map[string]string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	s.PeriodLimitDays, err = nonNegativeInt(values, "PERIOD_LIMIT_DAYS", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.TokenLimitPeriod, err = tokenLimit(values, "TOKEN_LIMIT_PERIOD", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.AmountLimitPeriod, err = amountLimit(values, "AMOUNT_LIMIT_PERIOD", 0)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.PeriodLimitStart, err = textOptional(values, "PERIOD_LIMIT_START")
+	if err != nil {
+		return Settings{}, err
+	}
+	if s.PeriodLimitStart != "" {
+		started, parseErr := time.Parse(time.RFC3339, s.PeriodLimitStart)
+		if parseErr != nil {
+			return Settings{}, invalid("PERIOD_LIMIT_START", parseErr)
+		}
+		s.PeriodLimitStart = started.UTC().Format(time.RFC3339)
+	}
+	if s.PeriodLimitDays > 0 && s.PeriodLimitStart == "" {
+		s.PeriodLimitStart = time.Now().UTC().Format(time.RFC3339)
+	}
 	s.ConnectTimeout, err = duration(values, "UPSTREAM_CONNECT_TIMEOUT", 10*time.Second, time.Second)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.HeaderTimeout, err = duration(values, "UPSTREAM_HEADER_TIMEOUT", 0, time.Second)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -215,7 +265,27 @@ func Parse(values map[string]string) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	s.UpstreamIdleTimeout, err = durationOrZero(values, "UPSTREAM_IDLE_TIMEOUT", 0, time.Second)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.UpstreamUserAgent = "civic-ai-relay/1.0"
+	if raw, ok := values["UPSTREAM_USER_AGENT"]; ok && strings.TrimSpace(raw) != "" {
+		s.UpstreamUserAgent = strings.TrimSpace(raw)
+	}
+	s.UpstreamSessionHeader, err = textOptional(values, "UPSTREAM_SESSION_HEADER")
+	if err != nil {
+		return Settings{}, err
+	}
+	s.SSEHeartbeatInterval, err = durationOrZero(values, "SSE_HEARTBEAT_INTERVAL", 15*time.Second, time.Second)
+	if err != nil {
+		return Settings{}, err
+	}
 	s.RetentionDays, err = positiveInt(values, "RETENTION_DAYS", 7)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.CORSAllowedOrigins, err = corsOrigins(values, "CORS_ALLOWED_ORIGINS")
 	if err != nil {
 		return Settings{}, err
 	}
@@ -272,6 +342,25 @@ func positiveInt(values map[string]string, name string, fallback int) (int, erro
 	return value, nil
 }
 
+func nonNegativeInt(values map[string]string, name string, fallback int) (int, error) {
+	raw, ok := values[name]
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value < 0 {
+		return 0, invalid(name, err)
+	}
+	return value, nil
+}
+
+func textOptional(values map[string]string, name string) (string, error) {
+	if raw, ok := values[name]; ok {
+		return strings.TrimSpace(raw), nil
+	}
+	return "", nil
+}
+
 // tokenLimit 解析 Token 窗口限额，单位 token。空值与 0 都表示不限。
 func tokenLimit(values map[string]string, name string, fallback int64) (int64, error) {
 	raw, ok := values[name]
@@ -320,6 +409,63 @@ func formatAmount(microyuan int64) string {
 		return "0"
 	}
 	return strconv.FormatFloat(float64(microyuan)/1e6, 'f', -1, 64)
+}
+
+// corsOrigins 解析 CORS_ALLOWED_ORIGINS。缺省或空值视为 "*"（出厂默认不限，
+// 与额度配置同一哲学：限制是运维的显式选择）；"off" 表示不下发任何 CORS 头；
+// 其余必须是逗号分隔的来源白名单，每个来源形如 scheme://host[:port]，不允许
+// 携带路径。白名单里混入 "*" 时整条配置按全放行处理。返回值是规范化后的
+// 配置（去空格、小写 off），供 EnvMap 序列化与运行时逐请求判断。
+func corsOrigins(values map[string]string, name string) (string, error) {
+	raw, ok := values[name]
+	value := strings.TrimSpace(raw)
+	if !ok || value == "" {
+		return "*", nil
+	}
+	if value == "*" {
+		return "*", nil
+	}
+	if strings.EqualFold(value, "off") {
+		return "off", nil
+	}
+	items := strings.Split(value, ",")
+	cleaned := make([]string, 0, len(items))
+	for _, item := range items {
+		origin := strings.TrimSpace(item)
+		if origin == "" {
+			continue
+		}
+		if origin == "*" {
+			return "*", nil
+		}
+		if err := validateOrigin(origin); err != nil {
+			return "", invalid(name, err)
+		}
+		cleaned = append(cleaned, origin)
+	}
+	if len(cleaned) == 0 {
+		return "", invalid(name, errors.New("no valid origin"))
+	}
+	return strings.Join(cleaned, ","), nil
+}
+
+// validateOrigin 校验单个来源：必须是 http/https 的 scheme://host[:port]，
+// 不允许路径、查询串或片段——浏览器 Origin 头从来不含这些。
+func validateOrigin(origin string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("origin scheme must be http or https")
+	}
+	if parsed.Host == "" {
+		return errors.New("origin requires a host")
+	}
+	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("origin must not contain a path")
+	}
+	return nil
 }
 
 // intervalOrZero 解析「可以关闭」的轮询间隔：0 或 "0s" 表示关闭该功能。
@@ -382,6 +528,16 @@ func duration(values map[string]string, name string, fallback, numericUnit time.
 	return parsed, nil
 }
 
+func durationOrZero(values map[string]string, name string, fallback, numericUnit time.Duration) (time.Duration, error) {
+	if raw, ok := values[name]; ok {
+		switch strings.TrimSpace(raw) {
+		case "0", "0s":
+			return 0, nil
+		}
+	}
+	return duration(values, name, fallback, numericUnit)
+}
+
 func bodyBytes(values map[string]string) (int64, error) {
 	if raw, ok := values["MAX_BODY_BYTES"]; ok {
 		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
@@ -406,6 +562,7 @@ func (s Settings) EnvMap() map[string]string {
 	values := map[string]string{
 		"ADMIN_API_KEY":            s.AdminAPIKey,
 		"DB_PATH":                  s.DBPath,
+		"PLUGIN_DIR":               s.PluginDir,
 		"GLOBAL_CONCURRENCY_LIMIT": strconv.Itoa(s.GlobalConcurrencyLimit),
 		"HOST":                     s.Host,
 		"LOG_LEVEL":                s.LogLevel,
@@ -425,10 +582,25 @@ func (s Settings) EnvMap() map[string]string {
 		"AMOUNT_LIMIT_5H":          formatAmount(s.AmountLimit5H),
 		"AMOUNT_LIMIT_DAILY":       formatAmount(s.AmountLimitDaily),
 		"AMOUNT_LIMIT_WEEKLY":      formatAmount(s.AmountLimitWeekly),
+		"PERIOD_LIMIT_DAYS":        strconv.Itoa(s.PeriodLimitDays),
+		"TOKEN_LIMIT_PERIOD":       strconv.FormatInt(s.TokenLimitPeriod, 10),
+		"AMOUNT_LIMIT_PERIOD":      formatAmount(s.AmountLimitPeriod),
+		"PERIOD_LIMIT_START":       s.PeriodLimitStart,
 		"UPSTREAM_CONNECT_TIMEOUT": s.ConnectTimeout.String(),
 		"UPSTREAM_POOL_TIMEOUT":    s.PoolTimeout.String(),
 		"UPSTREAM_READ_TIMEOUT":    s.ReadTimeout.String(),
+		"UPSTREAM_USER_AGENT":      s.UpstreamUserAgent,
+		"UPSTREAM_SESSION_HEADER":  s.UpstreamSessionHeader,
 		"UPSTREAM_WRITE_TIMEOUT":   s.WriteTimeout.String(),
+		"UPSTREAM_IDLE_TIMEOUT":    s.UpstreamIdleTimeout.String(),
+		"SSE_HEARTBEAT_INTERVAL":   s.SSEHeartbeatInterval.String(),
+		"CORS_ALLOWED_ORIGINS":     s.CORSAllowedOrigins,
+	}
+	if strings.TrimSpace(values["PLUGIN_DIR"]) == "" {
+		values["PLUGIN_DIR"] = "data/plugins"
+	}
+	if s.HeaderTimeout > 0 {
+		values["UPSTREAM_HEADER_TIMEOUT"] = s.HeaderTimeout.String()
 	}
 	const megabyte int64 = 1024 * 1024
 	if s.MaxBodyBytes%megabyte == 0 {
@@ -474,11 +646,23 @@ func (s Settings) RestartOnlyChanges(next Settings) []string {
 	if s.ReadTimeout != next.ReadTimeout {
 		changes = append(changes, "UPSTREAM_READ_TIMEOUT")
 	}
+	if s.HeaderTimeout != next.HeaderTimeout {
+		changes = append(changes, "UPSTREAM_HEADER_TIMEOUT")
+	}
 	if s.WriteTimeout != next.WriteTimeout {
 		changes = append(changes, "UPSTREAM_WRITE_TIMEOUT")
 	}
 	if s.PoolTimeout != next.PoolTimeout {
 		changes = append(changes, "UPSTREAM_POOL_TIMEOUT")
+	}
+	if s.UpstreamIdleTimeout != next.UpstreamIdleTimeout {
+		changes = append(changes, "UPSTREAM_IDLE_TIMEOUT")
+	}
+	if s.UpstreamUserAgent != next.UpstreamUserAgent {
+		changes = append(changes, "UPSTREAM_USER_AGENT")
+	}
+	if s.UpstreamSessionHeader != next.UpstreamSessionHeader {
+		changes = append(changes, "UPSTREAM_SESSION_HEADER")
 	}
 	return changes
 }

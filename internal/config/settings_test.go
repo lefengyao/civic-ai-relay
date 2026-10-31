@@ -46,6 +46,9 @@ func TestParseAppliesDefaultsAndTypes(t *testing.T) {
 	if settings.Port != 8000 || settings.MemoryLimitMB != 200 || settings.MaxBodyBytes != 8*1024*1024 {
 		t.Fatalf("unexpected defaults: %+v", settings)
 	}
+	if settings.UpstreamUserAgent != "civic-ai-relay/1.0" || settings.UpstreamSessionHeader != "" {
+		t.Fatalf("unexpected upstream header defaults: %+v", settings)
+	}
 	if settings.ModelSyncInterval != 30*time.Minute || settings.MaxStreamDuration != 1800*time.Second {
 		t.Fatalf("unexpected duration defaults: %+v", settings)
 	}
@@ -61,6 +64,26 @@ func TestParseAppliesDefaultsAndTypes(t *testing.T) {
 	}
 	if settings.AmountLimit5H != 0 || settings.AmountLimitDaily != 0 || settings.AmountLimitWeekly != 0 {
 		t.Fatalf("unexpected amount quota defaults: %+v", settings)
+	}
+}
+
+func TestUpstreamHeaderSettingsRoundTripAndRequireRestart(t *testing.T) {
+	values := validValues()
+	values["UPSTREAM_USER_AGENT"] = "custom-relay/2"
+	values["UPSTREAM_SESSION_HEADER"] = "X-Session-Key"
+	settings, err := Parse(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Parse(settings.EnvMap())
+	if err != nil || loaded != settings {
+		t.Fatalf("round-trip mismatch: err=%v loaded=%+v", err, loaded)
+	}
+	changed := settings
+	changed.UpstreamUserAgent = "next/3"
+	changed.UpstreamSessionHeader = "-"
+	if got := changed.RestartOnlyChanges(settings); len(got) != 2 || got[0] != "UPSTREAM_USER_AGENT" || got[1] != "UPSTREAM_SESSION_HEADER" {
+		t.Fatalf("restart changes = %v", got)
 	}
 }
 
@@ -84,6 +107,24 @@ func TestQuotaLimitsAcceptZeroAsUnlimitedAndYuanForAmounts(t *testing.T) {
 	env := settings.EnvMap()
 	if env["AMOUNT_LIMIT_DAILY"] != "5" || env["AMOUNT_LIMIT_WEEKLY"] != "12.5" || env["AMOUNT_LIMIT_5H"] != "0" {
 		t.Fatalf("unexpected amount env round-trip: %v", env)
+	}
+}
+
+func TestPeriodQuotaParsesAndInitializesStart(t *testing.T) {
+	values := validValues()
+	values["PERIOD_LIMIT_DAYS"] = "14"
+	values["TOKEN_LIMIT_PERIOD"] = "9000"
+	values["AMOUNT_LIMIT_PERIOD"] = "12.5"
+	settings, err := Parse(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.PeriodLimitDays != 14 || settings.TokenLimitPeriod != 9000 || settings.AmountLimitPeriod != 12_500_000 || settings.PeriodLimitStart == "" {
+		t.Fatalf("period settings = %+v", settings)
+	}
+	parsed, err := Parse(settings.EnvMap())
+	if err != nil || parsed != settings {
+		t.Fatalf("period round-trip failed: %v %+v", err, parsed)
 	}
 }
 
@@ -252,5 +293,59 @@ func TestEnvMapRoundTripsTypedValues(t *testing.T) {
 	}
 	if parsed != settings {
 		t.Fatalf("round trip changed settings: before %+v after %+v", settings, parsed)
+	}
+}
+
+func TestMaxStreamZeroRoundTrip(t *testing.T) {
+	for _, value := range []string{"0", "0s"} {
+		values := validValues()
+		values["MAX_STREAM_DURATION"] = value
+		settings, err := Parse(values)
+		if err != nil || settings.MaxStreamDuration != 0 {
+			t.Fatalf("value=%q parse=%v duration=%v", value, err, settings.MaxStreamDuration)
+		}
+		again, err := Parse(settings.EnvMap())
+		if err != nil || again.MaxStreamDuration != 0 {
+			t.Fatalf("value=%q roundtrip=%v duration=%v", value, err, again.MaxStreamDuration)
+		}
+	}
+	for _, value := range []string{"-1", "-1s", ""} {
+		values := validValues()
+		values["MAX_STREAM_DURATION"] = value
+		if _, err := Parse(values); err == nil {
+			t.Fatalf("MAX_STREAM_DURATION=%q accepted", value)
+		}
+	}
+}
+
+func TestTimeoutCompatibility(t *testing.T) {
+	old, err := Parse(validValues())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.HeaderTimeout != 0 || old.UpstreamIdleTimeout != 0 || old.SSEHeartbeatInterval != 15*time.Second {
+		t.Fatalf("old config timeouts: header=%v idle=%v heartbeat=%v", old.HeaderTimeout, old.UpstreamIdleTimeout, old.SSEHeartbeatInterval)
+	}
+	if _, exists := old.EnvMap()["UPSTREAM_HEADER_TIMEOUT"]; exists {
+		t.Fatal("old config gained an explicit header timeout")
+	}
+	for _, name := range []string{"UPSTREAM_HEADER_TIMEOUT", "UPSTREAM_IDLE_TIMEOUT", "SSE_HEARTBEAT_INTERVAL"} {
+		values := validValues()
+		values[name] = "-1s"
+		if _, err := Parse(values); err == nil {
+			t.Fatalf("%s accepted negative duration", name)
+		}
+	}
+	values := validValues()
+	values["UPSTREAM_HEADER_TIMEOUT"] = "0"
+	if _, err := Parse(values); err == nil {
+		t.Fatal("explicit zero header timeout accepted")
+	}
+	initial, err := GenerateInitialSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.HeaderTimeout != 30*time.Minute || initial.UpstreamIdleTimeout != 0 || initial.SSEHeartbeatInterval != 15*time.Second {
+		t.Fatalf("initial timeouts: header=%v idle=%v heartbeat=%v", initial.HeaderTimeout, initial.UpstreamIdleTimeout, initial.SSEHeartbeatInterval)
 	}
 }

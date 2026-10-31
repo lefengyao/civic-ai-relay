@@ -331,15 +331,25 @@ func GenerateInitialSettings() (Settings, error) {
 		"AMOUNT_LIMIT_5H":          "0",
 		"AMOUNT_LIMIT_DAILY":       "0",
 		"AMOUNT_LIMIT_WEEKLY":      "0",
+		"PERIOD_LIMIT_DAYS":        "0",
+		"TOKEN_LIMIT_PERIOD":       "0",
+		"AMOUNT_LIMIT_PERIOD":      "0",
 		"RETENTION_DAYS":           "7",
 		"DB_PATH":                  "data/relay.db",
 		"HOST":                     "0.0.0.0",
 		"PORT":                     "8000",
 		"LOG_LEVEL":                "INFO",
 		"UPSTREAM_CONNECT_TIMEOUT": "10s",
+		"UPSTREAM_HEADER_TIMEOUT":  "1800s",
 		"UPSTREAM_READ_TIMEOUT":    "300s",
+		"UPSTREAM_USER_AGENT":      "civic-ai-relay/1.0",
+		"UPSTREAM_SESSION_HEADER":  "",
 		"UPSTREAM_WRITE_TIMEOUT":   "30s",
 		"UPSTREAM_POOL_TIMEOUT":    "10s",
+		"UPSTREAM_IDLE_TIMEOUT":    "0",
+		"SSE_HEARTBEAT_INTERVAL":   "15s",
+		// 浏览器跨域访问默认全放行；要收紧时填来源白名单（逗号分隔）或 off 关闭。
+		"CORS_ALLOWED_ORIGINS": "*",
 	}
 	return Parse(values)
 }

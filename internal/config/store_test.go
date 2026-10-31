@@ -177,6 +177,27 @@ func TestConfigStoreWriteReplacesExistingFile(t *testing.T) {
 	}
 }
 
+func TestConfigStorePersistsUnlimitedStreamDuration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.env")
+	settings, err := GenerateInitialSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.MaxStreamDuration = 0
+	store := NewStore(path)
+	if err := store.Write(settings); err != nil {
+		t.Fatal(err)
+	}
+	values, err := store.ReadMapping()
+	if err != nil || values["MAX_STREAM_DURATION"] != "0s" {
+		t.Fatalf("stored duration=%q err=%v", values["MAX_STREAM_DURATION"], err)
+	}
+	again, err := Parse(values)
+	if err != nil || again.MaxStreamDuration != 0 {
+		t.Fatalf("reload duration=%v err=%v", again.MaxStreamDuration, err)
+	}
+}
+
 func TestDefaultPathHonorsOverride(t *testing.T) {
 	override := filepath.Join(t.TempDir(), "relay.env")
 	path, err := DefaultPath(override)
