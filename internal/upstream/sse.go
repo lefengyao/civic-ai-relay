@@ -18,6 +18,8 @@ type Usage struct {
 
 type Event struct {
 	Done             bool
+	Invalid          bool
+	FinishReason     string
 	OutputCharacters int
 	Usage            Usage
 }
@@ -48,14 +50,19 @@ func ParseEvent(data []byte) Event {
 			Delta struct {
 				Content string `json:"content"`
 			} `json:"delta"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage Usage `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload.String()), &raw) != nil {
+		event.Invalid = true
 		return event
 	}
 	for _, choice := range raw.Choices {
 		event.OutputCharacters += len([]rune(choice.Delta.Content))
+		if choice.FinishReason != "" {
+			event.FinishReason = choice.FinishReason
+		}
 	}
 	event.Usage = raw.Usage
 	return event

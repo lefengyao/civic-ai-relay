@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,54 @@ import (
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type failedBody struct{ err error }
+
+func (b failedBody) Read([]byte) (int, error) { return 0, b.err }
+func (b failedBody) Close() error             { return nil }
+
+func TestChatJSONCanceledBodyReadKeepsReceivedStatus(t *testing.T) {
+	client := New("https://upstream.example", "k", time.Second, time.Second, time.Second, time.Second)
+	client.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusAccepted, Body: failedBody{err: context.Canceled}}, nil
+	})
+	_, err := client.ChatJSON(context.Background(), map[string]any{"model": "m"})
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Code != "client_canceled" || upstreamErr.Status != http.StatusAccepted {
+		t.Fatalf("err=%v, want client_canceled with HTTP 202", err)
+	}
+}
+
+func TestChatJSONBodyReadFailureKeepsStatusWithoutLeakingError(t *testing.T) {
+	client := New("https://upstream.example", "k", time.Second, time.Second, time.Second, time.Second)
+	client.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusPartialContent, Body: failedBody{err: errors.New("upstream secret detail")}}, nil
+	})
+	_, err := client.ChatJSON(context.Background(), map[string]any{"model": "m"})
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Code != "upstream_response_invalid" || upstreamErr.Status != http.StatusPartialContent {
+		t.Fatalf("err=%v, want upstream_response_invalid with HTTP 206", err)
+	}
+	if strings.Contains(err.Error(), "upstream secret detail") {
+		t.Fatalf("raw body read error leaked: %v", err)
+	}
+}
+
+func TestChatJSONExpiredBodyReadKeepsReceivedStatus(t *testing.T) {
+	client := New("https://upstream.example", "k", time.Second, time.Second, time.Second, time.Second)
+	client.http.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: failedBody{err: context.DeadlineExceeded}}, nil
+	})
+	_, err := client.ChatJSON(context.Background(), map[string]any{"model": "m"})
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Code != "request_duration_exceeded" || upstreamErr.Status != http.StatusOK {
+		t.Fatalf("err=%v, want request_duration_exceeded with HTTP 200", err)
+	}
+}
 
 // TestClientHasNoAggregateTimeout 钉住一条线上事故级的约束：
 // `http.Client.Timeout` 是「整个请求」的总超时（**包含读取响应体的全部时间**），
@@ -74,6 +123,9 @@ func TestStreamAddsUsageOptionAndForwardsBearerKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer upstream-secret" {
 			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		if r.UserAgent() != DefaultUserAgent {
+			t.Fatalf("User-Agent = %q", r.UserAgent())
 		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
