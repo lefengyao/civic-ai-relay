@@ -1,7 +1,7 @@
 package httpapi
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"civic-ai-relay/internal/logging"
 	"civic-ai-relay/internal/relay"
+	"civic-ai-relay/internal/requestmeta"
 	"civic-ai-relay/internal/upstream"
 )
 
@@ -52,10 +54,16 @@ func (h *PublicHandler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 		writeErrorDetail(w, http.StatusBadRequest, "invalid_request", "request body is not valid JSON: "+err.Error())
 		return
 	}
+	if sid := strings.TrimSpace(r.Header.Get(upstream.SessionIDHeader)); sid != "" {
+		r = r.WithContext(upstream.WithSessionID(r.Context(), sid))
+	}
 	model, _ := body["model"].(string)
 	if strings.TrimSpace(model) == "" {
 		writeError(w, http.StatusBadRequest, "model_required")
 		return
+	}
+	if trace := requestmeta.FromContext(r.Context()); trace != nil {
+		trace.SetModel(model)
 	}
 	input, hasInput := body["input"]
 	if !hasInput {
@@ -85,7 +93,7 @@ func (h *PublicHandler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 	for i, m := range messages {
 		relayMessages[i] = m
 	}
-	req := relay.Request{Token: token, AppID: appID, Model: model, Payload: payload, Messages: relayMessages, InputText: string(encoded), Stream: stream, MaxTokens: intValue(body["max_output_tokens"])}
+	req := relay.Request{Token: token, AppID: appID, Model: model, Payload: payload, Messages: relayMessages, InputText: string(encoded), Stream: stream, MaxTokens: intValue(body["max_output_tokens"]), Protocol: "responses"}
 	if stream {
 		h.responsesStream(w, r, req, model)
 		return
@@ -135,109 +143,209 @@ func (h *PublicHandler) writeResponsesResult(w http.ResponseWriter, model string
 
 // responsesStream 把上游 chat SSE 增量转成 Responses 事件流。
 func (h *PublicHandler) responsesStream(w http.ResponseWriter, r *http.Request, req relay.Request, publicModel string) {
-	response, lease, model, err := h.service.Stream(r.Context(), req)
+	prepared, err := h.service.PrepareStream(r.Context(), req)
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
 	}
-	defer response.Body.Close()
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, _ := w.(http.Flusher)
-
+	lease := prepared.Lease
 	responseID, messageID := newID("resp"), newID("msg")
 	created := time.Now().Unix()
-	send := func(event string, payload map[string]any) {
-		payload["type"] = event
-		encoded, _ := json.Marshal(payload)
-		_, _ = io.WriteString(w, "event: "+event+"\ndata: "+string(encoded)+"\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-	// response.created 让客户端尽早拿到会话句柄
-	send("response.created", map[string]any{"response": map[string]any{
-		"id": responseID, "object": "response", "created_at": created, "status": "in_progress", "model": publicModel, "output": []any{},
-	}})
-	send("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{
-		"type": "message", "id": messageID, "status": "in_progress", "role": "assistant", "content": []any{},
-	}})
-	send("response.content_part.added", map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "part": map[string]any{
-		"type": "output_text", "text": "", "annotations": []any{},
-	}})
-
 	var full strings.Builder
 	var usageEvent upstream.Usage
-	status := "completed"
-	lines := 0
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
-			continue
+	var incompleteReason string
+	outcome := relay.Outcome{Status: "aborted", ErrorCode: "client_canceled", FailureStage: "stream", Protocol: lease.Protocol()}
+	var session *streamSession
+	defer func() {
+		if session != nil {
+			session.Close()
+		} else {
+			prepared.Cancel()
 		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
+		reportedUsage := usageEvent.TotalTokens > 0
+		if !reportedUsage && full.Len() > 0 {
+			usageEvent = upstream.Usage{CompletionTokens: (full.Len() + 1) / 2, TotalTokens: full.Len()}
 		}
-		dataPayload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if dataPayload == "[DONE]" {
-			break
+		outcome.InputTokens = int64(usageEvent.PromptTokens)
+		if outcome.InputTokens == 0 {
+			outcome.InputTokens = lease.LeaseInputTokens()
 		}
-		if h.streamAdmission != nil && lines%256 == 255 {
-			if err := h.streamAdmission(); err != nil {
-				status = "aborted"
-				break
+		outcome.OutputTokens = int64(usageEvent.CompletionTokens)
+		outcome.CachedInputTokens = int64(usageEvent.PromptTokensDetails.CachedTokens)
+		outcome.IncompleteReason = incompleteReason
+		outcome.AmountMicroyuan = relay.PriceUsage(usageEvent, prepared.Model)
+		if reportedUsage {
+			outcome.UsageSource = "upstream"
+		} else if full.Len() > 0 {
+			outcome.UsageSource = "estimated"
+		} else {
+			outcome.UsageSource = "unknown"
+		}
+		if err := lease.Close(r.Context(), outcome); err != nil {
+			logging.Errorf("responses settlement_failed request_id=%s status=%s error_code=%s failure_stage=%s upstream_status=%d", lease.RequestID(), outcome.Status, outcome.ErrorCode, outcome.FailureStage, outcome.HTTPStatus)
+		}
+	}()
+	session, err = newStreamSession(w, r, prepared, h.streamAdmission)
+	if err != nil {
+		outcome.ErrorCode, outcome.FailureStage = "downstream_write_failed", "downstream"
+		return
+	}
+	send := func(event string, payload map[string]any) bool {
+		payload["type"] = event
+		encoded, _ := json.Marshal(payload)
+		return session.write([]byte("event: "+event+"\ndata: "+string(encoded)+"\n\n")) == nil
+	}
+	writeFailure := func() {
+		outcome.Status, outcome.ErrorCode, outcome.FailureStage = "aborted", "downstream_write_failed", "downstream"
+	}
+	var done, headerReceived bool
+	var readErr error
+	var finishReason string
+	for {
+		result := session.Next()
+		switch result.kind {
+		case streamHeader:
+			headerReceived = true
+			if trace := requestmeta.FromContext(r.Context()); trace != nil {
+				trace.MarkHeader()
 			}
+			outcome.HTTPStatus = result.response.StatusCode
+			if !send("response.created", map[string]any{"response": map[string]any{
+				"id": responseID, "object": "response", "created_at": created, "status": "in_progress", "model": publicModel, "output": []any{},
+			}}) || !send("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{
+				"type": "message", "id": messageID, "status": "in_progress", "role": "assistant", "content": []any{},
+			}}) || !send("response.content_part.added", map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "part": map[string]any{
+				"type": "output_text", "text": "", "annotations": []any{},
+			}}) {
+				writeFailure()
+				return
+			}
+		case streamFrame:
+			if result.frame.Comment {
+				if err := session.write(result.frame.Raw); err != nil {
+					writeFailure()
+					return
+				}
+				continue
+			}
+			dataPayload := bytes.TrimSpace(result.frame.Data)
+			if bytes.Equal(dataPayload, []byte("[DONE]")) {
+				done = true
+				goto finished
+			}
+			if len(dataPayload) == 0 {
+				continue
+			}
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+					FinishReason string `json:"finish_reason"`
+				} `json:"choices"`
+				Usage *upstream.Usage `json:"usage"`
+			}
+			if json.Unmarshal(dataPayload, &chunk) != nil {
+				readErr = errors.New("invalid upstream event")
+				goto finished
+			}
+			if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+				usageEvent = *chunk.Usage
+			}
+			if len(chunk.Choices) > 0 {
+				if trace := requestmeta.FromContext(r.Context()); trace != nil {
+					trace.MarkFirstEvent()
+				}
+				if chunk.Choices[0].FinishReason != "" {
+					finishReason = chunk.Choices[0].FinishReason
+					if finishReason == "length" {
+						incompleteReason = "max_output_tokens"
+					}
+				}
+				delta := chunk.Choices[0].Delta.Content
+				if delta != "" {
+					full.WriteString(delta)
+					if !send("response.output_text.delta", map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "delta": delta}) {
+						writeFailure()
+						return
+					}
+				}
+			}
+		case streamReadError:
+			readErr = result.err
+			goto finished
+		case streamWriteError:
+			writeFailure()
+			return
+		case streamAdmissionError:
+			outcome.Status, outcome.ErrorCode = "aborted", "memory_limit_exceeded"
+			if !sendResponseFailure(send, responseID, publicModel, created, messageID, full.String(), outcome.ErrorCode, "response.failed", lease.RequestID()) {
+				writeFailure()
+			}
+			return
+		case streamCanceled:
+			outcome.Status, outcome.ErrorCode = "aborted", "client_canceled"
+			return
 		}
-		lines++
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-			} `json:"choices"`
-			Usage *upstream.Usage `json:"usage"`
-		}
-		if json.Unmarshal([]byte(dataPayload), &chunk) != nil {
-			continue
-		}
-		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
-			usageEvent = *chunk.Usage
-		}
-		if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == "" {
-			continue
-		}
-		delta := chunk.Choices[0].Delta.Content
-		full.WriteString(delta)
-		send("response.output_text.delta", map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "delta": delta})
 	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		status = "failed"
+
+finished:
+	if !headerReceived {
+		outcome.Status, outcome.ErrorCode, outcome.HTTPStatus = streamOpenFailure(readErr, r.Context())
+		outcome.FailureStage = "upstream"
+		if outcome.Status == "failed" && !sendResponseFailure(send, responseID, publicModel, created, messageID, full.String(), outcome.ErrorCode, "response.failed", lease.RequestID()) {
+			writeFailure()
+		}
+		return
 	}
-	if usageEvent.TotalTokens == 0 && full.Len() > 0 {
-		// 上游未报告 usage 时按流出的字符数估算，保证配额与账本仍有记录
-		usageEvent = upstream.Usage{PromptTokens: usageEvent.PromptTokens, CompletionTokens: (full.Len() + 1) / 2, TotalTokens: full.Len()}
+	responseEvent := ""
+	outcome.Status, outcome.ErrorCode, responseEvent = upstream.ResponsesBridgeTerminal(done, finishReason, readErr, r.Context().Err() != nil || errors.Is(readErr, context.Canceled))
+	if readErr != nil && !errors.Is(readErr, io.EOF) && readErr.Error() == "invalid upstream event" {
+		outcome.ErrorCode = "upstream_event_invalid"
+	}
+	if outcome.Status == "failed" && outcome.FailureStage == "stream" {
+		outcome.FailureStage = "upstream"
+	}
+	if outcome.Status == "completed" {
+		outcome.FailureStage = ""
 	}
 	text := full.String()
-	send("response.output_text.done", map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "text": text})
-	send("response.output_item.done", map[string]any{"output_index": 0, "item": map[string]any{
-		"type": "message", "id": messageID, "status": "completed", "role": "assistant",
-		"content": []map[string]any{{"type": "output_text", "text": text, "annotations": []any{}}},
-	}})
-	send("response.completed", map[string]any{"response": map[string]any{
-		"id": responseID, "object": "response", "created_at": created, "status": status, "model": publicModel,
+	if outcome.Status == "completed" {
+		if !send("response.output_text.done", map[string]any{"item_id": messageID, "output_index": 0, "content_index": 0, "text": text}) ||
+			!send("response.output_item.done", map[string]any{"output_index": 0, "item": map[string]any{
+				"type": "message", "id": messageID, "status": "completed", "role": "assistant",
+				"content": []map[string]any{{"type": "output_text", "text": text, "annotations": []any{}}},
+			}}) ||
+			!send("response.completed", map[string]any{"response": map[string]any{
+				"id": responseID, "object": "response", "created_at": created, "status": "completed", "model": publicModel,
+				"output": []map[string]any{{
+					"type": "message", "id": messageID, "status": "completed", "role": "assistant",
+					"content": []map[string]any{{"type": "output_text", "text": text, "annotations": []any{}}},
+				}},
+				"usage": map[string]any{
+					"input_tokens": usageEvent.PromptTokens, "output_tokens": usageEvent.CompletionTokens, "total_tokens": usageEvent.TotalTokens,
+				},
+			}}) {
+			writeFailure()
+		}
+	} else if responseEvent != "" && !sendResponseFailure(send, responseID, publicModel, created, messageID, text, outcome.ErrorCode, responseEvent, lease.RequestID()) {
+		writeFailure()
+	}
+}
+
+func sendResponseFailure(send func(string, map[string]any) bool, responseID, model string, created int64, messageID, text, code, event, requestID string) bool {
+	status := "failed"
+	if event == "response.incomplete" {
+		status = "incomplete"
+	}
+	return send(event, map[string]any{"response": map[string]any{
+		"id": responseID, "object": "response", "created_at": created, "status": status, "model": model,
+		"error": map[string]any{"code": code, "message": "response stream interrupted", "request_id": requestID},
 		"output": []map[string]any{{
-			"type": "message", "id": messageID, "status": "completed", "role": "assistant",
+			"type": "message", "id": messageID, "status": "incomplete", "role": "assistant",
 			"content": []map[string]any{{"type": "output_text", "text": text, "annotations": []any{}}},
 		}},
-		"usage": map[string]any{
-			"input_tokens": usageEvent.PromptTokens, "output_tokens": usageEvent.CompletionTokens, "total_tokens": usageEvent.TotalTokens,
-		},
 	}})
-	amount := relay.PriceUsage(usageEvent, model)
-	_ = lease.Close(r.Context(), relay.Outcome{Status: status, InputTokens: int64(usageEvent.PromptTokens), OutputTokens: int64(usageEvent.CompletionTokens), CachedInputTokens: int64(usageEvent.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: 200})
 }
 
 // responsesInputToMessages 把 Responses 的 instructions + input 转成

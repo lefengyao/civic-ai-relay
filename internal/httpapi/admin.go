@@ -6,13 +6,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"civic-ai-relay/internal/config"
+	"civic-ai-relay/internal/plugin"
 	"civic-ai-relay/internal/relay"
 	"civic-ai-relay/internal/store"
 	"civic-ai-relay/web"
@@ -31,7 +35,8 @@ type AdminHandler struct {
 	onSettingsChange func(config.Settings)
 	// groupMonitor 提供「立即检测」的按需触发；为 nil 时相关接口返回 503。
 	// 定时轮询由 cmd 层的后台循环负责，这里只做手动触发与历史查询。
-	groupMonitor GroupMonitor
+	groupMonitor  GroupMonitor
+	pluginManager *plugin.Manager
 }
 
 // GroupMonitor 是管理台手动触发分组监测所需的最小依赖面，由 relay.Monitor 实现。
@@ -42,6 +47,10 @@ type GroupMonitor interface {
 
 // SetGroupMonitor 注册分组监测器，启用 /admin/api/groups/monitor 等接口。
 func (h *AdminHandler) SetGroupMonitor(m GroupMonitor) { h.groupMonitor = m }
+
+// SetPluginManager registers the external WASM package manager. Keeping the
+// manager optional preserves the lightweight admin handler used by unit tests.
+func (h *AdminHandler) SetPluginManager(m *plugin.Manager) { h.pluginManager = m }
 
 func NewAdminHandler(repo *store.Store, service *relay.Service, settings config.Settings, adminKey string) *AdminHandler {
 	return &AdminHandler{repo: repo, service: service, settings: settings, adminKey: adminKey}
@@ -64,13 +73,25 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !h.requireAdmin(w, r) {
+	path := strings.TrimPrefix(r.URL.Path, "/admin/api/")
+	// 登录态查询本身不需要鉴权：只回答「这个密钥是不是管理员」，供前端决定
+	// 展示公开只读视图还是完整视图。
+	if path == "session" && isReadMethod(r.Method) {
+		writeJSON(w, http.StatusOK, map[string]any{"admin": h.adminAuthorized(r)})
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/admin/api/")
+	// 概览、用量分析、供应商、模型组公开只读；客户端 Key、请求日志、WASM 插件、
+	// 运行配置以及一切写操作仍然要求管理员密钥。
+	if !(isReadMethod(r.Method) && isPublicRead(path)) {
+		if !h.requireAdmin(w, r) {
+			return
+		}
+	}
 	switch {
 	case path == "overview" && r.Method == http.MethodGet:
 		h.overview(w, r)
+	case path == "analytics" && r.Method == http.MethodGet:
+		h.analytics(w, r)
 	case path == "config" && r.Method == http.MethodGet:
 		h.configGet(w, r)
 	case path == "config" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
@@ -109,9 +130,69 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.keyItem(w, r, strings.TrimPrefix(path, "keys/"))
 	case path == "requests" && r.Method == http.MethodGet:
 		h.requestsList(w, r)
+	case strings.HasPrefix(path, "requests/") && r.Method == http.MethodGet:
+		h.requestItem(w, r, strings.TrimPrefix(path, "requests/"))
+	case path == "plugins" && r.Method == http.MethodGet:
+		h.pluginsList(w, r)
+	case path == "plugins" && r.Method == http.MethodPost:
+		h.pluginInstall(w, r)
+	case strings.HasPrefix(path, "plugins/"):
+		h.pluginItem(w, r, strings.TrimPrefix(path, "plugins/"))
 	default:
 		writeAdminError(w, http.StatusNotFound, "not_found")
 	}
+}
+
+func (h *AdminHandler) analytics(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	filter := store.AnalyticsFilter{FromDate: query.Get("from_date"), ToDate: query.Get("to_date"), Bucket: query.Get("bucket"), Metric: query.Get("metric"), Status: query.Get("status")}
+	if raw := query.Get("days"); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil {
+			writeAdminErrorDetail(w, 400, "invalid_query", "days must be an integer")
+			return
+		}
+		filter.Days = days
+	}
+	for _, raw := range query["model_id"] {
+		if raw == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || id <= 0 {
+			writeAdminErrorDetail(w, 400, "invalid_query", "model_id must be a positive integer")
+			return
+		}
+		filter.ModelIDs = append(filter.ModelIDs, id)
+		if len(filter.ModelIDs) > 20 {
+			writeAdminErrorDetail(w, 400, "invalid_query", "at most 20 models may be selected")
+			return
+		}
+	}
+	data, err := h.repo.Analytics(r.Context(), time.Now().UTC(), filter)
+	if err != nil {
+		writeAdminErrorDetail(w, 400, "invalid_query", err.Error())
+		return
+	}
+	writeJSON(w, 200, data)
+}
+
+func isReadMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+// isPublicRead 列出未登录也能读的管理端路径。写操作永远不在此列。
+func isPublicRead(path string) bool {
+	switch {
+	case path == "overview", path == "analytics", path == "providers", path == "models", path == "groups", path == "groups/health":
+		return true
+	case strings.HasPrefix(path, "providers/"):
+		// remote-models 会带着已保存的上游密钥去请求上游，仍然只对管理员开放。
+		return !strings.HasSuffix(path, "/remote-models")
+	case strings.HasPrefix(path, "models/"), strings.HasPrefix(path, "groups/"):
+		return true
+	}
+	return false
 }
 
 func (h *AdminHandler) adminAuthorized(r *http.Request) bool {
@@ -175,6 +256,8 @@ func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 		Amount5H:     settings.AmountLimit5H,
 		AmountDaily:  settings.AmountLimitDaily,
 		AmountWeekly: settings.AmountLimitWeekly,
+		TokenPeriod:  settings.TokenLimitPeriod, AmountPeriod: settings.AmountLimitPeriod,
+		PeriodDays: settings.PeriodLimitDays, PeriodStart: parsePeriodStart(settings.PeriodLimitStart),
 	})
 	if err != nil {
 		writeAdminError(w, 500, "ledger_unavailable")
@@ -187,8 +270,19 @@ func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, data)
 }
 
+func parsePeriodStart(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	t, _ := time.Parse(time.RFC3339, raw)
+	return t
+}
+
 func safeSettings(s config.Settings) map[string]string {
 	values := s.EnvMap()
+	if _, configured := values["UPSTREAM_HEADER_TIMEOUT"]; !configured {
+		values["UPSTREAM_HEADER_TIMEOUT"] = ""
+	}
 	for _, key := range []string{"ADMIN_API_KEY", "RELAY_ENCRYPTION_KEY"} {
 		values[key] = ""
 	}
@@ -212,15 +306,26 @@ func (h *AdminHandler) configSave(w http.ResponseWriter, r *http.Request, valida
 	defer h.mu.Unlock()
 	values := h.settings.EnvMap()
 	for key, value := range body.Settings {
-		if value == "" && (key == "ADMIN_API_KEY" || key == "RELAY_ENCRYPTION_KEY") {
+		if value == "" && (key == "ADMIN_API_KEY" || key == "RELAY_ENCRYPTION_KEY" || key == "UPSTREAM_HEADER_TIMEOUT") {
 			continue
 		}
 		values[key] = value
 	}
 	next, err := config.Parse(values)
 	if err != nil {
-		writeAdminError(w, 400, "invalid_config")
+		// SettingsError 只包含字段名和安全的解析原因，不回显密钥或完整值。
+		// 管理台需要知道是哪一项导致保存失败，否则周期配置等新增字段会被
+		// 误认为「后端不支持」。
+		writeAdminErrorDetail(w, 400, "invalid_config", err.Error())
 		return
+	}
+	// An omitted/blank start field means "keep the active period's original
+	// boundary". Only the explicit +day controls or an explicit timestamp may
+	// change it; changing another quota must not shift/reset period usage.
+	if current := h.settings; current.PeriodLimitDays > 0 && next.PeriodLimitDays > 0 {
+		if value, supplied := body.Settings["PERIOD_LIMIT_START"]; !supplied || strings.TrimSpace(value) == "" {
+			next.PeriodLimitStart = current.PeriodLimitStart
+		}
 	}
 	pending := h.settings.RestartOnlyChanges(next)
 	changed := make([]string, 0)
@@ -253,19 +358,26 @@ func (h *AdminHandler) providersList(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 500, "store_error")
 		return
 	}
+	// 上游地址属于内部拓扑：公开只读接口只给名称与状态，不返回地址。
+	if !h.adminAuthorized(r) {
+		for i := range data {
+			data[i].BaseURL = ""
+		}
+	}
 	writeJSON(w, 200, map[string]any{"data": data})
 }
 func (h *AdminHandler) providerCreate(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		Name    string `json:"name"`
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		Name     string `json:"name"`
+		BaseURL  string `json:"base_url"`
+		APIKey   string `json:"api_key"`
+		Protocol string `json:"protocol"`
 	}
 	if json.NewDecoder(r.Body).Decode(&payload) != nil {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
-	in := store.NewProvider{Name: payload.Name, BaseURL: payload.BaseURL, APIKey: payload.APIKey}
+	in := store.NewProvider{Name: payload.Name, BaseURL: payload.BaseURL, APIKey: payload.APIKey, Protocol: payload.Protocol}
 	value, err := h.repo.CreateProvider(r.Context(), in)
 	if err != nil {
 		writeProviderError(w, err)
@@ -1027,10 +1139,193 @@ func clientBaseURL(r *http.Request) string {
 }
 
 func (h *AdminHandler) requestsList(w http.ResponseWriter, r *http.Request) {
-	data, err := h.repo.RecentRequests(r.Context(), 50)
+	query := r.URL.Query()
+	filter, err := requestFilterFromQuery(query)
+	if err != nil {
+		writeAdminErrorDetail(w, 400, "invalid_query", err.Error())
+		return
+	}
+	page, err := h.repo.QueryRequests(r.Context(), filter)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidRequestQuery) {
+			writeAdminErrorDetail(w, 400, "invalid_query", err.Error())
+			return
+		}
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	writeJSON(w, 200, page)
+}
+
+func requestFilterFromQuery(query map[string][]string) (store.RequestFilter, error) {
+	get := func(name string) string { return strings.TrimSpace(firstQueryValue(query, name)) }
+	filter := store.RequestFilter{RequestID: get("request_id"), Status: get("status"), Protocol: get("protocol")}
+	for _, field := range []struct {
+		name string
+		dst  *int64
+	}{{"provider_id", &filter.ProviderID}, {"model_id", &filter.ModelID}, {"before_id", &filter.BeforeID}} {
+		value := get(field.name)
+		if value == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n <= 0 {
+			return store.RequestFilter{}, fmt.Errorf("%s must be a positive integer", field.name)
+		}
+		*field.dst = n
+	}
+	if cursor := get("cursor"); cursor != "" {
+		if get("before_id") != "" {
+			return store.RequestFilter{}, errors.New("cursor and before_id cannot be combined")
+		}
+		id, err := store.DecodeRequestCursor(cursor)
+		if err != nil {
+			return store.RequestFilter{}, err
+		}
+		filter.BeforeID = id
+	}
+	if value := get("limit"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return store.RequestFilter{}, errors.New("limit must be an integer")
+		}
+		filter.Limit = n
+	}
+	for _, field := range []struct {
+		name string
+		dst  **time.Time
+	}{{"from", &filter.FromUTC}, {"to", &filter.ToUTC}} {
+		value := get(field.name)
+		if value == "" {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return store.RequestFilter{}, fmt.Errorf("%s must be RFC3339", field.name)
+		}
+		utc := at.UTC()
+		*field.dst = &utc
+	}
+	if filter.FromUTC != nil && filter.ToUTC != nil && filter.FromUTC.After(*filter.ToUTC) {
+		return store.RequestFilter{}, errors.New("from must not be after to")
+	}
+	return filter, nil
+}
+
+func firstQueryValue(query map[string][]string, name string) string {
+	values := query[name]
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func (h *AdminHandler) requestItem(w http.ResponseWriter, r *http.Request, raw string) {
+	if raw == "" {
+		writeAdminError(w, 400, "invalid_request_id")
+		return
+	}
+	requestID, err := url.PathUnescape(raw)
+	if err != nil || strings.TrimSpace(requestID) == "" || strings.Contains(requestID, "/") || strings.Contains(requestID, "\\") {
+		writeAdminError(w, 400, "invalid_request_id")
+		return
+	}
+	data, err := h.repo.GetRequest(r.Context(), requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeAdminError(w, 404, "not_found")
+		return
+	}
 	if err != nil {
 		writeAdminError(w, 500, "store_error")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"data": data})
+}
+
+func (h *AdminHandler) pluginsList(w http.ResponseWriter, r *http.Request) {
+	if h.pluginManager == nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "plugin_manager_unavailable")
+		return
+	}
+	plugins, err := h.pluginManager.List(r.Context())
+	if err != nil {
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"data": plugins})
+}
+
+func (h *AdminHandler) pluginInstall(w http.ResponseWriter, r *http.Request) {
+	if h.pluginManager == nil {
+		writeAdminError(w, 503, "plugin_manager_unavailable")
+		return
+	}
+	limited := http.MaxBytesReader(w, r.Body, plugin.MaxPackageBytes+1)
+	defer limited.Close()
+	var src io.Reader = limited
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		if err := r.ParseMultipartForm(plugin.MaxPackageBytes); err != nil {
+			writeAdminErrorDetail(w, 400, "invalid_plugin", err.Error())
+			return
+		}
+		file, _, err := r.FormFile("package")
+		if err != nil {
+			writeAdminError(w, 400, "plugin_package_required")
+			return
+		}
+		defer file.Close()
+		src = file
+	}
+	value, err := h.pluginManager.Install(r.Context(), src)
+	if err != nil {
+		writeAdminErrorDetail(w, 400, "invalid_plugin", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"data": value})
+}
+
+func (h *AdminHandler) pluginItem(w http.ResponseWriter, r *http.Request, raw string) {
+	if h.pluginManager == nil {
+		writeAdminError(w, 503, "plugin_manager_unavailable")
+		return
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) == 0 || parts[0] == "" || strings.ContainsAny(parts[0], `\\`) {
+		writeAdminError(w, 400, "invalid_plugin_id")
+		return
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil || strings.Contains(id, "/") {
+		writeAdminError(w, 400, "invalid_plugin_id")
+		return
+	}
+	var value store.Plugin
+	switch {
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "enable":
+		value, err = h.pluginManager.Enable(r.Context(), id)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "disable":
+		value, err = h.pluginManager.Disable(r.Context(), id)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "start":
+		value, err = h.pluginManager.Start(r.Context(), id)
+	case len(parts) == 2 && r.Method == http.MethodPost && parts[1] == "stop":
+		value, err = h.pluginManager.Stop(r.Context(), id)
+	case len(parts) == 1 && r.Method == http.MethodDelete:
+		err = h.pluginManager.Delete(r.Context(), id)
+		if err == nil {
+			writeJSON(w, 200, map[string]any{"deleted": true})
+			return
+		}
+	default:
+		writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeAdminError(w, 404, "not_found")
+		return
+	}
+	if err != nil {
+		writeAdminErrorDetail(w, 400, "plugin_operation_failed", err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"data": value})
 }

@@ -1,15 +1,16 @@
 package httpapi
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
+	"civic-ai-relay/internal/logging"
 	"civic-ai-relay/internal/relay"
+	"civic-ai-relay/internal/requestmeta"
 	"civic-ai-relay/internal/store"
 	"civic-ai-relay/internal/upstream"
 )
@@ -42,6 +43,7 @@ func (h *PublicHandler) SetStreamAdmission(fn func() error) { h.streamAdmission 
 // "/v1/chat/completions" and the variants clients actually send in the wild
 // (double "/v1" prefix, missing prefix, trailing slash) reach the same handler.
 func (h *PublicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	r = ensureRequestTrace(w, r)
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	path = strings.TrimPrefix(path, "/v1")
 	path = strings.TrimPrefix(path, "/v1") // 客户端 Base URL 已带 /v1 时会拼出双重前缀
@@ -122,10 +124,16 @@ func (h *PublicHandler) chatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeErrorDetail(w, http.StatusBadRequest, "invalid_request", "request body is not valid JSON: "+err.Error())
 		return
 	}
+	if sid := strings.TrimSpace(r.Header.Get(upstream.SessionIDHeader)); sid != "" {
+		r = r.WithContext(upstream.WithSessionID(r.Context(), sid))
+	}
 	model, _ := payload["model"].(string)
 	if strings.TrimSpace(model) == "" {
 		writeError(w, http.StatusBadRequest, "model_required")
 		return
+	}
+	if trace := requestmeta.FromContext(r.Context()); trace != nil {
+		trace.SetModel(model)
 	}
 	if _, ok := payload["messages"].([]any); !ok {
 		writeError(w, http.StatusBadRequest, "messages_required")
@@ -149,61 +157,141 @@ func (h *PublicHandler) chatCompletions(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *PublicHandler) stream(w http.ResponseWriter, r *http.Request, req relay.Request) {
-	response, lease, model, err := h.service.Stream(r.Context(), req)
+	prepared, err := h.service.PrepareStream(r.Context(), req)
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
 	}
-	defer response.Body.Close()
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, _ := w.(http.Flusher)
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	lease := prepared.Lease
 	outputChars := int64(0)
-	lines := 0
 	var usageEvent upstream.Usage
-	amount := int64(0)
-	status := "completed"
-	for scanner.Scan() {
-		line := scanner.Text()
-		if _, err := io.WriteString(w, line+"\n"); err != nil {
-			status = "aborted"
-			break
+	var incompleteReason string
+	var finishReason string
+	outcome := relay.Outcome{Status: "aborted", ErrorCode: "client_canceled", FailureStage: "stream", Protocol: lease.Protocol()}
+	var session *streamSession
+	defer func() {
+		if session != nil {
+			session.Close()
+		} else {
+			prepared.Cancel()
 		}
-		if flusher != nil {
-			flusher.Flush()
+		reportedUsage := usageEvent.TotalTokens > 0
+		if !reportedUsage && outputChars > 0 {
+			usageEvent = upstream.Usage{CompletionTokens: int((outputChars + 1) / 2), TotalTokens: int(outputChars)}
 		}
-		event := upstream.ParseEvent([]byte(line + "\n\n"))
-		outputChars += int64(event.OutputCharacters)
-		if event.Usage.TotalTokens > 0 {
-			usageEvent = event.Usage
+		outcome.InputTokens = int64(usageEvent.PromptTokens)
+		outcome.OutputTokens = int64(usageEvent.CompletionTokens)
+		outcome.CachedInputTokens = int64(usageEvent.PromptTokensDetails.CachedTokens)
+		if outcome.InputTokens == 0 {
+			outcome.InputTokens = lease.LeaseInputTokens()
 		}
-		if h.streamAdmission != nil && lines%256 == 255 {
-			if err := h.streamAdmission(); err != nil {
-				status = "aborted"
-				break
+		outcome.IncompleteReason = incompleteReason
+		outcome.AmountMicroyuan = relay.PriceUsage(usageEvent, prepared.Model)
+		if reportedUsage {
+			outcome.UsageSource = "upstream"
+		} else if outputChars > 0 {
+			outcome.UsageSource = "estimated"
+		} else {
+			outcome.UsageSource = "unknown"
+		}
+		if err := lease.Close(r.Context(), outcome); err != nil {
+			logging.Errorf("stream settlement_failed request_id=%s status=%s error_code=%s failure_stage=%s upstream_status=%d", lease.RequestID(), outcome.Status, outcome.ErrorCode, outcome.FailureStage, outcome.HTTPStatus)
+		}
+	}()
+	session, err = newStreamSession(w, r, prepared, h.streamAdmission)
+	if err != nil {
+		outcome.ErrorCode, outcome.FailureStage = "downstream_write_failed", "downstream"
+		return
+	}
+	var done, headerReceived bool
+	var readErr error
+	for {
+		result := session.Next()
+		switch result.kind {
+		case streamHeader:
+			headerReceived = true
+			if trace := requestmeta.FromContext(r.Context()); trace != nil {
+				trace.MarkHeader()
 			}
+			outcome.HTTPStatus = result.response.StatusCode
+		case streamFrame:
+			if err := session.write(result.frame.Raw); err != nil {
+				outcome.Status, outcome.ErrorCode, outcome.FailureStage = "aborted", "downstream_write_failed", "downstream"
+				return
+			}
+			event := upstream.ParseEvent(result.frame.Raw)
+			if event.Invalid {
+				readErr = errors.New("invalid upstream event")
+				goto finished
+			}
+			outputChars += int64(event.OutputCharacters)
+			if event.OutputCharacters > 0 || event.Usage.TotalTokens > 0 {
+				if trace := requestmeta.FromContext(r.Context()); trace != nil {
+					trace.MarkFirstEvent()
+				}
+			}
+			if event.FinishReason != "" {
+				finishReason = event.FinishReason
+			}
+			if event.Usage.TotalTokens > 0 {
+				usageEvent = event.Usage
+			}
+			if bytes.Equal(bytes.TrimSpace(result.frame.Data), []byte("[DONE]")) {
+				done = true
+				goto finished
+			}
+		case streamReadError:
+			readErr = result.err
+			goto finished
+		case streamWriteError:
+			outcome.Status, outcome.ErrorCode, outcome.FailureStage = "aborted", "downstream_write_failed", "downstream"
+			return
+		case streamAdmissionError:
+			outcome.Status, outcome.ErrorCode = "aborted", "memory_limit_exceeded"
+			if err := writeChatStreamError(session, outcome.ErrorCode, lease.RequestID()); err != nil {
+				outcome.ErrorCode, outcome.FailureStage = "downstream_write_failed", "downstream"
+			}
+			return
+		case streamCanceled:
+			outcome.Status, outcome.ErrorCode = "aborted", "client_canceled"
+			return
 		}
-		lines++
 	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		status = "failed"
+
+finished:
+	if !headerReceived {
+		outcome.Status, outcome.ErrorCode, outcome.HTTPStatus = streamOpenFailure(readErr, r.Context())
+		outcome.FailureStage = "upstream"
+	} else {
+		outcome.Status, outcome.ErrorCode = upstream.ChatTerminal(done, readErr, r.Context().Err() != nil || errors.Is(readErr, context.Canceled))
 	}
-	if usageEvent.TotalTokens == 0 && outputChars > 0 {
-		// Upstream never reported usage; estimate output tokens from
-		// streamed characters so quota and ledger still record something.
-		usageEvent = upstream.Usage{PromptTokens: int(usageEvent.PromptTokens), CompletionTokens: int((outputChars + 1) / 2), TotalTokens: int(outputChars)}
+	if finishReason == "length" && done && outcome.Status == "completed" {
+		incompleteReason = "max_output_tokens"
 	}
-	amount = relay.PriceUsage(usageEvent, model)
-	_ = lease.Close(r.Context(), relay.Outcome{Status: status, InputTokens: int64(usageEvent.PromptTokens), OutputTokens: int64(usageEvent.CompletionTokens), CachedInputTokens: int64(usageEvent.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: 200})
-	return
+	if readErr != nil && readErr.Error() == "invalid upstream event" {
+		outcome.ErrorCode = "upstream_event_invalid"
+	}
+	if outcome.Status == "failed" && outcome.FailureStage == "stream" {
+		outcome.FailureStage = "upstream"
+	}
+	if outcome.Status == "completed" {
+		outcome.FailureStage = ""
+	}
+	if outcome.Status == "failed" {
+		if err := writeChatStreamError(session, outcome.ErrorCode, lease.RequestID()); err != nil {
+			outcome.Status, outcome.ErrorCode, outcome.FailureStage = "aborted", "downstream_write_failed", "downstream"
+		}
+	}
 }
 
 func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 	status, code := http.StatusInternalServerError, "relay_error"
-	detail := err.Error()
+	// Service errors may be wrapped or joined with database, transport, or
+	// provider causes. Those causes are useful in server-side diagnostics, but
+	// their text can contain paths, URLs, or other implementation details. Keep
+	// the default public detail stable and opt in only to the two structured
+	// error types whose messages are deliberately safe for clients.
+	detail := "request could not be completed"
 	var quota *store.QuotaError
 	var upstreamErr *upstream.Error
 	switch {
@@ -216,6 +304,9 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 		detail = "客户端令牌已过期，请向管理员申请新的令牌"
 	case errors.Is(err, relay.ErrModelNotAllowed):
 		status, code = http.StatusBadRequest, "model_not_allowed"
+	case errors.Is(err, relay.ErrSettlementUnavailable):
+		status, code = http.StatusServiceUnavailable, "settlement_unavailable"
+		detail = "request settlement is temporarily unavailable"
 	case errors.Is(err, relay.ErrGlobalConcurrencyExceeded), errors.Is(err, relay.ErrKeyConcurrencyExceeded):
 		status, code = http.StatusTooManyRequests, "rate_limit_exceeded"
 	case errors.Is(err, relay.ErrInvalidRequest):
@@ -229,6 +320,9 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 		}
 	case errors.As(err, &upstreamErr):
 		status, code = http.StatusBadGateway, upstreamErr.Code
+		// upstream.Error.Error deliberately exposes only the stable code and
+		// status; its Cause is retained for server-side unwrapping and logging.
+		detail = upstreamErr.Error()
 	}
 	writeErrorDetail(w, status, code, detail)
 }

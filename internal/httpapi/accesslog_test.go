@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"civic-ai-relay/internal/logging"
+	"civic-ai-relay/internal/requestmeta"
 )
 
 // 访问日志包装必须把 http.Flusher 透传下去。SSE 流式响应靠 `w.(http.Flusher)`
@@ -72,6 +73,31 @@ func TestAccessLogNeverRecordsQueryOrHeaders(t *testing.T) {
 		if strings.Contains(out, secret) {
 			t.Fatalf("access log leaked %q: %q", secret, out)
 		}
+	}
+}
+
+func TestAccessLogIncludesResolvedModelWithoutLoggingRequestBody(t *testing.T) {
+	var buffer bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&buffer)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	logging.SetLevel(logging.LevelDebug)
+	t.Cleanup(func() { logging.SetLevel(logging.LevelInfo) })
+
+	handler := withRequestLog(withAccessLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trace := requestmeta.FromContext(r.Context())
+		trace.SetModel("MIMO/mimo-v2.6-pro")
+		w.WriteHeader(http.StatusOK)
+	})))
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"MIMO/mimo-v2.6-pro","messages":[{"content":"private prompt"}]}`))
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+
+	out := buffer.String()
+	if !strings.Contains(out, "model=MIMO/mimo-v2.6-pro") {
+		t.Fatalf("access log lacks resolved model: %q", out)
+	}
+	if strings.Contains(out, "private prompt") {
+		t.Fatalf("access log leaked request body: %q", out)
 	}
 }
 

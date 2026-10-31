@@ -1,10 +1,13 @@
 package httpapi
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"civic-ai-relay/internal/config"
+	"civic-ai-relay/internal/plugin"
 	"civic-ai-relay/internal/secret"
 	"civic-ai-relay/internal/store"
 )
@@ -34,6 +38,45 @@ func adminFixture(t *testing.T) (http.Handler, string) {
 	return NewAdminHandler(repo, nil, settings, settings.AdminAPIKey), settings.AdminAPIKey
 }
 
+func TestAdminPluginRoutes(t *testing.T) {
+	raw := make([]byte, 32)
+	box, _ := secret.New(base64.StdEncoding.EncodeToString(raw))
+	repo, err := store.Open(filepath.Join(t.TempDir(), "relay.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	h := NewAdminHandler(repo, nil, config.Settings{AdminAPIKey: "admin-key"}, "admin-key")
+	mgr, err := plugin.NewManager(repo, filepath.Join(t.TempDir(), "plugins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetPluginManager(mgr)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, _ := mw.CreateFormFile("package", "audit.zip")
+	zw := zip.NewWriter(part)
+	manifest := `{"id":"audit-plugin","name":"Audit","version":"1.0.0","api_version":1}`
+	w, _ := zw.Create("manifest.json")
+	_, _ = io.WriteString(w, manifest)
+	w, _ = zw.Create("module.wasm")
+	_, _ = w.Write([]byte{0, 'a', 's', 'm', 1, 0, 0, 0})
+	_ = zw.Close()
+	_ = mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/plugins", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-Admin-Key", "admin-key")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, req)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("install status=%d body=%s", response.Code, response.Body.String())
+	}
+	list := adminRequest(t, h, http.MethodGet, "/admin/api/plugins", "admin-key", nil)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "audit-plugin") {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+}
+
 func adminRequest(t *testing.T, handler http.Handler, method, path string, key string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	var reader *bytes.Reader
@@ -52,6 +95,56 @@ func adminRequest(t *testing.T, handler http.Handler, method, path string, key s
 	return rec
 }
 
+func TestAdminRequestQueryValidatesFiltersAndUsesCursorEnvelope(t *testing.T) {
+	handler, key := adminFixture(t)
+	valid := adminRequest(t, handler, http.MethodGet, "/admin/api/requests?limit=1", key, nil)
+	if valid.Code != http.StatusOK || !strings.Contains(valid.Body.String(), `"data":[]`) || strings.Contains(valid.Body.String(), `"data":null`) {
+		t.Fatalf("empty request page=%d %s", valid.Code, valid.Body.String())
+	}
+	for _, path := range []string{
+		"/admin/api/requests?limit=101",
+		"/admin/api/requests?cursor=bad",
+		"/admin/api/requests?from=2026-10-03T01:00:00Z&to=2026-10-03T00:00:00Z",
+		"/admin/api/requests?provider_id=-1",
+	} {
+		response := adminRequest(t, handler, http.MethodGet, path, key, nil)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_query") {
+			t.Fatalf("%s: status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+	for _, path := range []string{"/admin/api/requests/", "/admin/api/requests/a%2Fb"} {
+		response := adminRequest(t, handler, http.MethodGet, path, key, nil)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_request_id") {
+			t.Fatalf("%s: status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestAdminAnalyticsSupportsRangeAndStatusFilters(t *testing.T) {
+	handler, key := adminFixture(t)
+	response := adminRequest(t, handler, http.MethodGet, "/admin/api/analytics?days=30&bucket=day&metric=requests&status=failed", key, nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"days":30`) || strings.Contains(response.Body.String(), `"series":[]`) {
+		t.Fatalf("analytics response=%d %s", response.Code, response.Body.String())
+	}
+	bad := adminRequest(t, handler, http.MethodGet, "/admin/api/analytics?days=31", key, nil)
+	if bad.Code != http.StatusBadRequest || !strings.Contains(bad.Body.String(), "invalid_query") {
+		t.Fatalf("invalid analytics range=%d %s", bad.Code, bad.Body.String())
+	}
+}
+
+func TestAdminAnalyticsAcceptsMultipleModelsAndBoundsSelection(t *testing.T) {
+	handler, key := adminFixture(t)
+	response := adminRequest(t, handler, http.MethodGet, "/admin/api/analytics?days=7&model_id=1&model_id=2", key, nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"days":7`) {
+		t.Fatalf("multi-model analytics response=%d %s", response.Code, response.Body.String())
+	}
+	tooMany := "/admin/api/analytics?days=7" + strings.Repeat("&model_id=1", 21)
+	bad := adminRequest(t, handler, http.MethodGet, tooMany, key, nil)
+	if bad.Code != http.StatusBadRequest || !strings.Contains(bad.Body.String(), "at most 20 models") {
+		t.Fatalf("unbounded model selection=%d %s", bad.Code, bad.Body.String())
+	}
+}
+
 func TestAdminRequiresIndependentKeyAndRedactsConfig(t *testing.T) {
 	handler, key := adminFixture(t)
 	if response := adminRequest(t, handler, http.MethodGet, "/admin/api/config", "", nil); response.Code != http.StatusUnauthorized {
@@ -65,9 +158,12 @@ func TestAdminRequiresIndependentKeyAndRedactsConfig(t *testing.T) {
 
 func TestAdminCanCreateProviderAndOneTimeKey(t *testing.T) {
 	handler, key := adminFixture(t)
-	provider := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", key, map[string]any{"name": "p", "base_url": "https://provider.example", "api_key": "upstream-secret"})
+	provider := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", key, map[string]any{"name": "p", "base_url": "https://provider.example", "api_key": "upstream-secret", "protocol": "anthropic"})
 	if provider.Code != http.StatusCreated || strings.Contains(provider.Body.String(), "upstream-secret") {
 		t.Fatal(provider.Code, provider.Body.String())
+	}
+	if !strings.Contains(provider.Body.String(), `"Protocol":"anthropic"`) {
+		t.Fatalf("protocol missing from provider response: %s", provider.Body.String())
 	}
 	created := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", key, map[string]any{"name": "alice", "max_concurrency": 1})
 	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), "crk_") {
@@ -285,7 +381,8 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 	t.Cleanup(func() { _ = repo.Close() })
 	envPath := filepath.Join(t.TempDir(), "relay.env")
 	settings := config.Settings{AdminAPIKey: "admin-key", EncryptionKey: base64.StdEncoding.EncodeToString(raw), Host: "127.0.0.1", Port: 8000, DBPath: "data/relay.db", LogLevel: "INFO", RPMLimit: 30, TokenLimit5H: 1000, TokenLimitDaily: 1000, GlobalConcurrencyLimit: 1, MemoryLimitMB: 200, MaxOutputTokens: 64, RetentionDays: 7,
-		MaxBodyBytes: 8 << 20, MaxStreamDuration: time.Minute, ConnectTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, PoolTimeout: time.Second, ModelSyncInterval: time.Minute}
+		MaxBodyBytes: 8 << 20, MaxStreamDuration: time.Minute, ConnectTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, PoolTimeout: time.Second, ModelSyncInterval: time.Minute,
+		PeriodLimitDays: 7, TokenLimitPeriod: 1000, PeriodLimitStart: "2026-10-20T00:00:00Z"}
 	if err := config.NewStore(envPath).Write(settings); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +393,10 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 
 	// 修改一个运行时参数（非重启项）：应持久化并热应用
 	save := adminRequest(t, handler, http.MethodPut, "/admin/api/config", settings.AdminAPIKey,
-		map[string]any{"settings": map[string]string{"TOKEN_LIMIT_DAILY": "999999"}})
+		map[string]any{"settings": map[string]string{
+			"TOKEN_LIMIT_DAILY": "999999", "UPSTREAM_HEADER_TIMEOUT": "",
+			"PERIOD_LIMIT_DAYS": "10", "TOKEN_LIMIT_PERIOD": "2000",
+		}})
 	if save.Code != http.StatusOK {
 		t.Fatal(save.Body.String())
 	}
@@ -304,6 +404,9 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 	case got := <-applied:
 		if got.TokenLimitDaily != 999999 {
 			t.Fatalf("applied TokenLimitDaily = %d", got.TokenLimitDaily)
+		}
+		if got.PeriodLimitDays != 10 || got.TokenLimitPeriod != 2000 || got.AmountLimitPeriod != 0 || got.PeriodLimitStart != settings.PeriodLimitStart {
+			t.Fatalf("period settings were not applied: %+v", got)
 		}
 	default:
 		t.Fatal("settings listener was not notified")
@@ -320,6 +423,35 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 	get := adminRequest(t, handler, http.MethodGet, "/admin/api/config", settings.AdminAPIKey, nil)
 	if !strings.Contains(get.Body.String(), "999999") {
 		t.Fatal(get.Body.String())
+	}
+	if !strings.Contains(get.Body.String(), `"UPSTREAM_HEADER_TIMEOUT":""`) {
+		t.Fatalf("legacy header timeout is not editable: %s", get.Body.String())
+	}
+
+	updated := adminRequest(t, handler, http.MethodPut, "/admin/api/config", settings.AdminAPIKey,
+		map[string]any{"settings": map[string]string{
+			"MAX_STREAM_DURATION": "0", "UPSTREAM_HEADER_TIMEOUT": "60s", "SSE_HEARTBEAT_INTERVAL": "10s",
+			"UPSTREAM_USER_AGENT": "relay-test/2", "UPSTREAM_SESSION_HEADER": "x-session-id",
+		}})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("timeout save=%d body=%s", updated.Code, updated.Body.String())
+	}
+	var updateResult struct {
+		PendingRestartFields []string `json:"pending_restart_fields"`
+	}
+	if err := json.Unmarshal(updated.Body.Bytes(), &updateResult); err != nil {
+		t.Fatal(err)
+	}
+	if len(updateResult.PendingRestartFields) != 3 || updateResult.PendingRestartFields[0] != "UPSTREAM_HEADER_TIMEOUT" || updateResult.PendingRestartFields[1] != "UPSTREAM_USER_AGENT" || updateResult.PendingRestartFields[2] != "UPSTREAM_SESSION_HEADER" {
+		t.Fatalf("restart fields=%v", updateResult.PendingRestartFields)
+	}
+	stored, err = config.NewStore(envPath).ReadMapping()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Parse(stored)
+	if err != nil || reloaded.MaxStreamDuration != 0 || reloaded.HeaderTimeout != time.Minute || reloaded.SSEHeartbeatInterval != 10*time.Second {
+		t.Fatalf("reloaded timeouts: %+v err=%v", reloaded, err)
 	}
 }
 

@@ -41,7 +41,7 @@ func decodeHealth(t *testing.T, body []byte) HealthPayload {
 
 func TestHealthzReportsLivenessWithoutAuth(t *testing.T) {
 	_, service := newHealthFixture(t)
-	handler := NewServerWithAdmission(service, 1<<20, nil, nil)
+	handler := NewServerWithAdmission(service, 1<<20, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK {
@@ -64,7 +64,7 @@ func TestHealthzReportsLivenessWithoutAuth(t *testing.T) {
 
 func TestReadyzTracksDatabaseAvailability(t *testing.T) {
 	repo, service := newHealthFixture(t)
-	handler := NewServerWithAdmission(service, 1<<20, nil, nil)
+	handler := NewServerWithAdmission(service, 1<<20, nil, nil, nil)
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -98,7 +98,7 @@ func TestHealthRoutesCoexistWithAdminAndPublic(t *testing.T) {
 	_, service := newHealthFixture(t)
 	adminHit := false
 	admin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { adminHit = true })
-	handler := NewServerWithAdmission(service, 1<<20, nil, nil, admin)
+	handler := NewServerWithAdmission(service, 1<<20, nil, nil, nil, admin)
 
 	for _, path := range []string{"/healthz", "/readyz"} {
 		rec := httptest.NewRecorder()
@@ -131,7 +131,7 @@ func TestSetVersionIsReflectedInHealthz(t *testing.T) {
 	t.Cleanup(func() { Version = original })
 	SetVersion("v9.9.9-test")
 	_, service := newHealthFixture(t)
-	handler := NewServerWithAdmission(service, 1<<20, nil, nil)
+	handler := NewServerWithAdmission(service, 1<<20, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if payload := decodeHealth(t, rec.Body.Bytes()); payload.Version != "v9.9.9-test" {

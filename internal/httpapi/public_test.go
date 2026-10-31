@@ -15,7 +15,27 @@ import (
 	"civic-ai-relay/internal/relay"
 	"civic-ai-relay/internal/secret"
 	"civic-ai-relay/internal/store"
+	"civic-ai-relay/internal/testutil"
 )
+
+func TestDrainingReturnsSettlementUnavailable(t *testing.T) {
+	f := testutil.NewRelayFixture(t, nil)
+	f.Service.BeginDraining()
+	handler := NewPublicHandler(f.Service, 1<<20)
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+		if path == "/v1/responses" {
+			body = `{"model":"m","input":"hi"}`
+		}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+f.Key.Token)
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "settlement_unavailable") {
+			t.Fatalf("%s: code=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
 
 func TestModelsRequiresBearerAndFiltersAuthorizedModels(t *testing.T) {
 	raw := make([]byte, 32)

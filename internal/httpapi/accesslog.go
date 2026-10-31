@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"civic-ai-relay/internal/logging"
+	"civic-ai-relay/internal/requestmeta"
 )
 
 // statusRecorder 记录响应状态码，并把 Flush 透传下去。
@@ -36,10 +37,14 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 }
 
 func (s *statusRecorder) Flush() {
-	if flusher, ok := s.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	_ = s.FlushError()
 }
+
+func (s *statusRecorder) FlushError() error {
+	return http.NewResponseController(s.ResponseWriter).Flush()
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // withAccessLog 在 DEBUG 级别下记录每个 HTTP 请求，用于回答「客户端说报错了，
 // 但容器日志里什么都看不到」这类问题。非 DEBUG 时直接透传，不包装 ResponseWriter。
@@ -57,8 +62,12 @@ func withAccessLog(next http.Handler) http.Handler {
 		started := time.Now()
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(recorder, r)
-		logging.Debugf("http %s %s %d %s remote=%s", r.Method, r.URL.Path, recorder.status,
-			time.Since(started).Round(time.Millisecond), remoteHost(r.RemoteAddr))
+		model := "-"
+		if trace := requestmeta.FromContext(r.Context()); trace != nil && trace.ModelName() != "" {
+			model = trace.ModelName()
+		}
+		logging.Debugf("http %s %s %d %s remote=%s model=%s", r.Method, r.URL.Path, recorder.status,
+			time.Since(started).Round(time.Millisecond), remoteHost(r.RemoteAddr), model)
 	})
 }
 

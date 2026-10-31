@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"civic-ai-relay/internal/config"
 	"civic-ai-relay/internal/relay"
 )
 
@@ -32,13 +33,14 @@ type HealthPayload struct {
 type readinessProbe func(context.Context) error
 
 func NewServer(service *relay.Service, maxBodyBytes int64, admin ...http.Handler) http.Handler {
-	return NewServerWithAdmission(service, maxBodyBytes, nil, nil, admin...)
+	return NewServerWithAdmission(service, maxBodyBytes, nil, nil, nil, admin...)
 }
 
 // NewServerWithAdmission 同 NewServer，并为公开接口接入准入检查：
 // admit 在接受对话请求前调用（如 RSS 软保护，超限返回 503），
 // streamAdmit 在流式转发中周期调用，超限时中止流。两者均可为 nil。
-func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, streamAdmit func() error, admin ...http.Handler) http.Handler {
+// settings 返回当前运行配置（供 CORS 等逐请求读取的项热生效），可为 nil。
+func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, streamAdmit func() error, settings func() config.Settings, admin ...http.Handler) http.Handler {
 	public := NewPublicHandler(service, maxBodyBytes)
 	if concrete, ok := public.(*PublicHandler); ok {
 		concrete.SetAdmission(admit)
@@ -49,7 +51,7 @@ func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, s
 	if len(admin) == 0 || admin[0] == nil {
 		// 无管理端（测试或纯转发实例）：其余路径仍交给公开接口分发。
 		mux.Handle("/", public)
-		return withAccessLog(mux)
+		return withRequestLog(withAccessLog(withCORS(mux, settings)))
 	}
 	mux.Handle("/admin", admin[0])
 	mux.Handle("/admin/", admin[0])
@@ -69,7 +71,7 @@ func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, s
 		}
 		http.NotFound(w, r)
 	})
-	return withAccessLog(mux)
+	return withRequestLog(withAccessLog(withCORS(mux, settings)))
 }
 
 // registerHealth 挂载两个免认证探针：
