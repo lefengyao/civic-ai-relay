@@ -801,6 +801,42 @@ func (s *Store) windowUsage(ctx context.Context, extra string, args ...any) (int
 	return tokens, amount, nil
 }
 
+// GlobalQuotaSeed 携带 relay.env 里遗留的全局额度原值，供启动时的播种使用。
+type GlobalQuotaSeed struct {
+	Token5H, TokenDaily, TokenWeekly    int64
+	Amount5H, AmountDaily, AmountWeekly int64 // 微元
+	PeriodDays                          int
+	TokenPeriod, AmountPeriod           int64
+	PeriodStart                         string // RFC3339，空 = 不设
+}
+
+// SeedGroupQuotas 把全局额度值灌进每个分组「仍为 NULL」的额度列。
+// 只填 NULL：写库成功但 relay.env 删键失败而重跑时，不会覆盖运维期间的手工修改
+// ——这是幂等性的全部来由。
+// 值为 0（= 不限）的项不写、保持 NULL：语义等价，但只有 NULL 代表「这个窗口从未
+// 被设置过」，写 0 会让「哪些列播过种」失去痕迹。
+// 返回本次实际改动的分组行数（没有分组时是 0）。
+func (s *Store) SeedGroupQuotas(ctx context.Context, seed GlobalQuotaSeed) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE model_groups SET
+		token_limit_5h=COALESCE(token_limit_5h,NULLIF(?,0)),
+		amount_limit_5h=COALESCE(amount_limit_5h,NULLIF(?,0)),
+		token_limit_daily=COALESCE(token_limit_daily,NULLIF(?,0)),
+		amount_limit_daily=COALESCE(amount_limit_daily,NULLIF(?,0)),
+		token_limit_weekly=COALESCE(token_limit_weekly,NULLIF(?,0)),
+		amount_limit_weekly=COALESCE(amount_limit_weekly,NULLIF(?,0)),
+		period_limit_days=COALESCE(period_limit_days,NULLIF(?,0)),
+		token_limit_period=COALESCE(token_limit_period,NULLIF(?,0)),
+		amount_limit_period=COALESCE(amount_limit_period,NULLIF(?,0)),
+		period_limit_start=COALESCE(period_limit_start,NULLIF(?,''))`,
+		seed.Token5H, seed.Amount5H, seed.TokenDaily, seed.AmountDaily,
+		seed.TokenWeekly, seed.AmountWeekly, seed.PeriodDays,
+		seed.TokenPeriod, seed.AmountPeriod, seed.PeriodStart)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // Overview returns metadata-only counters used by the administrator console.
 // It deliberately accepts limits as arguments so configuration remains outside
 // the store and no credentials or prompts can enter the response.

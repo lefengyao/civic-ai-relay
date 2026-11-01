@@ -214,6 +214,17 @@ func (s *ConfigStore) Write(settings Settings) error {
 	for name, value := range settings.EnvMap() {
 		values[name] = value
 	}
+	return s.WriteMapping(values)
+}
+
+// WriteMapping 原子写回一份完整的键值集合，**不合并**文件里已有的键。
+// 与 Write 的区别就是这一点：Write 保留未知键（运维的部署元数据要留着），
+// 而这个用于「主动删键」的场景——v18 把全局额度迁进分组后要真删掉那 10 个键，
+// 否则每次启动都会重新播种。
+func (s *ConfigStore) WriteMapping(values map[string]string) error {
+	if s == nil || s.Path == "" {
+		return errors.New("configuration path is empty")
+	}
 	content, err := SerializeEnvMapping(values)
 	if err != nil {
 		return err
@@ -321,19 +332,8 @@ func GenerateInitialSettings() (Settings, error) {
 		"MAX_STREAM_DURATION":      "1800s",
 		"GLOBAL_CONCURRENCY_LIMIT": "8",
 		"RPM_LIMIT":                "30",
-		// 六个额度窗口出厂全部不限（0）。旧版本这里写死 5h=100000 / 日=20000，
-		// 而预留要算「输入估算 + 输出上限」，编码类客户端第一次请求就会撞上
-		// token_quota_exceeded —— 运维看到的是"明明还有余量却提示额度不足"。
-		// 限额是运维的显式选择，不该由出厂值代劳；需要限流时在管理台填数字即可。
-		"TOKEN_LIMIT_5H":           "0",
-		"TOKEN_LIMIT_DAILY":        "0",
-		"TOKEN_LIMIT_WEEKLY":       "0",
-		"AMOUNT_LIMIT_5H":          "0",
-		"AMOUNT_LIMIT_DAILY":       "0",
-		"AMOUNT_LIMIT_WEEKLY":      "0",
-		"PERIOD_LIMIT_DAYS":        "0",
-		"TOKEN_LIMIT_PERIOD":       "0",
-		"AMOUNT_LIMIT_PERIOD":      "0",
+		// 窗口额度（TOKEN_LIMIT_* / AMOUNT_LIMIT_* / PERIOD_LIMIT_*）不在这里：
+		// v18 起额度按分组分配，出厂全部分组不限，在管理台「模型组」按组设置。
 		"RETENTION_DAYS":           "7",
 		"DB_PATH":                  "data/relay.db",
 		"HOST":                     "0.0.0.0",

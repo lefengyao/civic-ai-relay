@@ -113,23 +113,6 @@ func TestSerializeEnvMappingSortsAndRoundTrips(t *testing.T) {
 	}
 }
 
-// 引导写入 relay.env 的出厂额度必须全部不限（0）。这里钉住它：旧版本写死
-// 5h=100000 / 日=20000，而预留要按「输入估算 + 输出上限」算，新部署的第一次
-// 编码类请求就会被 token_quota_exceeded 挡住——运维看到的是"明明还有余量却
-// 提示额度不足"。限额应当是运维的显式选择。
-func TestGeneratedSettingsLeaveQuotaWindowsUnlimited(t *testing.T) {
-	settings, err := GenerateInitialSettings()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tokens := settings.TokenLimits(); tokens != [3]int64{} {
-		t.Fatalf("bootstrap token limits = %v, want all zero (unlimited)", tokens)
-	}
-	if amounts := settings.AmountLimits(); amounts != [3]int64{} {
-		t.Fatalf("bootstrap amount limits = %v, want all zero (unlimited)", amounts)
-	}
-}
-
 func TestConfigStoreWriteIsAtomicAndPreservesUnknownValues(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "relay.env")
@@ -230,4 +213,50 @@ func mustReadDir(t *testing.T, path string) []string {
 		result = append(result, entry.Name())
 	}
 	return result
+}
+
+// Write 保留未知键，WriteMapping 不保留——额度播种要靠后者真删键。
+func TestWriteMappingDropsKeysOmitted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "relay.env")
+	if err := os.WriteFile(path, []byte("ADMIN_API_KEY=a\nTOKEN_LIMIT_5H=100\nOPERATOR_NOTE=keep?\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := GenerateInitialSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(path)
+	if err := store.Write(settings); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := store.ReadMapping()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"TOKEN_LIMIT_5H", "OPERATOR_NOTE"} {
+		if _, ok := merged[key]; !ok {
+			t.Fatalf("Write 应保留未知键 %s", key)
+		}
+	}
+
+	next := make(map[string]string)
+	for name, value := range settings.EnvMap() {
+		next[name] = value
+	}
+	if err := store.WriteMapping(next); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := store.ReadMapping()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"TOKEN_LIMIT_5H", "OPERATOR_NOTE"} {
+		if _, ok := replaced[key]; ok {
+			t.Fatalf("WriteMapping 不应保留 %s", key)
+		}
+	}
+	if replaced["ADMIN_API_KEY"] == "" {
+		t.Fatal("WriteMapping 丢了凭据")
+	}
 }

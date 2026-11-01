@@ -54,7 +54,7 @@ func TestModelsRequiresBearerAndFiltersAuthorizedModels(t *testing.T) {
 	_ = repo.ReplaceGroupProviders(t.Context(), g.ID, []int64{p.ID})
 	key, _ := repo.CreateClientKey(t.Context(), store.NewClientKey{Name: "k", ConcurrencyLimit: 1})
 	_ = repo.SetKeyGroup(t.Context(), key.ID, g.ID)
-	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 16}
+	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 16}
 	service := relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
 	h := NewPublicHandler(service, 1<<20)
 	unauthenticated := httptest.NewRecorder()
@@ -150,7 +150,7 @@ func TestPathVariantsReachPublicRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repo.Close()
-	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 16}
+	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 16}
 	service := relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
 	h := NewPublicHandler(service, 1<<20)
 

@@ -34,7 +34,7 @@ func adminFixture(t *testing.T) (http.Handler, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
-	settings := config.Settings{AdminAPIKey: "admin-key", EncryptionKey: base64.StdEncoding.EncodeToString(raw), Host: "127.0.0.1", Port: 8000, DBPath: "data/relay.db", RPMLimit: 30, TokenLimit5H: 1000, TokenLimitDaily: 1000, GlobalConcurrencyLimit: 1, MemoryLimitMB: 200, MaxOutputTokens: 64, RetentionDays: 7}
+	settings := config.Settings{AdminAPIKey: "admin-key", EncryptionKey: base64.StdEncoding.EncodeToString(raw), Host: "127.0.0.1", Port: 8000, DBPath: "data/relay.db", RPMLimit: 30, GlobalConcurrencyLimit: 1, MemoryLimitMB: 200, MaxOutputTokens: 64, RetentionDays: 7}
 	return NewAdminHandler(repo, nil, settings, settings.AdminAPIKey), settings.AdminAPIKey
 }
 
@@ -380,9 +380,8 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 	envPath := filepath.Join(t.TempDir(), "relay.env")
-	settings := config.Settings{AdminAPIKey: "admin-key", EncryptionKey: base64.StdEncoding.EncodeToString(raw), Host: "127.0.0.1", Port: 8000, DBPath: "data/relay.db", LogLevel: "INFO", RPMLimit: 30, TokenLimit5H: 1000, TokenLimitDaily: 1000, GlobalConcurrencyLimit: 1, MemoryLimitMB: 200, MaxOutputTokens: 64, RetentionDays: 7,
-		MaxBodyBytes: 8 << 20, MaxStreamDuration: time.Minute, ConnectTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, PoolTimeout: time.Second, ModelSyncInterval: time.Minute,
-		PeriodLimitDays: 7, TokenLimitPeriod: 1000, PeriodLimitStart: "2026-10-20T00:00:00Z"}
+	settings := config.Settings{AdminAPIKey: "admin-key", EncryptionKey: base64.StdEncoding.EncodeToString(raw), Host: "127.0.0.1", Port: 8000, DBPath: "data/relay.db", LogLevel: "INFO", RPMLimit: 30, GlobalConcurrencyLimit: 1, MemoryLimitMB: 200, MaxOutputTokens: 64, RetentionDays: 7,
+		MaxBodyBytes: 8 << 20, MaxStreamDuration: time.Minute, ConnectTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, PoolTimeout: time.Second, ModelSyncInterval: time.Minute}
 	if err := config.NewStore(envPath).Write(settings); err != nil {
 		t.Fatal(err)
 	}
@@ -391,22 +390,22 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 	applied := make(chan config.Settings, 1)
 	handler.SetSettingsListener(func(s config.Settings) { applied <- s })
 
-	// 修改一个运行时参数（非重启项）：应持久化并热应用
+	// 修改一个运行时参数（非重启项）：应持久化并热应用。
+	// 额度配置已迁到分组层（v18），这里改用上游超时作为「非重启项」的代表。
 	save := adminRequest(t, handler, http.MethodPut, "/admin/api/config", settings.AdminAPIKey,
 		map[string]any{"settings": map[string]string{
-			"TOKEN_LIMIT_DAILY": "999999", "UPSTREAM_HEADER_TIMEOUT": "",
-			"PERIOD_LIMIT_DAYS": "10", "TOKEN_LIMIT_PERIOD": "2000",
+			"UPSTREAM_HEADER_TIMEOUT": "45s", "RPM_LIMIT": "99",
 		}})
 	if save.Code != http.StatusOK {
 		t.Fatal(save.Body.String())
 	}
 	select {
 	case got := <-applied:
-		if got.TokenLimitDaily != 999999 {
-			t.Fatalf("applied TokenLimitDaily = %d", got.TokenLimitDaily)
+		if got.HeaderTimeout != 45*time.Second {
+			t.Fatalf("applied HeaderTimeout = %v", got.HeaderTimeout)
 		}
-		if got.PeriodLimitDays != 10 || got.TokenLimitPeriod != 2000 || got.AmountLimitPeriod != 0 || got.PeriodLimitStart != settings.PeriodLimitStart {
-			t.Fatalf("period settings were not applied: %+v", got)
+		if got.RPMLimit != 99 {
+			t.Fatalf("applied RPMLimit = %d", got.RPMLimit)
 		}
 	default:
 		t.Fatal("settings listener was not notified")
@@ -416,16 +415,16 @@ func TestConfigSavePersistsAndAppliesWithoutRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored["TOKEN_LIMIT_DAILY"] != "999999" {
-		t.Fatalf("persisted TOKEN_LIMIT_DAILY = %q", stored["TOKEN_LIMIT_DAILY"])
+	if stored["UPSTREAM_HEADER_TIMEOUT"] != "45s" || stored["RPM_LIMIT"] != "99" {
+		t.Fatalf("persisted settings = %q / %q", stored["UPSTREAM_HEADER_TIMEOUT"], stored["RPM_LIMIT"])
 	}
 	// GET 返回的也是新值
 	get := adminRequest(t, handler, http.MethodGet, "/admin/api/config", settings.AdminAPIKey, nil)
-	if !strings.Contains(get.Body.String(), "999999") {
+	if !strings.Contains(get.Body.String(), `"RPM_LIMIT":"99"`) {
 		t.Fatal(get.Body.String())
 	}
-	if !strings.Contains(get.Body.String(), `"UPSTREAM_HEADER_TIMEOUT":""`) {
-		t.Fatalf("legacy header timeout is not editable: %s", get.Body.String())
+	if !strings.Contains(get.Body.String(), `"UPSTREAM_HEADER_TIMEOUT":"45s"`) {
+		t.Fatalf("header timeout 未回显：%s", get.Body.String())
 	}
 
 	updated := adminRequest(t, handler, http.MethodPut, "/admin/api/config", settings.AdminAPIKey,

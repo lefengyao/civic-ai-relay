@@ -26,7 +26,7 @@ func newHealthFixture(t *testing.T) (*store.Store, *relay.Service) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
-	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 16}
+	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 16}
 	return repo, relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
 }
 

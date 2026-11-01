@@ -15,8 +15,6 @@ func validValues() map[string]string {
 		"RELAY_ENCRYPTION_KEY":     base64.StdEncoding.EncodeToString(make([]byte, 32)),
 		"MODEL_AUTO_SYNC":          "true",
 		"MODEL_SYNC_INTERVAL":      "30",
-		"TOKEN_LIMIT_5H":           "10000",
-		"TOKEN_LIMIT_DAILY":        "5000",
 		"RPM_LIMIT":                "30",
 		"GLOBAL_CONCURRENCY_LIMIT": "2",
 		"MEMORY_LIMIT_MB":          "200",
@@ -57,14 +55,6 @@ func TestParseAppliesDefaultsAndTypes(t *testing.T) {
 	if settings.ModelAutoSync {
 		t.Fatal("model auto-sync must default to off")
 	}
-	// 出厂默认全部不限（0）。新部署不该因为一个出厂限额就在第一次请求时被拒，
-	// 限额是运维的显式选择。
-	if settings.TokenLimit5H != 0 || settings.TokenLimitDaily != 0 || settings.TokenLimitWeekly != 0 {
-		t.Fatalf("unexpected token quota defaults: %+v", settings)
-	}
-	if settings.AmountLimit5H != 0 || settings.AmountLimitDaily != 0 || settings.AmountLimitWeekly != 0 {
-		t.Fatalf("unexpected amount quota defaults: %+v", settings)
-	}
 }
 
 func TestUpstreamHeaderSettingsRoundTripAndRequireRestart(t *testing.T) {
@@ -84,47 +74,6 @@ func TestUpstreamHeaderSettingsRoundTripAndRequireRestart(t *testing.T) {
 	changed.UpstreamSessionHeader = "-"
 	if got := changed.RestartOnlyChanges(settings); len(got) != 2 || got[0] != "UPSTREAM_USER_AGENT" || got[1] != "UPSTREAM_SESSION_HEADER" {
 		t.Fatalf("restart changes = %v", got)
-	}
-}
-
-func TestQuotaLimitsAcceptZeroAsUnlimitedAndYuanForAmounts(t *testing.T) {
-	values := validValues()
-	values["TOKEN_LIMIT_WEEKLY"] = "0"
-	values["AMOUNT_LIMIT_5H"] = "0"
-	values["AMOUNT_LIMIT_DAILY"] = "5"
-	values["AMOUNT_LIMIT_WEEKLY"] = "12.5"
-	settings, err := Parse(values)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if settings.TokenLimitWeekly != 0 || settings.AmountLimit5H != 0 {
-		t.Fatalf("0 must mean unlimited: %+v", settings)
-	}
-	if settings.AmountLimitDaily != 5_000_000 || settings.AmountLimitWeekly != 12_500_000 {
-		t.Fatalf("amount limits must be parsed as yuan into microyuan: %+v", settings)
-	}
-	// 回写时金额还原成「元」，便于管理台展示与再次编辑。
-	env := settings.EnvMap()
-	if env["AMOUNT_LIMIT_DAILY"] != "5" || env["AMOUNT_LIMIT_WEEKLY"] != "12.5" || env["AMOUNT_LIMIT_5H"] != "0" {
-		t.Fatalf("unexpected amount env round-trip: %v", env)
-	}
-}
-
-func TestPeriodQuotaParsesAndInitializesStart(t *testing.T) {
-	values := validValues()
-	values["PERIOD_LIMIT_DAYS"] = "14"
-	values["TOKEN_LIMIT_PERIOD"] = "9000"
-	values["AMOUNT_LIMIT_PERIOD"] = "12.5"
-	settings, err := Parse(values)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if settings.PeriodLimitDays != 14 || settings.TokenLimitPeriod != 9000 || settings.AmountLimitPeriod != 12_500_000 || settings.PeriodLimitStart == "" {
-		t.Fatalf("period settings = %+v", settings)
-	}
-	parsed, err := Parse(settings.EnvMap())
-	if err != nil || parsed != settings {
-		t.Fatalf("period round-trip failed: %v %+v", err, parsed)
 	}
 }
 
@@ -198,24 +147,10 @@ func TestRemovedLegacySettingsAreIgnored(t *testing.T) {
 		t.Fatalf("legacy keys must not break parsing: %v", err)
 	}
 	env := settings.EnvMap()
-	for _, gone := range []string{"UPSTREAM_BASE_URL", "UPSTREAM_API_KEY", "DOCS_ENABLED"} {
+	for _, gone := range []string{"UPSTREAM_BASE_URL", "UPSTREAM_API_KEY", "DOCS_ENABLED",
+		"TOKEN_LIMIT_5H", "TOKEN_LIMIT_DAILY", "AMOUNT_LIMIT_WEEKLY", "PERIOD_LIMIT_START"} {
 		if _, present := env[gone]; present {
 			t.Errorf("%s should no longer be written back to relay.env", gone)
-		}
-	}
-}
-
-func TestQuotaLimitsRejectNegativeAndGarbage(t *testing.T) {
-	for _, bad := range []struct{ name, value string }{
-		{"TOKEN_LIMIT_WEEKLY", "-1"},
-		{"TOKEN_LIMIT_5H", "abc"},
-		{"AMOUNT_LIMIT_DAILY", "-0.5"},
-		{"AMOUNT_LIMIT_WEEKLY", "十元"},
-	} {
-		values := validValues()
-		values[bad.name] = bad.value
-		if _, err := Parse(values); err == nil || !strings.Contains(err.Error(), bad.name) {
-			t.Fatalf("%s=%q: expected a validation error naming the setting, got %v", bad.name, bad.value, err)
 		}
 	}
 }

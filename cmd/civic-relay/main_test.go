@@ -270,3 +270,84 @@ func TestServeApplicationClosesResourcesWhenListenFails(t *testing.T) {
 		t.Fatal("maintenance loop remained active after listen failure")
 	}
 }
+
+// 升级路径闭环：relay.env 里的旧全局额度 → 灌进各分组 → 从 relay.env 删键。
+// 删键即幂等标记：第二次调用不再改库，也不会把键写回去。
+func TestSeedGroupQuotasMovesLegacyKeysIntoGroups(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "relay.env")
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	if err := os.WriteFile(envPath, []byte(
+		"ADMIN_API_KEY=adm_test\n"+
+			"RELAY_ENCRYPTION_KEY="+key+"\n"+
+			"TOKEN_LIMIT_5H=100000\n"+
+			"TOKEN_LIMIT_DAILY=20000\n"+
+			"AMOUNT_LIMIT_WEEKLY=12.5\n"+
+			"PERIOD_LIMIT_DAYS=7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	box, err := secret.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := store.Open(filepath.Join(dir, "relay.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	group, err := repo.CreateModelGroup(ctx, store.NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := seedGroupQuotas(ctx, repo, envPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.ListModelGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].TokenLimit5H == nil || *got[0].TokenLimit5H != 100000 {
+		t.Fatalf("分组未被播种：%+v", got)
+	}
+	if got[0].TokenLimitDaily == nil || *got[0].TokenLimitDaily != 20000 {
+		t.Fatalf("daily 未播种：%+v", got[0])
+	}
+	if got[0].AmountLimitWeekly == nil || *got[0].AmountLimitWeekly != 12_500_000 {
+		t.Fatalf("金额未按元换算成微元：%v", got[0].AmountLimitWeekly)
+	}
+	if got[0].PeriodLimitDays == nil || *got[0].PeriodLimitDays != 7 {
+		t.Fatalf("周期天数未播种：%v", got[0].PeriodLimitDays)
+	}
+
+	values, err := config.NewStore(envPath).ReadMapping()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range legacyQuotaKeys {
+		if _, present := values[key]; present {
+			t.Fatalf("%s 应从 relay.env 移除", key)
+		}
+	}
+	if values["ADMIN_API_KEY"] == "" || values["RELAY_ENCRYPTION_KEY"] == "" {
+		t.Fatalf("凭据不能丢：%v", values)
+	}
+
+	// 第二次：键已不在 → 直接返回，且不覆盖运维之后的修改
+	if _, err := repo.UpdateModelGroup(ctx, group.ID, store.UpdateModelGroup{TokenLimit5H: ptrInt64(7)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedGroupQuotas(ctx, repo, envPath); err != nil {
+		t.Fatal(err)
+	}
+	again, err := repo.ListModelGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again[0].TokenLimit5H == nil || *again[0].TokenLimit5H != 7 {
+		t.Fatalf("重跑播种覆盖了手工修改：%v", again[0].TokenLimit5H)
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }

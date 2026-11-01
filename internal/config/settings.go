@@ -63,20 +63,10 @@ type Settings struct {
 	MaxOutputTokens        int
 	MaxStreamDuration      time.Duration
 	GlobalConcurrencyLimit int
-	RPMLimit               int
-	// 额度限额一律「0 = 不限」。窗口语义：5h 为滚动五小时；日/周为北京时间
-	// 自然日与自然周（周一 00:00 起）。出厂默认全部不限，避免新部署第一次
-	// 请求就被预留额度挡住；限额是运维显式选择，不是默认约束。
-	TokenLimit5H          int64
-	TokenLimitDaily       int64
-	TokenLimitWeekly      int64
-	AmountLimit5H         int64 // 微元
-	AmountLimitDaily      int64 // 微元
-	AmountLimitWeekly     int64 // 微元
-	PeriodLimitDays       int
-	TokenLimitPeriod      int64
-	AmountLimitPeriod     int64 // 微元
-	PeriodLimitStart      string
+	// RPMLimit 是唯一还留在全局配置里的限流值。窗口额度（5h/当日/本周/自定义
+	// 周期 × Token/金额）在 v18 迁到了 model_groups：判定在预留事务内从密钥
+	// 所属分组读取，管理台「模型组」维护——每组独立分配，全局配置不再参与。
+	RPMLimit              int
 	ConnectTimeout        time.Duration
 	HeaderTimeout         time.Duration
 	ReadTimeout           time.Duration
@@ -93,16 +83,6 @@ type Settings struct {
 	// 逗号分隔的来源白名单＝仅精确匹配的来源放行。运行时逐请求读取，
 	// 管理台修改后立即生效（无需重启）。
 	CORSAllowedOrigins string
-}
-
-// TokenLimits 返回三个 Token 窗口的限额（0 = 不限），顺序为 5h / 日 / 周。
-func (s Settings) TokenLimits() [3]int64 {
-	return [3]int64{s.TokenLimit5H, s.TokenLimitDaily, s.TokenLimitWeekly}
-}
-
-// AmountLimits 返回三个金额窗口的限额，单位微元（0 = 不限），顺序为 5h / 日 / 周。
-func (s Settings) AmountLimits() [3]int64 {
-	return [3]int64{s.AmountLimit5H, s.AmountLimitDaily, s.AmountLimitWeekly}
 }
 
 var settingName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -194,56 +174,6 @@ func Parse(values map[string]string) (Settings, error) {
 	s.RPMLimit, err = positiveInt(values, "RPM_LIMIT", 30)
 	if err != nil {
 		return Settings{}, err
-	}
-	s.TokenLimit5H, err = tokenLimit(values, "TOKEN_LIMIT_5H", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.TokenLimitDaily, err = tokenLimit(values, "TOKEN_LIMIT_DAILY", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.TokenLimitWeekly, err = tokenLimit(values, "TOKEN_LIMIT_WEEKLY", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.AmountLimit5H, err = amountLimit(values, "AMOUNT_LIMIT_5H", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.AmountLimitDaily, err = amountLimit(values, "AMOUNT_LIMIT_DAILY", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.AmountLimitWeekly, err = amountLimit(values, "AMOUNT_LIMIT_WEEKLY", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.PeriodLimitDays, err = nonNegativeInt(values, "PERIOD_LIMIT_DAYS", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.TokenLimitPeriod, err = tokenLimit(values, "TOKEN_LIMIT_PERIOD", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.AmountLimitPeriod, err = amountLimit(values, "AMOUNT_LIMIT_PERIOD", 0)
-	if err != nil {
-		return Settings{}, err
-	}
-	s.PeriodLimitStart, err = textOptional(values, "PERIOD_LIMIT_START")
-	if err != nil {
-		return Settings{}, err
-	}
-	if s.PeriodLimitStart != "" {
-		started, parseErr := time.Parse(time.RFC3339, s.PeriodLimitStart)
-		if parseErr != nil {
-			return Settings{}, invalid("PERIOD_LIMIT_START", parseErr)
-		}
-		s.PeriodLimitStart = started.UTC().Format(time.RFC3339)
-	}
-	if s.PeriodLimitDays > 0 && s.PeriodLimitStart == "" {
-		s.PeriodLimitStart = time.Now().UTC().Format(time.RFC3339)
 	}
 	s.ConnectTimeout, err = duration(values, "UPSTREAM_CONNECT_TIMEOUT", 10*time.Second, time.Second)
 	if err != nil {
@@ -342,73 +272,11 @@ func positiveInt(values map[string]string, name string, fallback int) (int, erro
 	return value, nil
 }
 
-func nonNegativeInt(values map[string]string, name string, fallback int) (int, error) {
-	raw, ok := values[name]
-	if !ok || strings.TrimSpace(raw) == "" {
-		return fallback, nil
-	}
-	value, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil || value < 0 {
-		return 0, invalid(name, err)
-	}
-	return value, nil
-}
-
 func textOptional(values map[string]string, name string) (string, error) {
 	if raw, ok := values[name]; ok {
 		return strings.TrimSpace(raw), nil
 	}
 	return "", nil
-}
-
-// tokenLimit 解析 Token 窗口限额，单位 token。空值与 0 都表示不限。
-func tokenLimit(values map[string]string, name string, fallback int64) (int64, error) {
-	raw, ok := values[name]
-	if !ok {
-		return fallback, nil
-	}
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return fallback, nil
-	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || parsed < 0 {
-		return 0, invalid(name, err)
-	}
-	return parsed, nil
-}
-
-// amountLimit 解析金额窗口限额。配置单位是「元」（可带小数，如 5.5），
-// 内部一律换算成微元存储。空值与 0 都表示不限。
-func amountLimit(values map[string]string, name string, fallback int64) (int64, error) {
-	raw, ok := values[name]
-	if !ok {
-		return fallback, nil
-	}
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return fallback, nil
-	}
-	yuan, err := strconv.ParseFloat(value, 64)
-	if err != nil || math.IsNaN(yuan) || math.IsInf(yuan, 0) || yuan < 0 {
-		return 0, invalid(name, err)
-	}
-	if yuan == 0 {
-		return 0, nil
-	}
-	microyuan := yuan * 1e6
-	if microyuan > float64(math.MaxInt64) {
-		return 0, invalid(name, errors.New("out of range"))
-	}
-	return int64(math.Round(microyuan)), nil
-}
-
-// formatAmount 把微元还原成配置里使用的「元」表示，整数不补小数位。
-func formatAmount(microyuan int64) string {
-	if microyuan == 0 {
-		return "0"
-	}
-	return strconv.FormatFloat(float64(microyuan)/1e6, 'f', -1, 64)
 }
 
 // corsOrigins 解析 CORS_ALLOWED_ORIGINS。缺省或空值视为 "*"（出厂默认不限，
@@ -576,16 +444,6 @@ func (s Settings) EnvMap() map[string]string {
 		"RELAY_ENCRYPTION_KEY":     s.EncryptionKey,
 		"RETENTION_DAYS":           strconv.Itoa(s.RetentionDays),
 		"RPM_LIMIT":                strconv.Itoa(s.RPMLimit),
-		"TOKEN_LIMIT_5H":           strconv.FormatInt(s.TokenLimit5H, 10),
-		"TOKEN_LIMIT_DAILY":        strconv.FormatInt(s.TokenLimitDaily, 10),
-		"TOKEN_LIMIT_WEEKLY":       strconv.FormatInt(s.TokenLimitWeekly, 10),
-		"AMOUNT_LIMIT_5H":          formatAmount(s.AmountLimit5H),
-		"AMOUNT_LIMIT_DAILY":       formatAmount(s.AmountLimitDaily),
-		"AMOUNT_LIMIT_WEEKLY":      formatAmount(s.AmountLimitWeekly),
-		"PERIOD_LIMIT_DAYS":        strconv.Itoa(s.PeriodLimitDays),
-		"TOKEN_LIMIT_PERIOD":       strconv.FormatInt(s.TokenLimitPeriod, 10),
-		"AMOUNT_LIMIT_PERIOD":      formatAmount(s.AmountLimitPeriod),
-		"PERIOD_LIMIT_START":       s.PeriodLimitStart,
 		"UPSTREAM_CONNECT_TIMEOUT": s.ConnectTimeout.String(),
 		"UPSTREAM_POOL_TIMEOUT":    s.PoolTimeout.String(),
 		"UPSTREAM_READ_TIMEOUT":    s.ReadTimeout.String(),

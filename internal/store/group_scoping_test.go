@@ -519,3 +519,54 @@ func TestGroupUsageBucketsGroupsByOwnership(t *testing.T) {
 		t.Fatalf("buckets = five %v daily %v weekly %v, want 30 each", five[group.ID], daily[group.ID], weekly[group.ID])
 	}
 }
+
+// 播种把全局额度值灌进分组「仍为 NULL」的列：跑两次结果一致，
+// 已有值的列不被覆盖（写库成功但 relay.env 删键失败而重跑时，不覆盖运维的手工修改）。
+func TestSeedGroupQuotasFillsOnlyNullColumns(t *testing.T) {
+	ctx := context.Background()
+	repo := newTestStore(t)
+	if _, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	g2, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// g2 预先手工设过 5h=999：播种不得覆盖
+	if _, err := repo.UpdateModelGroup(ctx, g2.ID, UpdateModelGroup{TokenLimit5H: intPtr(999)}); err != nil {
+		t.Fatal(err)
+	}
+	seed := GlobalQuotaSeed{Token5H: 100000, TokenDaily: 20000}
+	n, err := repo.SeedGroupQuotas(ctx, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("seeded = %d, want 2", n)
+	}
+	if _, err := repo.SeedGroupQuotas(ctx, seed); err != nil {
+		t.Fatalf("重跑播种出错：%v", err)
+	}
+	listed, err := repo.ListModelGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range listed {
+		if g.TokenLimit5H == nil {
+			t.Fatalf("%s 未被播种", g.Name)
+		}
+		want := int64(100000)
+		if g.ID == g2.ID {
+			want = 999
+		}
+		if *g.TokenLimit5H != want {
+			t.Fatalf("%s token_limit_5h = %d, want %d", g.Name, *g.TokenLimit5H, want)
+		}
+		if g.TokenLimitDaily == nil || *g.TokenLimitDaily != 20000 {
+			t.Fatalf("%s token_limit_daily = %v", g.Name, g.TokenLimitDaily)
+		}
+		if g.TokenLimitWeekly != nil {
+			t.Fatalf("%s 未涉及的窗口被误设：%v", g.Name, g.TokenLimitWeekly)
+		}
+	}
+}

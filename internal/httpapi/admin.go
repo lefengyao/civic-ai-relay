@@ -311,14 +311,8 @@ func (h *AdminHandler) configSave(w http.ResponseWriter, r *http.Request, valida
 		writeAdminErrorDetail(w, 400, "invalid_config", err.Error())
 		return
 	}
-	// An omitted/blank start field means "keep the active period's original
-	// boundary". Only the explicit +day controls or an explicit timestamp may
-	// change it; changing another quota must not shift/reset period usage.
-	if current := h.settings; current.PeriodLimitDays > 0 && next.PeriodLimitDays > 0 {
-		if value, supplied := body.Settings["PERIOD_LIMIT_START"]; !supplied || strings.TrimSpace(value) == "" {
-			next.PeriodLimitStart = current.PeriodLimitStart
-		}
-	}
+	// 窗口额度（含自定义周期的起点）已迁到分组层，这里不再有「保留周期起点」
+	// 的语义——周期起点由 UpdateModelGroup 在分组上维护。
 	pending := h.settings.RestartOnlyChanges(next)
 	changed := make([]string, 0)
 	current := h.settings.EnvMap()

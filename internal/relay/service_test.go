@@ -113,7 +113,7 @@ func serviceFixturePath(t *testing.T, client *fakeClient, path string) (*Service
 	if err := repo.SetKeyGroup(context.Background(), k.ID, g.ID); err != nil {
 		t.Fatal(err)
 	}
-	settings := config.Settings{GlobalConcurrencyLimit: 2, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 32}
+	settings := config.Settings{GlobalConcurrencyLimit: 2, RPMLimit: 30, MaxOutputTokens: 32}
 	service := NewService(repo, &fakeFactory{client: client}, func() config.Settings { return settings })
 	return service, repo, k
 }

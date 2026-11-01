@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -428,6 +430,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Ensure 的 created 同时覆盖「真·首启」与「relay.env 在、但引导文件丢了」的
+	// 恢复路径，两者含义完全不同（前者生成了新凭据，后者只是把现有
+	// ADMIN_API_KEY 写回文件）。先记下 relay.env 当时是否存在，才能分开措辞。
+	_, statErr := os.Stat(path)
+	configExisted := !errors.Is(statErr, os.ErrNotExist)
 	settings, bootstrapKey, created, err := config.Ensure(path)
 	if err != nil {
 		log.Fatal(err)
@@ -440,10 +447,22 @@ func main() {
 		// The credential itself is written only to the adjacent one-time file and
 		// is intentionally never logged or included in process metadata.
 		_ = bootstrapKey
-		logging.Infof("first start created bootstrap administrator key file: %s", filepath.Join(filepath.Dir(path), "bootstrap-admin-key.txt"))
+		bootstrapPath := filepath.Join(filepath.Dir(path), "bootstrap-admin-key.txt")
+		if configExisted {
+			// 恢复路径：写回的是 relay.env 里**现有的** AdminAPIKey，不是新凭据。
+			// 旧文案「first start created…」会让人误以为管理员密钥被重置了。
+			logging.Infof("已恢复既有管理员凭据的引导文件：%s（relay.env 已存在，此处写回的是现有 ADMIN_API_KEY，不是新生成的密钥）", bootstrapPath)
+		} else {
+			logging.Infof("首次启动：已生成 relay.env 与管理员凭据引导文件 %s，请立即保存其中的密钥", bootstrapPath)
+		}
 	}
 	app, source, err := buildApplication(settings, path)
 	if err != nil {
+		log.Fatal(err)
+	}
+	// 额度已从全局配置迁到分组（v18）：把 relay.env 里遗留的全局额度值灌进各分组
+	// 仍为 NULL 的额度列，再从 relay.env 删键。必须在开始接请求之前完成。
+	if err := seedGroupQuotas(context.Background(), app.Store, path); err != nil {
 		log.Fatal(err)
 	}
 	server := newServer(net.JoinHostPort(settings.Host, strconv.Itoa(settings.Port)), app.Handler)
@@ -493,4 +512,80 @@ func newServer(addr string, handler http.Handler) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+}
+
+// legacyQuotaKeys 是 v18 之前留在 relay.env 里的 10 个全局额度键。
+// 它们已经从 config.Settings 删除，残留行按「未知键」保留、不再被读取——
+// 所以这里必须自己读原值、灌进分组、再删键，否则每次启动都会重新播种。
+var legacyQuotaKeys = []string{
+	"TOKEN_LIMIT_5H", "TOKEN_LIMIT_DAILY", "TOKEN_LIMIT_WEEKLY",
+	"AMOUNT_LIMIT_5H", "AMOUNT_LIMIT_DAILY", "AMOUNT_LIMIT_WEEKLY",
+	"PERIOD_LIMIT_DAYS", "TOKEN_LIMIT_PERIOD", "AMOUNT_LIMIT_PERIOD",
+	"PERIOD_LIMIT_START",
+}
+
+// seedGroupQuotas 把 relay.env 里遗留的全局额度原值搬进每个现有分组，然后
+// 从 relay.env 删掉这些键。删键本身就是幂等标记：下次启动读不到原值直接跳过；
+// 「只填 NULL 列」保证写库成功但删键失败而重跑时，不覆盖运维期间的手工修改。
+// 顺序必须先写库、再写 relay.env——任一步失败都不动 relay.env，下次重试。
+func seedGroupQuotas(ctx context.Context, repo *store.Store, path string) error {
+	values, err := config.NewStore(path).ReadMapping()
+	if err != nil {
+		return err
+	}
+	present := false
+	for _, key := range legacyQuotaKeys {
+		if _, ok := values[key]; ok {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return nil
+	}
+	grab := func(key string) string { return strings.TrimSpace(values[key]) }
+	toI64 := func(key string) int64 {
+		v, _ := strconv.ParseInt(grab(key), 10, 64)
+		return v
+	}
+	// 金额配置的书写单位是「元」（可带小数，如 12.5），库里一律存微元。
+	// 用 ParseInt 读会把 12.5 截成 12 —— 额度会被静默缩小六个数量级。
+	toMicroyuan := func(key string) int64 {
+		raw := grab(key)
+		if raw == "" {
+			return 0
+		}
+		yuan, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(yuan) || math.IsInf(yuan, 0) || yuan < 0 {
+			return 0
+		}
+		return int64(math.Round(yuan * 1e6))
+	}
+	seed := store.GlobalQuotaSeed{
+		Token5H:      toI64("TOKEN_LIMIT_5H"),
+		TokenDaily:   toI64("TOKEN_LIMIT_DAILY"),
+		TokenWeekly:  toI64("TOKEN_LIMIT_WEEKLY"),
+		Amount5H:     toMicroyuan("AMOUNT_LIMIT_5H"),
+		AmountDaily:  toMicroyuan("AMOUNT_LIMIT_DAILY"),
+		AmountWeekly: toMicroyuan("AMOUNT_LIMIT_WEEKLY"),
+		TokenPeriod:  toI64("TOKEN_LIMIT_PERIOD"),
+		AmountPeriod: toMicroyuan("AMOUNT_LIMIT_PERIOD"),
+		PeriodStart:  grab("PERIOD_LIMIT_START"),
+	}
+	days, _ := strconv.Atoi(grab("PERIOD_LIMIT_DAYS"))
+	seed.PeriodDays = days
+	n, err := repo.SeedGroupQuotas(ctx, seed)
+	if err != nil {
+		return fmt.Errorf("seed group quotas: %w", err)
+	}
+	// 删键必须走 WriteMapping（不合并）：Write 会把文件里已有的未知键原样保留，
+	// 而这 10 个键删掉之后正是「未知键」，用 Write 等于什么都没删。
+	for _, key := range legacyQuotaKeys {
+		delete(values, key)
+	}
+	if err := config.NewStore(path).WriteMapping(values); err != nil {
+		return fmt.Errorf("rewrite relay.env without legacy quota keys: %w", err)
+	}
+	logging.Infof("全局额度配置已灌入 %d 个分组并从 relay.env 移除（旧 TOKEN_LIMIT_*/AMOUNT_LIMIT_*/PERIOD_LIMIT_* 键；分组额度在管理台「模型组」维护）", n)
+	return nil
 }
