@@ -57,7 +57,7 @@
 - **分组额度判定实测**：临时组（日额度压到 1）调用返回 `429 token_quota_exceeded`，消息含「分组「__verify_tmp_429」#2」；临时 Key/组已删除，生产只剩 `福利` 组与 1 把 Key，用量未变
 - v0.6.0 升级备份（停机后一致备份）：服务器 `/opt/civic-ai-relay/backups/civic-{data,config}-20261101-051103.tar.gz` + 本机副本 `C:\Users\15610\civic-backups\civic-{data,config}-20261101-051103.tar.gz`（4.2MB / 574B，两端 sha256 已对齐：data `fa84dc6c…`、config `6a85125a…`；data 卷内为 `relay.db` 14,704,640 字节，无 `-wal`/`-shm`）
 - **v0.6.0 部署实测（2026-11-01 13:11）**：`healthz` 报 `v0.6.0 (commit 9db9b2ac)`、`readyz`/`admin` 全 200、日志 0 条 ERROR；**匿名 `/admin/api/{overview,session,groups,analytics,providers}` 全部 401 `authentication_required`**（升级前是 200）；管理员 `X-Admin-Key` 全部 200；客户端密钥主体 `session` 返回 `{"admin":false,"scope":{…}}`、本组 200 / 跨组 404、`keys`/`config`/`plugins` 404、写操作 404、渠道列表 `BaseURL` 为空；该密钥实调 `/v1/chat/completions` 200，请求日志只回自己的；周期用量 809,987,971（升级前 809,956,034 + 验证调用），**额度仍从原处继续计**；经 Nginx（`--resolve` 到 127.0.0.1:443）核验同一版本、匿名 api 也是 401
-- ⚠️ **v0.6.0 已知小问题（管理员侧，非安全）**：`GET /admin/api/overview?group_id=<不存在的组>` 返回 200 且 `group` 块全 0、`group_name` 为空，而不是 404。前端下拉只列真实分组，正常操作碰不到；若要修，在 `overview` 里判 `group_name == ""` 后回 404
+- ✅ **v0.6.0 已知小问题已修（`58313c1`，未上生产）**：`GET /admin/api/overview?group_id=<不存在的组>` 原本返回 200 + 全 0 的 `group` 块（`GroupOverview` 为容忍「组刚被删、台子还在轮询」故意返回空概览），读起来像「这组额度用完了」。现在管理员显式指定 `group_id` 时先 `GetModelGroup` 校验，不存在回 404 `not_found`；密钥主体路径不查（它的 `group_id` 来自绑定，跨组早已 404）。`TestAdminOverviewGroupSwitch` 已加断言。**生产仍在 v0.6.0，要带上这条修复需出 v0.6.1**
 - ⚠️ **周期额度不是硬停**：自定义周期用满后不返回 429，而是由 `periodQuotaTransition` 把「本周」窗口起点挪到用满那一刻（`transition_utc`），即自动滚动进入下一周期。想让周期额度真正封顶，必须同时配「本周」Token/金额额度（当前 `福利` 组本周为不限）
 - 升级备份（v0.4.0 迁移前的完整库）：服务器 `/opt/civic-ai-relay/backups/civic-{data,config}-20261101-023738.tar.gz` + 本机副本 `C:\Users\15610\civic-backups\waigame-pre-v0.4.0-20261101.tar.gz`（3.88MB；内含 relay.db 13,434,880 字节、SQLite 头已验证）。**备份里没有 `-wal`/`-shm` 是正常的**——`compose stop` 优雅停机时 SQLite 已把 WAL checkpoint 进主库
 - 阿里云2c2g 上的 civic 已全清（归档在本机 `civic-backups\civic-aliyun-archive-20261031.tar.gz`，含 RELAY_ENCRYPTION_KEY，别外传）
@@ -113,6 +113,6 @@
 ## 八、接手后第一件事
 
 1. 读本文第三节「v0.6.0 部署实测」：生产已是 v0.6.0，控制台无匿名路径，密钥主体按分组只读；`福利` 组周期额度 920M / 已用 809.99M（88%）
-2. `git log --oneline -3 && git status` 确认基线（应为 `9db9b2a` 之后的提交、干净）。**远端仍未 push**（阶段 A/B/C 的提交都在本地），推之前先确认老板意愿
+2. `git log --oneline -3 && git status` 确认基线（应为 `58313c1` 或其后、干净）。**远端已同步**：`main` 推到 `58313c1`，tag `v0.5.0`/`v0.6.0` 已推（2026-11-01 13:21）
 3. 阶段 C 已发版，**没有下一阶段排期**。候选：spec 里剩下的「三态前端打磨」、§10.3 与实现的偏差已按老板要求改完无需回收
 4. 另外三件悬留项：SSH 关密码认证（公钥已验证可登，只剩把 `PasswordAuthentication` 改 no）；`_e2e/run_e2e.py` 额度断言按分组口径重写；`overview?group_id=<不存在>` 的回 200 小问题（见第三节）
