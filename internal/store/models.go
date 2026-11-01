@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Model struct {
@@ -44,6 +45,22 @@ type ModelGroup struct {
 	Name      string
 	Enabled   bool
 	RateMilli int64 // 计费倍率，千分比表示：1000 = 1.0x
+	// 分组额度（取代旧全局额度，v18）：nil = 未设 = 不限。判定在预留事务内
+	// 从本行读取（ledger.go ReserveRequest），统计与扣减同口径。
+	TokenLimit5H      *int64
+	AmountLimit5H     *int64 // 微元
+	TokenLimitDaily   *int64
+	AmountLimitDaily  *int64 // 微元
+	TokenLimitWeekly  *int64
+	AmountLimitWeekly *int64 // 微元
+	PeriodLimitDays   *int
+	TokenLimitPeriod  *int64
+	AmountLimitPeriod *int64 // 微元
+	// PeriodLimitStart 为 RFC3339 文本；PeriodLimitDays>0 且为空时由
+	// UpdateModelGroup 自动填 now（沿用 internal/config/settings.go 的既有行为）。
+	PeriodLimitStart *string
+	// BoundKeys 绑定到本组的客户端密钥数。删组前要让运维看到影响面。
+	BoundKeys int64
 }
 
 type NewModelGroup struct {
@@ -56,6 +73,19 @@ type UpdateModelGroup struct {
 	Name      string
 	Enabled   *bool
 	RateMilli *int64
+	// 分组额度：nil = 保持原值；非 nil = 设为该值（0 = 不限），负数拒绝。
+	// 前端编辑弹窗总是显式传全量，所以「改名」不会误清额度、
+	// 「清空输入框」就是显式设为不限。
+	TokenLimit5H      *int64
+	AmountLimit5H     *int64
+	TokenLimitDaily   *int64
+	AmountLimitDaily  *int64
+	TokenLimitWeekly  *int64
+	AmountLimitWeekly *int64
+	PeriodLimitDays   *int
+	TokenLimitPeriod  *int64
+	AmountLimitPeriod *int64
+	PeriodStart       *string // RFC3339；"" = 清除起点
 }
 
 const DefaultGroupRateMilli int64 = 1000
@@ -275,10 +305,24 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGroup) (ModelGroup, error) {
 	var g ModelGroup
 	var enabled int
-	if err := s.db.QueryRowContext(ctx, `SELECT name,enabled,rate_milli FROM model_groups WHERE id=?`, id).Scan(&g.Name, &enabled, &g.RateMilli); err != nil {
+	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
+	var ps sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT name,enabled,rate_milli,token_limit_5h,amount_limit_5h,token_limit_daily,amount_limit_daily,token_limit_weekly,amount_limit_weekly,period_limit_days,token_limit_period,amount_limit_period,period_limit_start FROM model_groups WHERE id=?`, id).Scan(&g.Name, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps); err != nil {
 		return ModelGroup{}, err
 	}
 	g.ID, g.Enabled = id, enabled == 1
+	g.TokenLimit5H, g.AmountLimit5H = nullableInt(t5h), nullableInt(a5h)
+	g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
+	g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
+	g.TokenLimitPeriod, g.AmountLimitPeriod = nullableInt(tp), nullableInt(ap)
+	if pd.Valid {
+		days := int(pd.Int64)
+		g.PeriodLimitDays = &days
+	}
+	if ps.Valid && ps.String != "" {
+		start := ps.String
+		g.PeriodLimitStart = &start
+	}
 	if strings.TrimSpace(in.Name) != "" {
 		g.Name = strings.TrimSpace(in.Name)
 	}
@@ -292,14 +336,58 @@ func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGr
 		}
 		g.RateMilli = rate
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,rate_milli=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), g.RateMilli, nowUTC(), id); err != nil {
+	for _, pair := range []struct {
+		dst **int64
+		src *int64
+	}{
+		{&g.TokenLimit5H, in.TokenLimit5H}, {&g.AmountLimit5H, in.AmountLimit5H},
+		{&g.TokenLimitDaily, in.TokenLimitDaily}, {&g.AmountLimitDaily, in.AmountLimitDaily},
+		{&g.TokenLimitWeekly, in.TokenLimitWeekly}, {&g.AmountLimitWeekly, in.AmountLimitWeekly},
+		{&g.TokenLimitPeriod, in.TokenLimitPeriod}, {&g.AmountLimitPeriod, in.AmountLimitPeriod},
+	} {
+		if pair.src != nil {
+			if err := validateLimit(pair.src, "group quota limit"); err != nil {
+				return ModelGroup{}, err
+			}
+			value := *pair.src
+			*pair.dst = &value
+		}
+	}
+	if in.PeriodLimitDays != nil {
+		if *in.PeriodLimitDays < 0 {
+			return ModelGroup{}, errors.New("group quota limit must be non-negative")
+		}
+		days := *in.PeriodLimitDays
+		g.PeriodLimitDays = &days
+	}
+	// 周期起点：显式传入就照设（"" = 清除）；没传且当前为空、而天数 > 0 时
+	// 自动填 now——否则「只填了天数」的周期会因起点为零而静默不生效
+	//（periodQuotaTransition 对 PeriodStart.IsZero() 直接返回零值）。
+	if in.PeriodStart != nil {
+		if *in.PeriodStart == "" {
+			g.PeriodLimitStart = nil
+		} else {
+			start := *in.PeriodStart
+			g.PeriodLimitStart = &start
+		}
+	}
+	if g.PeriodLimitDays != nil && *g.PeriodLimitDays > 0 && g.PeriodLimitStart == nil && in.PeriodStart == nil {
+		started := time.Now().UTC().Format(time.RFC3339)
+		g.PeriodLimitStart = &started
+	}
+	// 周期不再生效时清掉残留起点，避免「天数归零、起点还在」的历史脏值
+	// 在下次设回天数时被当成旧周期的起点。
+	if g.PeriodLimitDays == nil || *g.PeriodLimitDays == 0 {
+		g.PeriodLimitStart = nil
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,rate_milli=?,token_limit_5h=?,amount_limit_5h=?,token_limit_daily=?,amount_limit_daily=?,token_limit_weekly=?,amount_limit_weekly=?,period_limit_days=?,token_limit_period=?,amount_limit_period=?,period_limit_start=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), g.RateMilli, g.TokenLimit5H, g.AmountLimit5H, g.TokenLimitDaily, g.AmountLimitDaily, g.TokenLimitWeekly, g.AmountLimitWeekly, g.PeriodLimitDays, g.TokenLimitPeriod, g.AmountLimitPeriod, g.PeriodLimitStart, nowUTC(), id); err != nil {
 		return ModelGroup{}, err
 	}
 	return g, nil
 }
 
 func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled,rate_milli FROM model_groups ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id) FROM model_groups g ORDER BY g.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -309,10 +397,26 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 	for rows.Next() {
 		var g ModelGroup
 		var enabled int
-		if err := rows.Scan(&g.ID, &g.Name, &enabled, &g.RateMilli); err != nil {
+		var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
+		var ps sql.NullString
+		var bound int64
+		if err := rows.Scan(&g.ID, &g.Name, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound); err != nil {
 			return nil, err
 		}
 		g.Enabled = enabled == 1
+		g.TokenLimit5H, g.AmountLimit5H = nullableInt(t5h), nullableInt(a5h)
+		g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
+		g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
+		g.TokenLimitPeriod, g.AmountLimitPeriod = nullableInt(tp), nullableInt(ap)
+		if pd.Valid {
+			days := int(pd.Int64)
+			g.PeriodLimitDays = &days
+		}
+		if ps.Valid && ps.String != "" {
+			start := ps.String
+			g.PeriodLimitStart = &start
+		}
+		g.BoundKeys = bound
 		out = append(out, g)
 	}
 	return out, rows.Err()

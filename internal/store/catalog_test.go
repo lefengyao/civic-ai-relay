@@ -289,5 +289,71 @@ func TestGroupRateMultiplierPersistenceAndKeyModelRate(t *testing.T) {
 	}
 }
 
-func intPtr(v int64) *int64 { return &v }
-func boolPtr(v bool) *bool  { return &v }
+func intPtr(v int64) *int64   { return &v }
+func boolPtr(v bool) *bool    { return &v }
+func strPtr(v string) *string { return &v }
+func daysPtr(v int) *int      { return &v }
+
+// 分组额度持久化：nil = 保持原值，0 = 不限，负数拒绝；周期起点自动填充。
+func TestGroupQuotaPersistenceAndValidation(t *testing.T) {
+	ctx := context.Background()
+	repo := newTestStore(t)
+	g, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{TokenLimit5H: intPtr(-1)}); err == nil {
+		t.Fatal("负数额度被接受")
+	}
+	updated, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{
+		TokenLimit5H:    intPtr(5000),
+		AmountLimit5H:   intPtr(1_000_000),
+		PeriodLimitDays: daysPtr(3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.TokenLimit5H == nil || *updated.TokenLimit5H != 5000 {
+		t.Fatalf("token_limit_5h = %v", updated.TokenLimit5H)
+	}
+	if updated.PeriodLimitStart == nil || *updated.PeriodLimitStart == "" {
+		t.Fatalf("days>0 且起点为空时应自动填 now，实际 %v", updated.PeriodLimitStart)
+	}
+	// 未提及的字段保持原值（nil = 不动）
+	touched, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{TokenLimit5H: intPtr(6000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *touched.TokenLimit5H != 6000 || touched.AmountLimit5H == nil || *touched.AmountLimit5H != 1_000_000 {
+		t.Fatalf("未提及的额度被误改：5h=%v 金额5h=%v", touched.TokenLimit5H, touched.AmountLimit5H)
+	}
+	// 0 = 显式设为不限；周期天数归零时起点一并清除
+	cleared, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{
+		TokenLimit5H:    intPtr(0),
+		PeriodLimitDays: daysPtr(0),
+		PeriodStart:     strPtr(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.TokenLimit5H == nil || *cleared.TokenLimit5H != 0 {
+		t.Fatalf("0 应表示不限，实际 %v", cleared.TokenLimit5H)
+	}
+	if cleared.PeriodLimitStart != nil && *cleared.PeriodLimitStart != "" {
+		t.Fatalf("days=0 应清除起点，实际 %v", cleared.PeriodLimitStart)
+	}
+	// 列表能读回
+	listed, err := repo.ListModelGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *ModelGroup
+	for i := range listed {
+		if listed[i].ID == g.ID {
+			found = &listed[i]
+		}
+	}
+	if found == nil || found.TokenLimit5H == nil || *found.TokenLimit5H != 0 {
+		t.Fatalf("列表未读回额度：%#v", found)
+	}
+}
