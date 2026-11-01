@@ -54,7 +54,7 @@ nav svg{width:17px;height:17px;flex-shrink:0}
 #settings-tabs{display:flex;gap:4px;overflow-x:auto;border-bottom:1px solid var(--border);margin:0 -20px 18px;padding:0 20px;scrollbar-width:thin}
 #settings-tabs button{flex:none;background:transparent;color:var(--muted);padding:10px 12px;border-radius:0;border-bottom:2px solid transparent;font-size:13px;white-space:nowrap}
 #settings-tabs button:hover{color:var(--accent);background:var(--accent-soft)}#settings-tabs button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
-.settings-panel[hidden]{display:none}.settings-panel .kv{margin:0}.period-actions{display:flex;gap:6px;align-items:center}.period-actions input{flex:1}
+.settings-panel[hidden]{display:none}.settings-panel .kv{margin:0}
 .side-foot{border-top:1px solid var(--border);padding:14px 10px 2px;font-size:12px;color:var(--muted)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#c2cad6;margin-right:6px;transition:background .3s}
 .dot.ok{background:var(--green);box-shadow:0 0 0 3px var(--green-soft)}
@@ -633,12 +633,10 @@ async function loadOverview() {
   const lh = d.last_hour || {};
   const errPct = Math.round((lh.error_rate || 0) * 100);
   const conc = d.concurrency || { active: 0, limit: "—" };
+  // 额度卡片已从这里移除：限额是「每个模型组一份」，全局概览没有可展示的限额，
+  // 硬渲染只会显示「不限」——那是在撒谎。按组的用量与限额在分组概览里看。
   $("stat-cards").innerHTML =
     statCard("RPM（每分钟请求）", `${fmtNum(d.rpm.used)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(d.rpm.limit)}</span>`, "全局滚动一分钟", rpmPct) +
-    quotaCard("5 小时额度", "滚动 5 小时，含进行中请求的预留", d.five_hour, "five-hour") +
-    quotaCard("当日额度", "北京时间自然日，含进行中请求的预留", d.daily, "daily") +
-    quotaCard((d.period && d.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (d.period && d.period.active) ? `至 ${fmtTime(d.period.end_utc)}；用满或到期后切换周限额` : (d.period && d.period.transition_utc ? `已切换周限额：${fmtTime(d.period.transition_utc)}` : "未启用"), d.period) +
-    quotaCard(d.weekly && d.weekly.active === false ? "本周额度（等待周期结束）" : "本周额度", d.weekly && d.weekly.active === false ? "周期期间不计入周限额" : "北京时间自然周（周一起），含进行中请求的预留", d.weekly, "weekly") +
     statCard("并发", `${fmtNum(conc.active)} <span style="font-size:13px;color:var(--muted)">/ ${esc(conc.limit)}</span>`, "当前进行中的请求", null) +
     statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null);
   renderRequests(d.recent || [], "overview-recent");
@@ -823,16 +821,6 @@ $("analytics-chart-type").addEventListener("change", () => { if (lastAnalyticsDa
 document.querySelectorAll("[data-analytics-days]").forEach(button => button.addEventListener("click", () => { setAnalyticsDates(Number(button.dataset.analyticsDays)); loadAnalytics().catch(error => toast(error.message, "err")); }));
 $("analytics-from").addEventListener("change", () => { if ($("analytics-to").value && $("analytics-from").value > $("analytics-to").value) $("analytics-to").value = $("analytics-from").value; });
 setAnalyticsDates(7);
-$("stat-cards").addEventListener("click", async event => {
-  const button = event.target.closest("[data-quota-refresh]");
-  if (!button) return;
-  const label = { "five-hour": "5 小时额度", daily: "当日额度", weekly: "本周额度" }[button.dataset.quotaRefresh];
-  if (!window.confirm(`确认刷新${label}用量？`)) return;
-  button.disabled = true;
-  try { await loadOverview(); }
-  catch (error) { if (error.message !== "认证失败") toast(error.message, "err"); }
-  finally { button.disabled = false; }
-});
 
 /* ── 请求表 ── */
 function statusTag(s) {
@@ -1224,12 +1212,25 @@ async function loadGroups() {
   };
   renderGroupChecks();
   if (!cache.groups.length) { $("group-data").innerHTML = `<div class="empty">还没有模型组，点击上方按钮创建</div>`; return; }
-  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
+  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
     cache.groups.map(g => {
       const ops = isAdmin
         ? `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="monitorGroup(${g.ID},this)">检测</button> <button class="btn-ghost btn-sm" onclick="editGroup(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delGroup(${g.ID})">删除</button>`
         : `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="viewGroup(${g.ID})">查看信息</button>`;
-      return `<tr><td class="mono">${g.ID}</td><td><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td style="white-space:nowrap">${ops}</td></tr>`;
+      // 三个主窗口（5h/当日/本周）里最紧张的那个的占比；三个都没设限额时后端给 0。
+      // 注意 0 有两种含义——「没设限额」和「设了但一点没用」——必须靠额度字段本身
+      // 区分，否则新建的组会一律显示「不限」，运维以为额度没生效。
+      // 服务端只按 Token 算紧张度（金额含预留波动大），所以这里也只看 Token 三列。
+      const tension = g.TensionPct != null ? Number(g.TensionPct) : 0;
+      const limited = [g.TokenLimit5H, g.TokenLimitDaily, g.TokenLimitWeekly].some(v => v != null && v > 0);
+      const quotaCell = g.Overdrawn
+        ? `<span class="tag err" title="三个主窗口中至少一个已用满：下一个请求就会被拒">已欠费 ${tension.toFixed(0)}%</span>`
+        : !limited
+          ? `<span style="color:var(--muted)" title="三个主窗口都没有设置限额">不限</span>`
+          : tension >= 80
+            ? `<span class="tag warn" title="三个主窗口中最高用量占比（按 Token）">${tension.toFixed(0)}%</span>`
+            : `<span class="tag ok" title="三个主窗口中最高用量占比（按 Token）">${tension.toFixed(0)}%</span>`;
+      return `<tr><td class="mono">${g.ID}</td><td style="min-width:96px"><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td style="white-space:nowrap">${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td style="white-space:nowrap">${quotaCell}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td style="white-space:nowrap">${ops}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
 /* ── 分组概览：与全局概览同口径，但仅统计走该组内渠道的请求 ── */
@@ -1243,17 +1244,18 @@ window.groupOverview = async id => {
     // 监测历史是附加信息，取不到不该让整个概览打不开
     let history = [];
     try { history = (await apiJSON(`/admin/api/groups/${id}/monitor`)).data || []; } catch {}
+    // 限额跟着组走，所以四个窗口各给一张 quotaCard（已用 / 本组限额）。
+    // 卡片上的 ↻ 只重算这一份概览——它要读周期切换点，比全局概览贵。
     return `<div class="stats">` +
-      statCard("RPM（每分钟请求）", fmtNum(d.rpm.used), "本组渠道滚动一分钟", null) +
-      statCard("5 小时 Token", fmtNum(d.five_hour.used_tokens), "本组渠道近 5 小时合计", null) +
-      statCard("当日 Token（北京时间）", fmtNum(d.daily.used_tokens), "本组渠道当日合计", null) +
-      statCard("当日金额", fmtYuan(d.daily.used_microyuan), "含进行中请求的预留金额", null) +
-      statCard("本周 Token（北京时间，周一起）", fmtNum((d.weekly || {}).used_tokens), "本组渠道本周合计", null) +
-      statCard("本周金额", fmtYuan((d.weekly || {}).used_microyuan), "含进行中请求的预留金额", null) +
+      statCard("RPM（每分钟请求）", fmtNum(d.rpm.used), "归属本组的请求，滚动一分钟", null) +
+      quotaCard("5 小时额度", "滚动 5 小时，含进行中请求的预留", d.five_hour, "five-hour") +
+      quotaCard("当日额度", "北京时间自然日，含进行中请求的预留", d.daily, "daily") +
+      quotaCard((d.period && d.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (d.period && d.period.active) ? `至 ${fmtTime(d.period.end_utc)}；用满或到期后切换周限额` : (d.period && d.period.transition_utc ? `已切换周限额：${fmtTime(d.period.transition_utc)}` : "未启用"), d.period) +
+      quotaCard(d.weekly && d.weekly.active === false ? "本周额度（等待周期结束）" : "本周额度", d.weekly && d.weekly.active === false ? "周期期间不计入周限额" : "北京时间自然周（周一起），含进行中请求的预留", d.weekly, "weekly") +
       statCard("进行中请求", fmtNum(d.active), "状态为进行中的请求", null) +
       statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null) +
       `</div>
-      <p style="color:var(--muted);font-size:12.5px;margin:4px 0 0">统计口径：仅计入通过本组包含渠道发起的请求；令牌与金额包含未结算的预留部分。限额为全局配置（5 小时 / 当日 / 本周 × Token / 金额，0 表示不限），分组本身不设限额。</p>
+      <p style="color:var(--muted);font-size:12.5px;margin:4px 0 0">统计口径：仅计入归属本组的请求（按账目行上的分组归属），与额度扣减同口径；令牌与金额包含未结算的预留部分。限额来自本组的额度设置，在「查看 / 编辑」里维护，0 或留空 = 不限。</p>
       <div class="card" style="margin:16px 0 0;box-shadow:none;padding:16px 18px">
         <div class="card-head">
           <h3 style="font-size:14px">可用性监测（最近 10 轮）</h3>
@@ -1264,6 +1266,8 @@ window.groupOverview = async id => {
   };
   openManageModal(`分组概览 — ${esc(g.Name)}`, `<div class="form-actions" style="margin:0 0 10px"><button class="btn-ghost btn-sm" id="go-refresh">↻ 刷新</button></div><div id="go-body"><div class="skeleton"></div><div class="skeleton"></div></div>`);
   $("go-refresh").onclick = async () => { try { $("go-body").innerHTML = await render(); } catch (e) { $("go-body").innerHTML = `<div class="empty">${esc(e.message)}</div>`; } };
+  // 卡片上的 ↻ 与顶部「刷新」是同一件事；#go-body 只换 innerHTML，监听挂在外层才不会被换掉。
+  $("go-body").addEventListener("click", event => { if (event.target.closest("[data-quota-refresh]")) $("go-refresh").click(); });
   $("go-refresh").click();
 };
 /* 成员渠道的模型与计价一览：管理员编辑弹窗与访客只读弹窗共用。 */
@@ -1291,17 +1295,53 @@ window.editGroup = async id => {
   const offMembers = memberIds.filter(pid => !okProviders.some(p => p.ID === pid));
   const rate = g.RateMilli != null ? g.RateMilli / 1000 : 1;
   const detail = groupMemberDetail(memberIds, rate);
+  // 额度留空的语义是「保持原值」（后端 nil = 不动），所以「改回不限」必须显式填 0。
+  // 手机上 9 个并列输入框很难认，按窗口分行：每行 = Token + 金额（元）。
+  const quotaField = (id, label, value, money) =>
+    `<div class="field"><label>${label}</label><input id="eg-${id}" type="number" min="0" ${money ? `step="0.01"` : `step="1"`} placeholder="留空 = 保持原值" value="${value}"></div>`;
+  const plainVal = v => (v == null ? "" : v);
+  const moneyVal = v => (v == null ? "" : v / 1e6);
   openEdit(`模型组「${esc(g.Name)}」信息`, `
     <div class="form-grid">
       <div class="field"><label>组名</label><input id="eg-name" value="${esc(g.Name)}" style="max-width:280px"></div>
       <div class="field"><label>计费倍率（该组内请求按模型单价 × 倍率计费）</label><input id="eg-rate" type="number" step="0.01" min="0.01" value="${g.RateMilli != null ? (g.RateMilli / 1000).toFixed(2) : "1.00"}" style="max-width:140px"></div>
     </div>
-    <div class="field"><label>包含的供应商（渠道）——组管理渠道，渠道下所有已定价启用模型随组授权</label>${checkListHTML(items, memberIds, "暂无启用中的渠道")}</div>
+    <div style="margin-top:14px"><h4 style="margin:0 0 4px">额度（只作用于本组）</h4>
+      <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">任一窗口用满即拒绝该组的新请求（先欠费后停服：已用 ≥ 限额就拒）。<b>0 = 不限；留空 = 保持原值</b>——想把已设的限额改回不限，要填 0 而不是清空。自定义周期要<b>同时</b>填「周期长度」和至少一项「周期限额」才生效；用满后交接到「本周」窗口。</p>
+      <div class="form-grid">
+        ${quotaField("t5h", "5 小时 Token 限额", plainVal(g.TokenLimit5H))}
+        ${quotaField("a5h", "5 小时金额限额（元）", moneyVal(g.AmountLimit5H), true)}
+        ${quotaField("td", "当日 Token 限额（北京时间）", plainVal(g.TokenLimitDaily))}
+        ${quotaField("ad", "当日金额限额（元）", moneyVal(g.AmountLimitDaily), true)}
+        ${quotaField("tw", "本周 Token 限额（周一起，北京时间）", plainVal(g.TokenLimitWeekly))}
+        ${quotaField("aw", "本周金额限额（元）", moneyVal(g.AmountLimitWeekly), true)}
+        ${quotaField("pd", "自定义周期长度（天；0 = 关闭）", plainVal(g.PeriodLimitDays))}
+        ${quotaField("tp", "自定义周期 Token 限额", plainVal(g.TokenLimitPeriod))}
+        ${quotaField("ap", "自定义周期金额限额（元）", moneyVal(g.AmountLimitPeriod), true)}
+      </div>
+      ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}（填天数时若起点为空会自动从现在开始；用满后交接到「本周」窗口）</p>` : ""}
+    </div>
+    <div class="field" style="margin-top:14px"><label>包含的供应商（渠道）——组管理渠道，渠道下所有已定价启用模型随组授权</label>${checkListHTML(items, memberIds, "暂无启用中的渠道")}</div>
     ${offMembers.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${offMembers.length} 个已停用的成员渠道保存后将被移除</p>` : ""}
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${detail}</div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="eg-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该模型组</label>
   `, async () => {
-    await apiJSON("/admin/api/groups/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: $("eg-name").value.trim(), rate: parseFloat($("eg-rate").value) || 1, enabled: $("eg-enabled").checked }) });
+    // 空串 → null（后端保持原值）；填 0 → 显式「不限」。金额按元进出，库里存微元。
+    const numOrNull = (id, micro) => {
+      const raw = $("eg-" + id).value.trim();
+      if (raw === "") return null;
+      const v = Number(raw);
+      if (!Number.isFinite(v) || v < 0) throw new Error("额度不能为负数");
+      return micro ? Math.round(v * 1e6) : Math.round(v);
+    };
+    await apiJSON("/admin/api/groups/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      name: $("eg-name").value.trim(), rate: parseFloat($("eg-rate").value) || 1, enabled: $("eg-enabled").checked,
+      token_limit_5h: numOrNull("t5h", false), amount_limit_5h: numOrNull("a5h", true),
+      token_limit_daily: numOrNull("td", false), amount_limit_daily: numOrNull("ad", true),
+      token_limit_weekly: numOrNull("tw", false), amount_limit_weekly: numOrNull("aw", true),
+      period_limit_days: numOrNull("pd", false), token_limit_period: numOrNull("tp", false),
+      amount_limit_period: numOrNull("ap", true),
+    }) });
     await apiJSON("/admin/api/groups/" + id + "/providers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider_ids: checkedIds($("edit-body")) }) });
     loadGroups();
   });
@@ -1404,8 +1444,13 @@ window.delProvider = id => {
 window.delGroup = id => {
   const g = cache.groups.find(x => x.ID === id);
   if (!g) return;
+  // 密钥与分组一对一：删组不是「少一个可选分组」，而是把组内密钥变成无组可依，
+  // 它们立刻调不动任何模型。把数字写进确认框，别让运维事后才发现。
+  const n = g.BoundKeys || 0;
   removeResource(`/admin/api/groups/${id}`,
-    `删除模型组「${g.Name}」？授权了该组的 Key 将失去其渠道下所有模型的访问权。`,
+    n > 0
+      ? `删除模型组「${g.Name}」？将解绑 ${n} 个客户端密钥，它们会立即无法调用任何模型（可改绑到其他分组恢复）。`
+      : `删除模型组「${g.Name}」？当前没有密钥绑定到该组。`,
     loadGroups);
 };
 window.delKey = id => {
@@ -1535,10 +1580,15 @@ window.rotateKey = async id => {
 window.editKey = async id => {
   const k = cache.keys.find(x => x.ID === id);
   if (!k) return;
-  if (!cache.groups.length) { try { cache.groups = (await apiJSON("/admin/api/groups")).data || []; } catch {} }
+  // 分组可能在别处被停用/改名，而 cache.groups 只在「模型组」页刷新；这里缓存若旧，
+  // 「已停用」标记与分组名都会是错的。多一次 GET 换一份准确的选择列表，值。
+  try { cache.groups = (await apiJSON("/admin/api/groups")).data || cache.groups; } catch {}
   let groupId = null;
   try { groupId = (await apiJSON("/admin/api/keys/" + id + "/group")).data ?? null; } catch {}
-  const items = cache.groups.filter(g => g.Enabled).map(g => ({ id: g.ID, label: g.Name }));
+  // 当前分组若是停用状态，也必须出现在列表里并保持选中：否则 radio 无一项命中，
+  // 保存时会把 group_id 发成 0，等于「只改了个名字却静默解绑」。
+  const items = cache.groups.filter(g => g.Enabled || g.ID === groupId).map(g => ({ id: g.ID, label: g.Enabled ? g.Name : `${g.Name}（已停用）` }));
+  const currentDisabled = groupId != null && !cache.groups.some(g => g.ID === groupId && g.Enabled);
   openEdit(`编辑客户端 Key #${id}`, `
     <div class="form-grid">
       <div class="field"><label>名称</label><input id="ek-name" value="${esc(k.Name)}"></div>
@@ -1551,6 +1601,7 @@ window.editKey = async id => {
       </div>
     </div>
     <div class="field" style="margin-top:12px"><label>所属模型组（一个密钥只属于一个分组，可切换）</label>${radioListHTML(items, groupId, "ek-group")}</div>
+    ${currentDisabled ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ 该密钥当前所属分组已停用，这个 Key 现在调不动任何模型。保持选中即不改绑，换一个启用的分组即可恢复。</p>` : ""}
     <label class="switch-row" style="margin-top:4px"><label class="switch"><input id="ek-enabled" type="checkbox" ${k.Enabled ? "checked" : ""}><span class="track"></span></label>启用该 Key</label>
   `, async () => {
     const conc = Number($("ek-conc").value);
@@ -1561,8 +1612,13 @@ window.editKey = async id => {
     const ttl = $("ek-ttl").value.trim();
     if (ttl !== "") body.ttl_seconds = Math.max(0, Math.round(Number(ttl) * 3600));
     await apiJSON("/admin/api/keys/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    // 只在选中值真的变了才发：SetKeyGroup 会拒绝停用分组（400），而「没动分组」不该
+    // 因为分组恰好被停用而让整次保存失败。
     const picked = document.querySelector("#edit-body input[name='ek-group']:checked");
-    await apiJSON("/admin/api/keys/" + id + "/group", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_id: picked ? Number(picked.value) : 0 }) });
+    const pickedID = picked ? Number(picked.value) : 0;
+    if (pickedID !== (groupId ?? 0)) {
+      await apiJSON("/admin/api/keys/" + id + "/group", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_id: pickedID }) });
+    }
     loadKeys();
   });
 };
@@ -1735,16 +1791,6 @@ const cfgLabels = {
   RELAY_ENCRYPTION_KEY:     "中转加密密钥 / Relay encryption key",
   RETENTION_DAYS:           "日志保留天数 / Log retention days",
   RPM_LIMIT:                "每分钟请求限额 / Requests-per-minute limit",
-  TOKEN_LIMIT_5H:           "5 小时 Token 限额（0 = 不限）/ 5-hour token limit",
-  TOKEN_LIMIT_DAILY:        "当日 Token 限额，北京时间（0 = 不限）/ Daily token limit",
-  TOKEN_LIMIT_WEEKLY:       "本周 Token 限额，周一起，北京时间（0 = 不限）/ Weekly token limit",
-  PERIOD_LIMIT_DAYS:         "自定义周期长度（天；0 = 关闭）/ Custom period length in days",
-  PERIOD_LIMIT_START:        "自定义周期开始时间（RFC3339；留空时启用会自动从现在开始）/ Period start",
-  TOKEN_LIMIT_PERIOD:        "自定义周期 Token 限额（0 = 不限）/ Custom period token limit",
-  AMOUNT_LIMIT_5H:          "5 小时金额限额，单位元（0 = 不限）/ 5-hour amount limit in CNY",
-  AMOUNT_LIMIT_DAILY:       "当日金额限额，单位元（0 = 不限）/ Daily amount limit in CNY",
-  AMOUNT_LIMIT_WEEKLY:      "本周金额限额，单位元（0 = 不限）/ Weekly amount limit in CNY",
-  AMOUNT_LIMIT_PERIOD:      "自定义周期金额限额，单位元（0 = 不限）/ Custom period amount limit in CNY",
   UPSTREAM_CONNECT_TIMEOUT: "上游连接超时（新建连接的超时，不是总时长）/ Upstream connect timeout",
   UPSTREAM_HEADER_TIMEOUT:  "等待上游响应头超时（留空沿用旧配置）/ Upstream response header timeout",
   UPSTREAM_POOL_TIMEOUT:    "上游连接池超时 / Upstream pool timeout",
@@ -1759,8 +1805,9 @@ const cfgLabels = {
 async function loadConfig() {
   const d = await apiJSON("/admin/api/config");
   const s = d.settings || {};
+  // 额度已迁到各模型组（model_groups 的 10 列），运行配置里只剩全局限流。
   const groups = [
-    ["quota", "额度与周期", ["RPM_LIMIT", "TOKEN_LIMIT_5H", "AMOUNT_LIMIT_5H", "TOKEN_LIMIT_DAILY", "AMOUNT_LIMIT_DAILY", "PERIOD_LIMIT_DAYS", "PERIOD_LIMIT_START", "TOKEN_LIMIT_PERIOD", "AMOUNT_LIMIT_PERIOD", "TOKEN_LIMIT_WEEKLY", "AMOUNT_LIMIT_WEEKLY"]],
+    ["quota", "限流", ["RPM_LIMIT"]],
     ["request", "并发与请求", ["GLOBAL_CONCURRENCY_LIMIT", "MAX_BODY_MB", "MAX_OUTPUT_TOKENS", "MAX_STREAM_DURATION", "MEMORY_LIMIT_MB", "RETENTION_DAYS"]],
     ["monitor", "模型监测", ["MODEL_AUTO_SYNC", "MODEL_SYNC_INTERVAL", "GROUP_MONITOR_INTERVAL"]],
     ["upstream", "上游连接", ["UPSTREAM_CONNECT_TIMEOUT", "UPSTREAM_HEADER_TIMEOUT", "UPSTREAM_POOL_TIMEOUT", "UPSTREAM_READ_TIMEOUT", "UPSTREAM_WRITE_TIMEOUT", "UPSTREAM_IDLE_TIMEOUT", "UPSTREAM_USER_AGENT", "UPSTREAM_SESSION_HEADER", "SSE_HEARTBEAT_INTERVAL"]],
@@ -1770,27 +1817,14 @@ async function loadConfig() {
   const renderField = k => {
     const v = s[k] ?? "", secret = /KEY|SECRET/i.test(k), numeric = /LIMIT|DAYS|PORT|MEMORY|TOKENS|RETENTION|MAX_BODY/.test(k);
     const desc = cfgLabels[k] ? `<div class="cfg-desc">${esc(cfgLabels[k])}</div>` : "";
-    const add = k === "PERIOD_LIMIT_DAYS" ? `<div class="period-actions"><input data-cfg="${esc(k)}" type="number" min="0" step="1" value="${esc(v)}"><button class="btn-ghost btn-sm" type="button" data-add-period="1">+1 天</button><button class="btn-ghost btn-sm" type="button" data-add-period="7">+7 天</button></div>` : `<input data-cfg="${esc(k)}" type="${secret ? "password" : numeric ? "number" : "text"}" value="${esc(v)}" placeholder="${secret ? "已设置（留空保持不变）/ Set (leave blank to keep)" : ""}">`;
-    return `<div class="k mono">${esc(k)}${restartKeys.includes(k) ? ' <span style="color:var(--amber)">⚠</span>' : ""}${desc}</div>${add}`;
+    const input = `<input data-cfg="${esc(k)}" type="${secret ? "password" : numeric ? "number" : "text"}" value="${esc(v)}" placeholder="${secret ? "已设置（留空保持不变）/ Set (leave blank to keep)" : ""}">`;
+    return `<div class="k mono">${esc(k)}${restartKeys.includes(k) ? ' <span style="color:var(--amber)">⚠</span>' : ""}${desc}</div>${input}`;
   };
   const extra = Object.keys(s).filter(k => !used.has(k));
   if (extra.length) groups.push(["other", "其他", extra]);
   $("settings-tabs").innerHTML = groups.map(([id, title]) => `<button type="button" role="tab" id="settings-tab-${id}" data-config-tab="${id}" aria-controls="settings-panel-${id}">${title}</button>`).join("");
-  $("settings-kv").innerHTML = groups.map(([id, title, keys]) => `<div class="settings-panel" id="settings-panel-${id}" role="tabpanel" aria-labelledby="settings-tab-${id}" data-config-panel="${id}"><div class="kv">${keys.filter(k => Object.prototype.hasOwnProperty.call(s, k)).map(renderField).join("")}</div>${title === "额度与周期" ? `<div class="hint" style="margin-top:12px">自定义周期内不统计周额度；周期 Token/金额任一用满或到达截止日后，周额度从交接时刻开始统计。延长中的周期可追加天数。</div>` : ""}</div>`).join("");
+  $("settings-kv").innerHTML = groups.map(([id, title, keys]) => `<div class="settings-panel" id="settings-panel-${id}" role="tabpanel" aria-labelledby="settings-tab-${id}" data-config-panel="${id}"><div class="kv">${keys.filter(k => Object.prototype.hasOwnProperty.call(s, k)).map(renderField).join("")}</div></div>`).join("");
   selectConfigTab(activeConfigTab);
-  $("settings-kv").querySelectorAll("[data-add-period]").forEach(btn => btn.onclick = () => {
-    const input = btn.parentElement.querySelector("[data-cfg=PERIOD_LIMIT_DAYS]");
-    const days = Number(input.value || 0), step = Number(btn.dataset.addPeriod);
-    const startInput = $("settings-kv").querySelector("[data-cfg=PERIOD_LIMIT_START]");
-    const start = new Date(startInput.value || "");
-    const end = new Date(start.getTime() + days * 86400000);
-    if (!days || !Number.isFinite(start.getTime()) || end <= new Date()) {
-      startInput.value = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-      input.value = step;
-    } else {
-      input.value = days + step;
-    }
-  });
 }
 let activeConfigTab = "quota";
 function selectConfigTab(id) {
