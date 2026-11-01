@@ -909,6 +909,14 @@ function checkListHTML(items, selected, name) {
     `<label class="check-item ${selected.includes(x.id) ? "on" : ""}"><input type="checkbox" data-id="${x.id}" ${selected.includes(x.id) ? "checked" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span class="mono">${esc(x.label)}</span></label>`).join("") + `</div>`
     : `<span style="color:var(--muted);font-size:13px">${name}</span>`;
 }
+/* 单选列表：与 checkListHTML 共用 .check-list/.check-item 样式，radio 原生单选。
+   密钥与分组是一对一——一个密钥只属于一个分组，可切换。组内渠道的多选
+   （checkListHTML）不能动，group_providers 靠它维护。 */
+function radioListHTML(items, selected, name) {
+  return items.length ? `<div class="check-list">` + items.map(x =>
+    `<label class="check-item ${selected === x.id ? "on" : ""}"><input type="radio" name="${esc(name)}" value="${x.id}" ${selected === x.id ? "checked" : ""} onchange="this.closest('.check-list').querySelectorAll('.check-item').forEach(i=>i.classList.remove('on'));this.closest('.check-item').classList.toggle('on',this.checked)"><span class="mono">${esc(x.label)}</span></label>`).join("") + `</div>`
+    : `<span style="color:var(--muted);font-size:13px">${esc(name)}</span>`;
+}
 const checkedIds = container => [...container.querySelectorAll(".check-list input:checked")].map(i => Number(i.dataset.id));
 function closeEditModal() {
   $("edit-modal").classList.remove("on");
@@ -1341,7 +1349,7 @@ function expiryTag(k) {
 }
 function renderKeyGroupChecks() {
   $("key-group-checks").innerHTML = cache.groups.filter(g => g.Enabled).map(g =>
-    `<label class="check-item"><input type="checkbox" value="${g.ID}" onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(g.Name)}</span></label>`).join("")
+    `<label class="check-item"><input type="radio" name="key-group" value="${g.ID}" onchange="this.closest('.check-list').querySelectorAll('.check-item').forEach(i=>i.classList.remove('on'));this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(g.Name)}</span></label>`).join("")
     || `<span style="color:var(--muted);font-size:13px">暂无模型组，请先创建</span>`;
 }
 async function loadKeys() {
@@ -1528,8 +1536,8 @@ window.editKey = async id => {
   const k = cache.keys.find(x => x.ID === id);
   if (!k) return;
   if (!cache.groups.length) { try { cache.groups = (await apiJSON("/admin/api/groups")).data || []; } catch {} }
-  let groupIds = [];
-  try { groupIds = (await apiJSON("/admin/api/keys/" + id + "/groups")).data || []; } catch {}
+  let groupId = null;
+  try { groupId = (await apiJSON("/admin/api/keys/" + id + "/group")).data ?? null; } catch {}
   const items = cache.groups.filter(g => g.Enabled).map(g => ({ id: g.ID, label: g.Name }));
   openEdit(`编辑客户端 Key #${id}`, `
     <div class="form-grid">
@@ -1542,7 +1550,7 @@ window.editKey = async id => {
         <input id="ek-ttl" type="number" step="0.1" min="0" placeholder="${k.ExpiresAtUTC ? "当前到期 " + fmtTime(k.ExpiresAtUTC) + "，填数字即从现在起重新计时" : "当前：永久有效"}">
       </div>
     </div>
-    <div class="field" style="margin-top:12px"><label>授权模型组</label>${checkListHTML(items, groupIds, "暂无模型组，请先创建")}</div>
+    <div class="field" style="margin-top:12px"><label>所属模型组（一个密钥只属于一个分组，可切换）</label>${radioListHTML(items, groupId, "ek-group")}</div>
     <label class="switch-row" style="margin-top:4px"><label class="switch"><input id="ek-enabled" type="checkbox" ${k.Enabled ? "checked" : ""}><span class="track"></span></label>启用该 Key</label>
   `, async () => {
     const conc = Number($("ek-conc").value);
@@ -1553,7 +1561,8 @@ window.editKey = async id => {
     const ttl = $("ek-ttl").value.trim();
     if (ttl !== "") body.ttl_seconds = Math.max(0, Math.round(Number(ttl) * 3600));
     await apiJSON("/admin/api/keys/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    await apiJSON("/admin/api/keys/" + id + "/groups", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_ids: checkedIds($("edit-body")) }) });
+    const picked = document.querySelector("#edit-body input[name='ek-group']:checked");
+    await apiJSON("/admin/api/keys/" + id + "/group", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_id: picked ? Number(picked.value) : 0 }) });
     loadKeys();
   });
 };
@@ -1564,7 +1573,9 @@ window.toggleKey = async (id, el) => {
 $("key-form").onsubmit = async e => {
   e.preventDefault();
   const f = new FormData(e.target);
-  const body = { name: f.get("name"), max_concurrency: Number(f.get("max_concurrency")), group_ids: [...$("key-group-checks").querySelectorAll("input:checked")].map(i => Number(i.value)) };
+  const body = { name: f.get("name"), max_concurrency: Number(f.get("max_concurrency")) };
+  const picked = document.querySelector("#key-group-checks input:checked");
+  if (picked) body.group_id = Number(picked.value);
   const tl = f.get("token_limit"), ml = f.get("money_limit");
   if (tl) body.token_limit_total = Number(tl);
   if (ml) body.money_limit_yuan_total = Number(ml);
