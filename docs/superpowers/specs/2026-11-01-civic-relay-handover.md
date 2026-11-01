@@ -1,7 +1,7 @@
-# Civic Relay 分组改造 — 执行状态交接（v0.5.0 已上线，阶段 B 完成，阶段 C 代码已完成待发布）
+# Civic Relay 分组改造 — 执行状态交接（v0.6.0 已上线，阶段 A/B/C 全部完成）
 
 日期：2026-11-01
-基线：main = `91b6977`，tag `v0.5.0`（commit `6dbd6d48`）已部署 waigame 生产；上一版 tag `v0.4.0`（`e2aed42c`）保留作回滚。阶段 C（认证与可见性）已实现并通过测试，**尚未发版、尚未上生产**
+基线：main = `9db9b2a`，tag `v0.6.0`（commit `9db9b2ac`）已部署 waigame 生产；回滚目标 tag `v0.5.0`（`6dbd6d48`，镜像仍在）。阶段 C（认证与可见性）已发版并上生产
 配套文档：设计 spec `docs/superpowers/specs/2026-11-01-civic-relay-group-scoping-design.md`；阶段 B 计划 `docs/superpowers/plans/2026-11-01-civic-relay-group-quota-phase-b.md`
 
 ---
@@ -18,7 +18,7 @@
 |---|---|---|
 | 阶段 A | 数据模型归位（密钥↔分组一对一，v16/v17） | ✅ **已完成并上线 v0.4.0**（13 提交 + tag，7 任务全部通过「实现→规格审查→质量审查」三轮 + 终审） |
 | 阶段 B | 分组额度（v18 加列、判定链换数据源、删全局配置、播种、前端额度 UI） | ✅ **已完成并上线 v0.5.0**（B1~B7 七个提交 + tag，2026-11-01 部署 waigame） |
-| 阶段 C | 认证与可见性（删匿名读、密钥登录、subject 矩阵、前端三态） | ✅ **代码已完成并通过测试，未发版未上线**（2026-11-01，见第八节） |
+| 阶段 C | 认证与可见性（删匿名读、密钥登录、subject 矩阵、前端三态） | ✅ **已完成并上线 v0.6.0**（1 个功能提交 + tag，2026-11-01 13:11 部署 waigame，见第三节与「二之二」） |
 
 ## 二之二、阶段 C 落地记录（2026-11-01）
 
@@ -41,20 +41,23 @@
 
 **测试**：`internal/httpapi/visibility_test.go` 新增可见性矩阵 table-driven（33 条：匿名 401、密钥本组 200、跨组 404、写操作 404）、四种登录拒绝码分开断言、过期令牌返回 `token_expired`、密钥主体只看到本组渠道且 `base_url` 为空、管理员概览「全站 + group 块」并存。`go build` / `go vet` / `go test ./...` 11 个包全绿；另用 Playwright（本机 chromium）跑了两轮真实浏览器验证（登录门禁、分组切换、密钥主体只读视图、组概览弹窗、请求日志），24 项断言全过，无 4xx 噪点。
 
-**发布前待办**：打 tag、`scripts/build_deploy_bundle.sh` 出包、按 `2026-11-01-v0.5.0-deploy-handover.md` 的流程上 waigame（本次无迁移，回滚只需切回 `v0.5.0` 镜像）。
+**发布（2026-11-01 已完成）**：tag `v0.6.0`（`9db9b2ac`）→ `bash scripts/build_deploy_bundle.sh v0.6.0` → 按 `2026-11-01-v0.5.0-deploy-handover.md` 同一套流程上 waigame。**本次无数据库迁移**（schema 仍 v18），回滚只需把 `.env` 的 `CIVIC_RELAY_VERSION` 改回 `v0.5.0` 再 `compose up -d`。
 
 任务跟踪器里已建好 B1~B4 四个条目（#26~#29），B5~B7 未建——接手者从 B1 开始按计划逐个派发即可。
 
 ## 三、代码与部署现状
 
 - 远端 `https://github.com/lefengyao/civic-ai-relay.git`，main 与 origin/main 同步，工作区干净
-- **生产：waigame**（`59.44.120.54`，NAT 9045→22），`/opt/civic-ai-relay`，容器 `civic-ai-relay-civic-relay-1`，镜像 `civic-relay:v0.5.0` healthy，`/healthz` 报 `v0.5.0`（commit `6dbd6d48`）
+- **生产：waigame**（`59.44.120.54`，NAT 9045→22），`/opt/civic-ai-relay`，容器 `civic-ai-relay-civic-relay-1`，镜像 `civic-relay:v0.6.0` healthy，`/healthz` 报 `v0.6.0`（commit `9db9b2ac`）
 - 对外入口：`https://civic.fengyao.xin` → 宝塔 Nginx → `127.0.0.1:8000`（容器内 8000）。Nginx 并未显式 `proxy_buffering off`，流式靠应用侧 `X-Accel-Buffering: no` 关闭缓冲；`client_max_body_size` 走全局 50m，`proxy_read_timeout 600s`
 - 服务器树 = git commit 树 + `.env`/`civic-bin`/`DEPLOYED_COMMIT` 三个本地文件；`DEPLOYED_COMMIT` 记录 version/commit/built/binary_sha256
-- 镜像清单：`civic-relay-runtime:base`（**绝不能删**）+ `v0.5.0`（在跑）+ `v0.4.0`（**保留作回滚**：v18 纯加列，旧二进制不看这 10 列，可直接跑）+ `v0.3.9`（保留但**已无回滚能力**——v17 删了它依赖的 `key_groups`）
+- 镜像清单：`civic-relay-runtime:base`（**绝不能删**）+ `v0.6.0`（在跑）+ `v0.5.0`（**保留作回滚**：v0.6.0 无迁移，旧二进制直接跑）+ `v0.4.0`（保留）+ `v0.3.9`（保留但**已无回滚能力**——v17 删了它依赖的 `key_groups`）
 - v0.5.0 升级备份（停机后一致备份）：服务器 `/opt/civic-ai-relay/backups/civic-{data,config}-20261101-040557.tar.gz` + 本机副本 `C:\Users\15610\civic-backups\civic-{data,config}-20261101-040557.tar.gz`（3.9MB / 649B，两端 sha256 已对齐：data `e1585ef1…`、config `c4919398…`）
 - **v0.5.0 部署实测（2026-11-01 12:06）**：`全局额度配置已灌入 1 个分组并从 relay.env 移除` 如期出现；`福利` 组 `TokenLimitPeriod=920000000`、周期起点 `2026-10-28T07:54:41Z` 原样保留，组概览 `used_tokens=809956034` 与升级前全局周期用量完全一致（**额度不是从 0 重新计**）；relay.env 已清掉全部 `TOKEN_LIMIT_*`/`AMOUNT_LIMIT_*`/`PERIOD_LIMIT_*`，`ADMIN_API_KEY` 与 `RELAY_ENCRYPTION_KEY` 保留；`healthz/readyz/admin` 全 200，日志无 ERROR/WARN；经 Nginx 路径（`--resolve` 到 127.0.0.1:443）核验同一版本
 - **分组额度判定实测**：临时组（日额度压到 1）调用返回 `429 token_quota_exceeded`，消息含「分组「__verify_tmp_429」#2」；临时 Key/组已删除，生产只剩 `福利` 组与 1 把 Key，用量未变
+- v0.6.0 升级备份（停机后一致备份）：服务器 `/opt/civic-ai-relay/backups/civic-{data,config}-20261101-051103.tar.gz` + 本机副本 `C:\Users\15610\civic-backups\civic-{data,config}-20261101-051103.tar.gz`（4.2MB / 574B，两端 sha256 已对齐：data `fa84dc6c…`、config `6a85125a…`；data 卷内为 `relay.db` 14,704,640 字节，无 `-wal`/`-shm`）
+- **v0.6.0 部署实测（2026-11-01 13:11）**：`healthz` 报 `v0.6.0 (commit 9db9b2ac)`、`readyz`/`admin` 全 200、日志 0 条 ERROR；**匿名 `/admin/api/{overview,session,groups,analytics,providers}` 全部 401 `authentication_required`**（升级前是 200）；管理员 `X-Admin-Key` 全部 200；客户端密钥主体 `session` 返回 `{"admin":false,"scope":{…}}`、本组 200 / 跨组 404、`keys`/`config`/`plugins` 404、写操作 404、渠道列表 `BaseURL` 为空；该密钥实调 `/v1/chat/completions` 200，请求日志只回自己的；周期用量 809,987,971（升级前 809,956,034 + 验证调用），**额度仍从原处继续计**；经 Nginx（`--resolve` 到 127.0.0.1:443）核验同一版本、匿名 api 也是 401
+- ⚠️ **v0.6.0 已知小问题（管理员侧，非安全）**：`GET /admin/api/overview?group_id=<不存在的组>` 返回 200 且 `group` 块全 0、`group_name` 为空，而不是 404。前端下拉只列真实分组，正常操作碰不到；若要修，在 `overview` 里判 `group_name == ""` 后回 404
 - ⚠️ **周期额度不是硬停**：自定义周期用满后不返回 429，而是由 `periodQuotaTransition` 把「本周」窗口起点挪到用满那一刻（`transition_utc`），即自动滚动进入下一周期。想让周期额度真正封顶，必须同时配「本周」Token/金额额度（当前 `福利` 组本周为不限）
 - 升级备份（v0.4.0 迁移前的完整库）：服务器 `/opt/civic-ai-relay/backups/civic-{data,config}-20261101-023738.tar.gz` + 本机副本 `C:\Users\15610\civic-backups\waigame-pre-v0.4.0-20261101.tar.gz`（3.88MB；内含 relay.db 13,434,880 字节、SQLite 头已验证）。**备份里没有 `-wal`/`-shm` 是正常的**——`compose stop` 优雅停机时 SQLite 已把 WAL checkpoint 进主库
 - 阿里云2c2g 上的 civic 已全清（归档在本机 `civic-backups\civic-aliyun-archive-20261031.tar.gz`，含 RELAY_ENCRYPTION_KEY，别外传）
@@ -93,9 +96,9 @@
 ## 六、spec §12 需要更新的条目（以本文为准）
 
 - §12.1 「中间提交不保证单独可编译」的范围扩大到 `2245471..05671ff` 之外：阶段 A 的 13 个提交里**每个都是绿的**（子代理流程保证了），这个警告只适用于 9/29~10/31 那段历史
-- §12.2 生产版本 v0.3.9 → v0.4.0 → **v0.5.0**（2026-11-01）；镜像四个（见第三节）；部署目录多了 `backups/`、`DEPLOYED_COMMIT` 与 `.env.bak-*`
+- §12.2 生产版本 v0.3.9 → v0.4.0 → v0.5.0 → **v0.6.0**（2026-11-01 13:11）；镜像五个（见第三节）；部署目录多了 `backups/`、`DEPLOYED_COMMIT` 与 `.env.bak-*`
 - §12.5 SSH 加固**已做一半**（2026-11-01 12:20）：**fail2ban 0.11.2 已装并开机自启**（sshd jail：10 分钟 5 次失败封 1 小时，屡犯每次翻倍、上限 7 天）；头号爆破源 `195.178.110.220`（TECHOFF SRV LIMITED，每分钟 399 次字典爆破）已用 ufw 永久封禁；`PubkeyAuthentication` 已打开、密钥 `~/.ssh/civic_waigame_ed25519` 已写入服务器 `authorized_keys`（回环 `KEY_LOGIN_OK` 验证通过）。**`PasswordAuthentication` 仍为 yes**——老板选择过渡，确认密钥连得稳之后再关，关掉后爆破才彻底归零
-- §12.6 本机留存敏感文件新增：`civic-backups\waigame-pre-v0.4.0-20261101.tar.gz`、`civic-backups\civic-{data,config}-20261101-040557.tar.gz`（含完整账目库与 `RELAY_ENCRYPTION_KEY`，别外传）
+- §12.6 本机留存敏感文件新增：`civic-backups\waigame-pre-v0.4.0-20261101.tar.gz`、`civic-backups\civic-{data,config}-20261101-040557.tar.gz`、`civic-backups\civic-{data,config}-20261101-051103.tar.gz`（含完整账目库与 `RELAY_ENCRYPTION_KEY`，别外传）
 
 ## 七、已知欠账（都排了去处，别新开摊子）
 
@@ -109,7 +112,7 @@
 
 ## 八、接手后第一件事
 
-1. 读本文第三节「v0.5.0 部署实测」：生产已是 v0.5.0，额度判定已按组工作，`福利` 组周期额度 920M / 已用 809.96M（88%）
-2. `git log --oneline -3 && git status` 确认基线（应为 `91b6977`、干净），并 `git push` 这两笔 docs 提交（阶段 A/B 的提交至今未推远端）
-3. **阶段 C 进 brainstorming**：认证与可见性（删匿名读、密钥登录、subject 矩阵、前端三态）。spec 第五~九节是设计，实施计划还没写——按阶段 B 的做法先出计划再动手
-4. 另外两件悬留项：SSH 加固（先加公钥并在服务器上验证能登，再关密码认证，最后改 `PermitRootLogin prohibit-password`，宝塔 VNC 是兜底）；`_e2e/run_e2e.py` 的额度断言按分组口径重写
+1. 读本文第三节「v0.6.0 部署实测」：生产已是 v0.6.0，控制台无匿名路径，密钥主体按分组只读；`福利` 组周期额度 920M / 已用 809.99M（88%）
+2. `git log --oneline -3 && git status` 确认基线（应为 `9db9b2a` 之后的提交、干净）。**远端仍未 push**（阶段 A/B/C 的提交都在本地），推之前先确认老板意愿
+3. 阶段 C 已发版，**没有下一阶段排期**。候选：spec 里剩下的「三态前端打磨」、§10.3 与实现的偏差已按老板要求改完无需回收
+4. 另外三件悬留项：SSH 关密码认证（公钥已验证可登，只剩把 `PasswordAuthentication` 改 no）；`_e2e/run_e2e.py` 额度断言按分组口径重写；`overview?group_id=<不存在>` 的回 200 小问题（见第三节）

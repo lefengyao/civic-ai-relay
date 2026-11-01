@@ -18,7 +18,7 @@
 
 认证失败一律 401，码分四种：`authentication_required`（没带凭据或管理员密钥不对）、`invalid_api_key`（客户端密钥不存在或已停用）、`token_expired`（短时令牌已过期 —— 凭据没错，只是该换新令牌了，客户端不应把它当服务故障重试）、`console_login_not_supported`（用应用型 `app_...` 标识登录控制台；它的密钥创建时即丢弃，无可验证物）。
 
-错误统一返回 `{"error": {"message": "...", "type": "relay_error", "code": "...", "request_id": "..."}}`；`request_id` 同时出现在响应头 `X-Request-Id`，用于把客户端错误、流内错误和账本记录关联起来。服务端始终生成新的 request ID，客户端提供的 `X-Client-Request-Id`（兼容读取 `X-Request-Id`）只作为关联字段。认证失败一律 401，但码分三种：管理端是 `authentication_required`，公共接口是 `invalid_api_key`（令牌不存在或已停用）与 `token_expired`（短时令牌已过期 —— 凭据没错，只是该换新令牌了，客户端不应把它当服务故障重试）。所有列表字段在无数据时返回 `[]` 而非 `null`（含 `data`、`trend`、各组 `provider_ids`/`model_ids` 等），客户端无需额外判空。公共接口的请求体解析错误和上游错误会携带具体原因（`message = code: detail`）；服务层 `invalid_request` 和其他内部错误使用稳定提示，不回传底层错误正文。管理端的渠道建/改失败（`provider_invalid`）同样携带具体原因，并额外附 `code` 字段（`message` 带原因便于管理台直接展示，`code` 保持稳定便于程序匹配）。当进程 RSS 超过 `MEMORY_LIMIT_MB` 时，公共对话请求返回 503 `memory_limit_exceeded`，进行中的流式响应会被中止（按 aborted 结算）；管理接口不受内存保护影响。
+错误统一返回 `{"error": {"message": "...", "type": "relay_error", "code": "...", "request_id": "..."}}`；`request_id` 同时出现在响应头 `X-Request-Id`，用于把客户端错误、流内错误和账本记录关联起来。服务端始终生成新的 request ID，客户端提供的 `X-Client-Request-Id`（兼容读取 `X-Request-Id`）只作为关联字段。公共转发接口的认证失败同样是 401，码为 `invalid_api_key`（令牌不存在或已停用）与 `token_expired`（短时令牌已过期 —— 凭据没错，只是该换新令牌了，客户端不应把它当服务故障重试）。所有列表字段在无数据时返回 `[]` 而非 `null`（含 `data`、`trend`、各组 `provider_ids`/`model_ids` 等），客户端无需额外判空。公共接口的请求体解析错误和上游错误会携带具体原因（`message = code: detail`）；服务层 `invalid_request` 和其他内部错误使用稳定提示，不回传底层错误正文。管理端的渠道建/改失败（`provider_invalid`）同样携带具体原因，并额外附 `code` 字段（`message` 带原因便于管理台直接展示，`code` 保持稳定便于程序匹配）。当进程 RSS 超过 `MEMORY_LIMIT_MB` 时，公共对话请求返回 503 `memory_limit_exceeded`，进行中的流式响应会被中止（按 aborted 结算）；管理接口不受内存保护影响。
 
 ## 服务路由总览
 
