@@ -1263,8 +1263,7 @@ Overview 删掉全局窗口块（额度显示移到组维度）；分组列表�
 func TestSeedGroupQuotasFillsOnlyNullColumns(t *testing.T) {
 	ctx := context.Background()
 	repo := newTestStore(t)
-	g1, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g1"})
-	if err != nil {
+	if _, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g1"}); err != nil {
 		t.Fatal(err)
 	}
 	g2, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g2"})
@@ -1309,7 +1308,6 @@ func TestSeedGroupQuotasFillsOnlyNullColumns(t *testing.T) {
 			t.Fatalf("%s 未涉及的窗口被误设：%v", g.Name, g.TokenLimitWeekly)
 		}
 	}
-	_ = g1
 }
 ```
 
