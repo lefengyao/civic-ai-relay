@@ -420,6 +420,20 @@ func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if groupID > 0 {
+		// 管理员显式点了某个组才要校验存在性：GroupOverview 为了容忍「组刚被删、
+		// 管理台还在轮询」而按空概览返回，直接透传会让 `?group_id=999` 拿到一个
+		// 全 0 的分组块——看起来像「这个组额度用完了」，其实组根本不存在。
+		// 密钥主体不查：groupID 来自它自己的绑定，跨组在 authorizeSubject 已挡成 404。
+		if sub.Admin {
+			if _, gerr := h.repo.GetModelGroup(r.Context(), groupID); gerr != nil {
+				if errors.Is(gerr, sql.ErrNoRows) {
+					writeAdminError(w, 404, "not_found")
+					return
+				}
+				writeAdminError(w, 500, "store_error")
+				return
+			}
+		}
 		group, err := h.repo.GroupOverview(r.Context(), groupID, time.Now().UTC())
 		if err != nil {
 			writeAdminError(w, 500, "ledger_unavailable")

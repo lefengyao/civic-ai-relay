@@ -291,6 +291,16 @@ func TestAdminOverviewGroupSwitch(t *testing.T) {
 	if _, ok := grouped["rpm"]; !ok {
 		t.Fatal("grouped overview must keep the global rpm card")
 	}
+	// 不存在的组必须是 404：GroupOverview 为容忍「组刚被删、台子还在轮询」会返回
+	// 空概览，若直接透传，`?group_id=999` 会拿到一个全 0 的分组块，看起来像
+	// 「这组额度已用尽」——比报错更容易误导人。
+	missing := f.perform(t, "GET", "/admin/api/overview?group_id=999999", "admin")
+	if missing.Code != 404 {
+		t.Fatalf("unknown group should be 404, got %d: %s", missing.Code, missing.Body.String())
+	}
+	if body := missing.Body.String(); !strings.Contains(body, "not_found") {
+		t.Fatalf("unknown group error body = %s", body)
+	}
 }
 
 // TestExpiredKeyGetsTokenExpired 过期与无效必须分开：前者该换令牌，后者是凭据
