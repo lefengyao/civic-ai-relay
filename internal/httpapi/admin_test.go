@@ -746,18 +746,21 @@ func TestAdminKeyGroupSingleBinding(t *testing.T) {
 
 	// 不存在的组 → 400 key_invalid
 	if resp := adminRequest(t, handler, http.MethodPut, keyPath+"/group", adminKey,
-		map[string]any{"group_id": 999999}); resp.Code != http.StatusBadRequest {
-		t.Fatalf("不存在的组应 400，实际 %d", resp.Code)
+		map[string]any{"group_id": 999999}); resp.Code != http.StatusBadRequest ||
+		!strings.Contains(resp.Body.String(), "key_invalid") {
+		t.Fatalf("不存在的组应 400 key_invalid，实际 %d：%s", resp.Code, resp.Body.String())
 	}
 
 	// 负数 → 400 invalid_request（审查移交项：旧 ReplaceKeyGroups 对 gid<=0 报错，不能静默吞）
 	if resp := adminRequest(t, handler, http.MethodPut, keyPath+"/group", adminKey,
-		map[string]any{"group_id": -1}); resp.Code != http.StatusBadRequest {
-		t.Fatalf("负数 group_id 应 400，实际 %d", resp.Code)
+		map[string]any{"group_id": -1}); resp.Code != http.StatusBadRequest ||
+		!strings.Contains(resp.Body.String(), "invalid_request") {
+		t.Fatalf("负数 group_id 应 400 invalid_request，实际 %d：%s", resp.Code, resp.Body.String())
 	}
 	negCreate := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey,
 		map[string]any{"name": "负数组", "max_concurrency": 1, "group_id": -5})
-	if negCreate.Code != http.StatusBadRequest {
-		t.Fatalf("创建带负数 group_id 应 400，实际 %d：%s", negCreate.Code, negCreate.Body.String())
+	if negCreate.Code != http.StatusBadRequest ||
+		!strings.Contains(negCreate.Body.String(), "invalid_request") {
+		t.Fatalf("创建带负数 group_id 应 400 invalid_request，实际 %d：%s", negCreate.Code, negCreate.Body.String())
 	}
 }

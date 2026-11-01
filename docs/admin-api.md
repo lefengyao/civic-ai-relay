@@ -200,7 +200,7 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/api/keys` | 列表，含用量统计（见下） |
-| POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_id?, ttl_seconds?, keyless?}`。`group_id > 0` 时创建即绑定到该分组（一对一）；缺省/0 = 不绑；负数 = 400 `invalid_request`；组不存在或已停用 = 400 `key_invalid`。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
+| POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_id?, ttl_seconds?, keyless?}`。`group_id > 0` 时创建即绑定到该分组（一对一）；缺省/0 = 不绑；负数 = 400 `invalid_request`；组不存在或已停用 = 400 `key_invalid`——此时 Key 本体已创建（历史保留，需事后在编辑里改绑或删除）。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
 | GET | `/admin/api/keys/hints` | 脱敏缩略 `crk_xxxx…` + 非敏感标识 `key-xxxxxx`（独立接口，保证列表永不泄露密钥字符） |
 | PUT | `/admin/api/keys/{id}` | 更新 `{name?, enabled?, concurrency_limit?, token_limit_total?, money_limit_yuan_total?, ttl_seconds?}`；**nil 字段保持原值**。`ttl_seconds` 三态：缺省 = 不动；`0`/负数 = 改为永久有效；`>0` = 从现在起 N 秒后到期（**续期就是再传一次**） |
 | DELETE | `/admin/api/keys/{id}` | 删除：立即吊销访问；历史账目金额保留；重复删除返回 404 |
