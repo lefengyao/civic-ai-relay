@@ -75,20 +75,32 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/admin/api/")
-	// 登录态查询本身不需要鉴权：只回答「这个密钥是不是管理员」，供前端决定
-	// 展示公开只读视图还是完整视图。
-	if path == "session" && isReadMethod(r.Method) {
-		writeJSON(w, http.StatusOK, map[string]any{"admin": h.adminAuthorized(r)})
+	// 没有任何匿名路径：页面本身是静态登录页，但一条数据都要先认人。
+	sub, authCode := h.resolveSubject(r)
+	if authCode != "" {
+		writeAdminAuthError(w, authCode)
 		return
 	}
-	// 概览、用量分析、供应商、模型组公开只读；客户端 Key、请求日志、WASM 插件、
-	// 运行配置以及一切写操作仍然要求管理员密钥。
-	if !(isReadMethod(r.Method) && isPublicRead(path)) {
-		if !h.requireAdmin(w, r) {
+	// 登录探针：只回答「你是谁」，由前端据此决定展示哪个视图。它本身不需要
+	// 额外权限，但同样不接受匿名。
+	if path == "session" && isReadMethod(r.Method) {
+		if sub.Admin {
+			writeJSON(w, http.StatusOK, map[string]any{"admin": true})
 			return
 		}
+		writeJSON(w, http.StatusOK, map[string]any{"admin": false, "scope": scopePayload(sub)})
+		return
 	}
+	if !authorizeSubject(sub, path, r.Method) {
+		// 密钥主体越权一律 404 而非 403：分组 ID 与 Key ID 都是自增整数，
+		// 403 等于确认「这个资源存在」，可以被枚举。
+		writeAdminError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	r = r.WithContext(withAdminSubject(r.Context(), sub))
 	switch {
+	case path == "me" && r.Method == http.MethodGet:
+		h.me(w, r)
 	case path == "overview" && r.Method == http.MethodGet:
 		h.overview(w, r)
 	case path == "analytics" && r.Method == http.MethodGet:
@@ -144,9 +156,167 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ── 主体与鉴权 ────────────────────────────────────────────────────────────
+//
+// 管理台有两种主体：管理员（X-Admin-Key）与客户端密钥（Authorization: Bearer
+// crk_…）。密钥主体是**只读且按分组裁剪**的：它只能用分发出去的密钥看自己这组的
+// 用量、渠道与自己的请求明细，看不到别的组，也看不到任何写操作。
+//
+// 三种拒绝分开返回，客户端才知道该换令牌还是凭据本身不对：
+// 过期 → token_expired；停用/摘要不符 → invalid_api_key；应用型 app_ 标识
+// → console_login_not_supported（它的密钥明文创建时即丢弃，没有可验证物）。
+
+const (
+	authAuthenticationRequired = "authentication_required"
+	authInvalidAPIKey          = "invalid_api_key"
+	authTokenExpired           = "token_expired"
+	authConsoleNotSupported    = "console_login_not_supported"
+)
+
+type adminSubject struct {
+	Admin     bool
+	KeyID     int64
+	GroupID   int64 // 0 = 未绑分组（授权模型为空，控制台没有可看的内容）
+	GroupName string
+}
+
+type adminSubjectKey struct{}
+
+func withAdminSubject(ctx context.Context, sub adminSubject) context.Context {
+	return context.WithValue(ctx, adminSubjectKey{}, sub)
+}
+
+// subjectOf 取出当前请求的主体。ServeHTTP 已经保证非空，取不到时按最小权限处理。
+func subjectOf(r *http.Request) adminSubject {
+	if sub, ok := r.Context().Value(adminSubjectKey{}).(adminSubject); ok {
+		return sub
+	}
+	return adminSubject{}
+}
+
+func scopePayload(sub adminSubject) map[string]any {
+	var groupID any
+	if sub.GroupID > 0 {
+		groupID = sub.GroupID
+	}
+	return map[string]any{"key_id": sub.KeyID, "group_id": groupID, "group_name": sub.GroupName}
+}
+
+func bearerToken(r *http.Request) string {
+	raw := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(raw) < 7 || !strings.EqualFold(raw[:7], "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(raw[7:])
+}
+
+// resolveSubject 认人。返回非空 authCode 表示拒绝。
+func (h *AdminHandler) resolveSubject(r *http.Request) (adminSubject, string) {
+	if h.adminAuthorized(r) {
+		return adminSubject{Admin: true}, ""
+	}
+	token := bearerToken(r)
+	if token == "" {
+		return adminSubject{}, authAuthenticationRequired
+	}
+	// 应用型标识是公开的，接受它等于把分组用量对任何能访问网关的人开放。
+	if strings.HasPrefix(token, "app_") {
+		return adminSubject{}, authConsoleNotSupported
+	}
+	key, err := h.repo.AuthenticateClientKey(r.Context(), token)
+	if errors.Is(err, store.ErrClientKeyExpired) {
+		return adminSubject{}, authTokenExpired
+	}
+	if err != nil || key.Keyless() || !key.Enabled {
+		return adminSubject{}, authInvalidAPIKey
+	}
+	sub := adminSubject{KeyID: key.ID}
+	if key.GroupID != nil {
+		sub.GroupID = *key.GroupID
+	}
+	if sub.GroupID > 0 {
+		if group, gerr := h.repo.GetModelGroup(r.Context(), sub.GroupID); gerr == nil {
+			sub.GroupName = group.Name
+		}
+	}
+	return sub, ""
+}
+
+// authorizeSubject 是唯一一张可见性表，处理函数不再各自判 isAdmin。
+// 管理员全通；密钥主体只读，且只碰得到自己范围里的读接口。
+func authorizeSubject(sub adminSubject, path, method string) bool {
+	if sub.Admin {
+		return true
+	}
+	if sub.KeyID == 0 || !isReadMethod(method) {
+		return false
+	}
+	switch {
+	case path == "me", path == "overview", path == "analytics", path == "providers",
+		path == "models", path == "groups", path == "groups/health", path == "requests":
+		return true
+	case strings.HasPrefix(path, "providers/"):
+		// remote-models 会带着已保存的上游密钥去请求上游，密钥主体一律不给。
+		return !strings.HasSuffix(path, "/remote-models")
+	case strings.HasPrefix(path, "models/"):
+		return true
+	case strings.HasPrefix(path, "groups/"):
+		// 允许路径，组 ID 越界由 groupItem 逐条判 404（路径级判定拦不住枚举）。
+		return true
+	case strings.HasPrefix(path, "requests/"):
+		return true
+	}
+	return false
+}
+
+// writeAdminAuthError 给登录环节一个带 code 的 401，前端按 code 出文案。
+func writeAdminAuthError(w http.ResponseWriter, code string) {
+	writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"code": code, "message": code}})
+}
+
+func isReadMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+func (h *AdminHandler) adminAuthorized(r *http.Request) bool {
+	h.mu.RLock()
+	expected := h.adminKey
+	h.mu.RUnlock()
+	supplied, wanted := []byte(r.Header.Get("X-Admin-Key")), []byte(expected)
+	// 空密钥永远不算通过：未配置管理员密钥时，空串不能让任何人变成管理员。
+	return len(supplied) > 0 && len(supplied) == len(wanted) && subtle.ConstantTimeCompare(supplied, wanted) == 1
+}
+func (h *AdminHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if h.adminAuthorized(r) {
+		return true
+	}
+	writeAdminError(w, 401, "authentication_required")
+	return false
+}
+
 func (h *AdminHandler) analytics(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
+	sub := subjectOf(r)
 	filter := store.AnalyticsFilter{FromDate: query.Get("from_date"), ToDate: query.Get("to_date"), Bucket: query.Get("bucket"), Metric: query.Get("metric"), Status: query.Get("status")}
+	// 分组范围由主体决定，不接受密钥主体用 query 参数扩大：管理员可用 ?group_id=N
+	// 切换视角（0/空 = 全站），密钥主体永远只能是自己那个分组。
+	if sub.Admin {
+		if raw := strings.TrimSpace(query.Get("group_id")); raw != "" {
+			id, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || id <= 0 {
+				writeAdminErrorDetail(w, 400, "invalid_query", "group_id must be a positive integer")
+				return
+			}
+			filter.GroupID = id
+		}
+	} else {
+		if sub.GroupID == 0 {
+			// 未绑分组：没有可统计的范围，返回空串而不是全站数据。
+			writeAdminErrorDetail(w, 400, "group_unbound", "this key is not bound to any model group")
+			return
+		}
+		filter.GroupID = sub.GroupID
+	}
 	if raw := query.Get("days"); raw != "" {
 		days, err := strconv.Atoi(raw)
 		if err != nil {
@@ -178,38 +348,6 @@ func (h *AdminHandler) analytics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, data)
 }
 
-func isReadMethod(method string) bool {
-	return method == http.MethodGet || method == http.MethodHead
-}
-
-// isPublicRead 列出未登录也能读的管理端路径。写操作永远不在此列。
-func isPublicRead(path string) bool {
-	switch {
-	case path == "overview", path == "analytics", path == "providers", path == "models", path == "groups", path == "groups/health":
-		return true
-	case strings.HasPrefix(path, "providers/"):
-		// remote-models 会带着已保存的上游密钥去请求上游，仍然只对管理员开放。
-		return !strings.HasSuffix(path, "/remote-models")
-	case strings.HasPrefix(path, "models/"), strings.HasPrefix(path, "groups/"):
-		return true
-	}
-	return false
-}
-
-func (h *AdminHandler) adminAuthorized(r *http.Request) bool {
-	h.mu.RLock()
-	expected := h.adminKey
-	h.mu.RUnlock()
-	supplied, wanted := []byte(r.Header.Get("X-Admin-Key")), []byte(expected)
-	return len(supplied) == len(wanted) && subtle.ConstantTimeCompare(supplied, wanted) == 1
-}
-func (h *AdminHandler) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if h.adminAuthorized(r) {
-		return true
-	}
-	writeAdminError(w, 401, "authentication_required")
-	return false
-}
 func writeAdminError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message}})
 }
@@ -245,21 +383,129 @@ func writeDeleteResult(w http.ResponseWriter, err error) {
 	}
 }
 
+// overview 是全站概览。管理员看到全局数据，可再用 ?group_id=N 叠加某个分组的
+// 额度与用量；密钥主体只拿到自己那个分组的同一份数据 + 自己的明细。
+//
+// 分组数据单独放在 group 字段里，而不是把全局数字改写成该组的数字——两者语义
+// 不同（全局 RPM 是全站闸门，分组 RPM 只是该组的请求量），混在一个字段里前端
+// 无法区分该显示「全站」还是「本组」。
 func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	settings := h.settings
 	h.mu.RUnlock()
-	// 概览只传全局 RPM：窗口额度已按分组存放，由 Overview 自己按组汇总。
-	data, err := h.repo.Overview(r.Context(), time.Now().UTC(), store.QuotaLimits{RPMLimit: int64(settings.RPMLimit)})
-	if err != nil {
-		writeAdminError(w, 500, "ledger_unavailable")
-		return
+	sub := subjectOf(r)
+	data := map[string]any{}
+	if sub.Admin {
+		global, err := h.repo.Overview(r.Context(), time.Now().UTC(), store.QuotaLimits{RPMLimit: int64(settings.RPMLimit)})
+		if err != nil {
+			writeAdminError(w, 500, "ledger_unavailable")
+			return
+		}
+		global["ledger_status"] = "ok"
+		if h.service != nil {
+			global["concurrency"] = map[string]any{"active": h.service.ActiveGlobal(), "limit": settings.GlobalConcurrencyLimit}
+		}
+		data = global
 	}
-	data["ledger_status"] = "ok"
-	if h.service != nil {
-		data["concurrency"] = map[string]any{"active": h.service.ActiveGlobal(), "limit": settings.GlobalConcurrencyLimit}
+	groupID := sub.GroupID
+	if sub.Admin {
+		groupID = 0
+		if raw := strings.TrimSpace(r.URL.Query().Get("group_id")); raw != "" {
+			id, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || id <= 0 {
+				writeAdminErrorDetail(w, 400, "invalid_query", "group_id must be a positive integer")
+				return
+			}
+			groupID = id
+		}
+	}
+	if groupID > 0 {
+		group, err := h.repo.GroupOverview(r.Context(), groupID, time.Now().UTC())
+		if err != nil {
+			writeAdminError(w, 500, "ledger_unavailable")
+			return
+		}
+		// GroupOverview 不知道全局 RPM 闸门（那是保护性闸门，不随分组走）。
+		if rpm, ok := group["rpm"].(map[string]any); ok {
+			rpm["limit"] = settings.RPMLimit
+		}
+		data["group"] = group
+		if sub.Admin {
+			// 管理员选了分组：最近请求也换成该组的，否则页面上的两块数据不是一个范围。
+			page, perr := h.repo.QueryRequests(r.Context(), store.RequestFilter{GroupID: groupID, Limit: 10})
+			if perr != nil {
+				writeAdminError(w, 500, "store_error")
+				return
+			}
+			data["recent"] = page.Data
+		}
+	}
+	if !sub.Admin {
+		data["scope"] = scopePayload(sub)
+		// 分组汇总（group）与自己明细（me）同屏：决策是「分组汇总 + 自己明细」，
+		// 不新开视图。最近请求只能是自己那把密钥的，否则分组汇总的入口顺手
+		// 泄露了同组其他密钥的记录。
+		page, err := h.repo.QueryRequests(r.Context(), store.RequestFilter{KeyID: sub.KeyID, Limit: 10})
+		if err != nil {
+			writeAdminError(w, 500, "store_error")
+			return
+		}
+		data["recent"] = page.Data
+		if self, err := h.keySelfInfo(r.Context(), sub); err == nil {
+			data["me"] = self
+		}
 	}
 	writeJSON(w, 200, data)
+}
+
+// keySelfInfo 汇总「我这把密钥」的用量与限制，供 overview 的「我的用量」区块
+// 与 /admin/api/me 共用。用量口径与额度判定一致：预留中的也算已用。
+func (h *AdminHandler) keySelfInfo(ctx context.Context, sub adminSubject) (map[string]any, error) {
+	key, err := h.repo.GetClientKey(ctx, sub.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	usage, err := h.repo.KeyUsageByID(ctx, sub.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	models, err := h.repo.AuthorizedModelsForKey(ctx, sub.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	var expiresAt, expiresIn any
+	if key.ExpiresAt != nil {
+		expiresAt = key.ExpiresAt.UTC().Format(time.RFC3339)
+		if left := time.Until(*key.ExpiresAt); left > 0 {
+			expiresIn = int64(left.Seconds())
+		} else {
+			expiresIn = 0
+		}
+	}
+	return map[string]any{
+		"key_id": key.ID, "name": key.Name, "enabled": key.Enabled,
+		"group_id": scopePayload(sub)["group_id"], "group_name": sub.GroupName,
+		"concurrency_limit": key.ConcurrencyLimit,
+		"token_limit":       key.TokenLimit, "amount_limit_microyuan": key.AmountLimitMicroyuan,
+		"used_tokens": usage.Tokens, "used_microyuan": usage.AmountMicroyuan, "requests": usage.Requests,
+		"expires_at_utc": expiresAt, "expires_in_secs": expiresIn,
+		"authorized_models": len(models),
+	}, nil
+}
+
+func (h *AdminHandler) me(w http.ResponseWriter, r *http.Request) {
+	sub := subjectOf(r)
+	if sub.Admin {
+		// 管理员没有「自己那把密钥」；前端不会调它，直接说明原因而不是 500。
+		writeAdminErrorDetail(w, 400, "not_applicable", "administrator has no client key")
+		return
+	}
+	data, err := h.keySelfInfo(r.Context(), sub)
+	if err != nil {
+		writeAdminError(w, 500, "store_error")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"data": data})
 }
 
 func parsePeriodStart(raw string) time.Time {
@@ -344,11 +590,26 @@ func (h *AdminHandler) providersList(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 500, "store_error")
 		return
 	}
-	// 上游地址属于内部拓扑：公开只读接口只给名称与状态，不返回地址。
-	if !h.adminAuthorized(r) {
-		for i := range data {
-			data[i].BaseURL = ""
+	sub := subjectOf(r)
+	if !sub.Admin {
+		// 密钥主体只看得到自己分组挂的渠道，而且拿不到上游地址——
+		// 地址属于内部拓扑，拿到就能绕过网关直连上游。
+		members, merr := h.repo.GroupProviderIDs(r.Context(), sub.GroupID)
+		if merr != nil || sub.GroupID == 0 {
+			members = nil
 		}
+		allowed := make(map[int64]bool, len(members))
+		for _, id := range members {
+			allowed[id] = true
+		}
+		filtered := make([]store.Provider, 0, len(members))
+		for _, p := range data {
+			if allowed[p.ID] {
+				p.BaseURL = ""
+				filtered = append(filtered, p)
+			}
+		}
+		data = filtered
 	}
 	writeJSON(w, 200, map[string]any{"data": data})
 }
@@ -542,6 +803,22 @@ func (h *AdminHandler) modelCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{"data": value})
 }
 func (h *AdminHandler) modelsList(w http.ResponseWriter, r *http.Request) {
+	sub := subjectOf(r)
+	if !sub.Admin {
+		// 与公共 /v1/models 同源的授权口径：密钥主体看到的模型必须是它真能调的，
+		// 否则用量分析里的模型选择器会列出一堆用不了的模型。
+		if sub.GroupID == 0 {
+			writeJSON(w, 200, map[string]any{"data": []store.Model{}})
+			return
+		}
+		data, err := h.repo.AuthorizedModelsForKey(r.Context(), sub.KeyID)
+		if err != nil {
+			writeAdminError(w, 500, "store_error")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"data": data})
+		return
+	}
 	data, err := h.repo.ListModels(r.Context())
 	if err != nil {
 		writeAdminError(w, 500, "store_error")
@@ -619,6 +896,16 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 500, "store_error")
 		return
 	}
+	// 密钥主体只看到自己那一个分组（未绑分组则一个也看不到）。
+	if sub := subjectOf(r); !sub.Admin {
+		own := make([]store.ModelGroup, 0, 1)
+		for _, g := range data {
+			if sub.GroupID > 0 && g.ID == sub.GroupID {
+				own = append(own, g)
+			}
+		}
+		data = own
+	}
 	five, daily, weekly, err := h.repo.GroupUsageBuckets(r.Context(), time.Now().UTC())
 	if err != nil {
 		writeAdminError(w, 500, "usage_error")
@@ -683,7 +970,11 @@ func (h *AdminHandler) groupsHealth(w http.ResponseWriter, r *http.Request) {
 	interval := h.settings.GroupMonitorInterval
 	h.mu.RUnlock()
 	data := make(map[string]any, len(latest))
+	sub := subjectOf(r)
 	for id, result := range latest {
+		if !sub.Admin && (sub.GroupID == 0 || id != sub.GroupID) {
+			continue
+		}
 		data[strconv.FormatInt(id, 10)] = result
 	}
 	writeJSON(w, 200, map[string]any{
@@ -736,6 +1027,25 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		writeAdminError(w, 400, "invalid_id")
+		return
+	}
+	// 路径级放行之后必须再判一次 ID：组 ID 是自增整数，只做路径判定等于允许
+	// 枚举别组的用量。跨组一律 404，不确认存在性。
+	if sub := subjectOf(r); !sub.Admin && (sub.GroupID == 0 || id != sub.GroupID) {
+		writeAdminError(w, 404, "not_found")
+		return
+	}
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		g, err := h.repo.GetModelGroup(r.Context(), id)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeAdminError(w, 404, "not_found")
+			return
+		}
+		if err != nil {
+			writeAdminError(w, 500, "store_error")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"data": g})
 		return
 	}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
@@ -1215,6 +1525,19 @@ func (h *AdminHandler) requestsList(w http.ResponseWriter, r *http.Request) {
 		writeAdminErrorDetail(w, 400, "invalid_query", err.Error())
 		return
 	}
+	// 管理员可按 ?group_id 收窄（与概览的分组切换同口径），密钥主体强制只看自己。
+	sub := subjectOf(r)
+	if !sub.Admin {
+		filter.KeyID = sub.KeyID
+		filter.GroupID = 0
+	} else if raw := strings.TrimSpace(query.Get("group_id")); raw != "" {
+		id, perr := strconv.ParseInt(raw, 10, 64)
+		if perr != nil || id <= 0 {
+			writeAdminErrorDetail(w, 400, "invalid_query", "group_id must be a positive integer")
+			return
+		}
+		filter.GroupID = id
+	}
 	page, err := h.repo.QueryRequests(r.Context(), filter)
 	if err != nil {
 		if errors.Is(err, store.ErrInvalidRequestQuery) {
@@ -1299,6 +1622,22 @@ func (h *AdminHandler) requestItem(w http.ResponseWriter, r *http.Request, raw s
 	if err != nil || strings.TrimSpace(requestID) == "" || strings.Contains(requestID, "/") || strings.Contains(requestID, "\\") {
 		writeAdminError(w, 400, "invalid_request_id")
 		return
+	}
+	// 单条也要按归属裁剪：request_id 是外部可见的，只裁列表能被遍历绕过。
+	if sub := subjectOf(r); !sub.Admin {
+		owner, _, oerr := h.repo.RequestOwner(r.Context(), requestID)
+		if errors.Is(oerr, sql.ErrNoRows) {
+			writeAdminError(w, 404, "not_found")
+			return
+		}
+		if oerr != nil {
+			writeAdminError(w, 500, "store_error")
+			return
+		}
+		if owner != sub.KeyID {
+			writeAdminError(w, 404, "not_found")
+			return
+		}
 	}
 	data, err := h.repo.GetRequest(r.Context(), requestID)
 	if errors.Is(err, sql.ErrNoRows) {

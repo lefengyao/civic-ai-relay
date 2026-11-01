@@ -422,6 +422,39 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 	return out, rows.Err()
 }
 
+// GetModelGroup 读单个分组。控制台按密钥主体登录时要拿组名做展示，
+// 逐个 ListModelGroups 再筛不划算也容易写错。
+func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error) {
+	if id <= 0 {
+		return ModelGroup{}, errors.New("group ID is required")
+	}
+	var g ModelGroup
+	var enabled int
+	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
+	var ps sql.NullString
+	var bound int64
+	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
+		Scan(&g.ID, &g.Name, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound)
+	if err != nil {
+		return ModelGroup{}, err
+	}
+	g.Enabled = enabled == 1
+	g.TokenLimit5H, g.AmountLimit5H = nullableInt(t5h), nullableInt(a5h)
+	g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
+	g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
+	g.TokenLimitPeriod, g.AmountLimitPeriod = nullableInt(tp), nullableInt(ap)
+	if pd.Valid {
+		days := int(pd.Int64)
+		g.PeriodLimitDays = &days
+	}
+	if ps.Valid && ps.String != "" {
+		start := ps.String
+		g.PeriodLimitStart = &start
+	}
+	g.BoundKeys = bound
+	return g, nil
+}
+
 // CountKeysInGroup 数出绑定到某分组的密钥数，供删除确认框告知影响面：
 // 一对一之后删组会把该组所有密钥变成未绑、立即无法调用（spec 5.1）。
 func (s *Store) CountKeysInGroup(ctx context.Context, groupID int64) (int64, error) {

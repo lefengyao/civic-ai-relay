@@ -1,7 +1,7 @@
-# Civic Relay 分组改造 — 执行状态交接（v0.5.0 已上线，阶段 B 完成）
+# Civic Relay 分组改造 — 执行状态交接（v0.5.0 已上线，阶段 B 完成，阶段 C 代码已完成待发布）
 
 日期：2026-11-01
-基线：main = `91b6977`，tag `v0.5.0`（commit `6dbd6d48`）已部署 waigame 生产；上一版 tag `v0.4.0`（`e2aed42c`）保留作回滚
+基线：main = `91b6977`，tag `v0.5.0`（commit `6dbd6d48`）已部署 waigame 生产；上一版 tag `v0.4.0`（`e2aed42c`）保留作回滚。阶段 C（认证与可见性）已实现并通过测试，**尚未发版、尚未上生产**
 配套文档：设计 spec `docs/superpowers/specs/2026-11-01-civic-relay-group-scoping-design.md`；阶段 B 计划 `docs/superpowers/plans/2026-11-01-civic-relay-group-quota-phase-b.md`
 
 ---
@@ -18,7 +18,30 @@
 |---|---|---|
 | 阶段 A | 数据模型归位（密钥↔分组一对一，v16/v17） | ✅ **已完成并上线 v0.4.0**（13 提交 + tag，7 任务全部通过「实现→规格审查→质量审查」三轮 + 终审） |
 | 阶段 B | 分组额度（v18 加列、判定链换数据源、删全局配置、播种、前端额度 UI） | ✅ **已完成并上线 v0.5.0**（B1~B7 七个提交 + tag，2026-11-01 部署 waigame） |
-| 阶段 C | 认证与可见性（删匿名读、密钥登录、subject 矩阵、前端三态） | ⬜ 未规划（spec 第五~九节是设计，实施计划待写） |
+| 阶段 C | 认证与可见性（删匿名读、密钥登录、subject 矩阵、前端三态） | ✅ **代码已完成并通过测试，未发版未上线**（2026-11-01，见第八节） |
+
+## 二之二、阶段 C 落地记录（2026-11-01）
+
+老板的原话是「纯用户登录网页应该先让他输密钥，输入了密钥才能看到对应分组信息，而目前是谁都能看到；运行概览和用量分析应该全量保留，但可以通过切换分组查看对应分组的信息，而不是必须到模型组查看概览」。据此实施的内容：
+
+**后端**
+- 删掉 `isPublicRead` 白名单与「匿名只读视图」，`/admin/api/` 下没有任何匿名路径。新增 `adminSubject{Admin, KeyID, GroupID, GroupName}` + `resolveSubject` + 单一可见性表 `authorizeSubject`（处理函数不再各自判 `isAdmin`）
+- 凭证：管理员 `X-Admin-Key`；客户端密钥 `Authorization: Bearer crk_…`（`app_` 应用型标识显式拒绝，返回 `console_login_not_supported`）。四种拒绝码：`authentication_required` / `invalid_api_key` / `token_expired` / `console_login_not_supported`
+- `GET /admin/api/session` 语义变更：匿名不再 200，改为「回答你是谁」；新增 `GET /admin/api/me`
+- 行级裁剪：`overview`（密钥主体带 `group`/`me`/`scope`，`recent` 只含自己）、`analytics`（`group_id` 过滤）、`providers`（组内渠道且不含 `base_url`）、`models`（与 `/v1/models` 同源的授权口径）、`groups`/`groups/{id}`/`groups/{id}/overview`/`groups/health`（只有自己那组）、`requests`（强制 `key_id`，单条按 `RequestOwner` 判 404）。跨组一律 404
+- 新增 store 能力：`RequestFilter.GroupID/KeyID`、`AnalyticsFilter.GroupID`、`RequestOwner`、`GetModelGroup`、`KeyUsageByID`、`groups/{id}` 的 GET
+
+**前端（`web/admin.html`）**
+- 打开即是登录页（没有任何匿名可见数据）；一个输入框自动判别：`crk_` 前缀走客户端密钥，其余走管理员密钥；两个 localStorage 键互斥，换主体时清空缓存
+- 主体三态用 `body.readonly` + `body.mode-key`：密钥主体看不到「客户端 Key / WASM 插件 / 运行配置」，但保留「请求日志」（后端按 key 裁剪）
+- **概览页保留全站数据，另加「统计范围」下拉**（全部分组 / 某个组）。选中分组后展示该组四个窗口的额度卡片、本组 RPM、进行中与成功率，最近请求也换成该组的；密钥主体看到的是固定显示的本组 + 「我的用量（这把密钥）」区块
+- 用量分析筛选条件里加「分组」下拉（管理员），密钥主体由服务端锁定
+
+**与设计 spec 的偏差（老板本轮明确要求）**：spec §10.3 原本定「管理员概览去掉额度卡片，分组额度只看模型组弹窗」；现在改为**概览页内置分组切换器**，模型组弹窗的概览入口保留不变。两处口径一致（都走 `GroupOverview`）。
+
+**测试**：`internal/httpapi/visibility_test.go` 新增可见性矩阵 table-driven（33 条：匿名 401、密钥本组 200、跨组 404、写操作 404）、四种登录拒绝码分开断言、过期令牌返回 `token_expired`、密钥主体只看到本组渠道且 `base_url` 为空、管理员概览「全站 + group 块」并存。`go build` / `go vet` / `go test ./...` 11 个包全绿；另用 Playwright（本机 chromium）跑了两轮真实浏览器验证（登录门禁、分组切换、密钥主体只读视图、组概览弹窗、请求日志），24 项断言全过，无 4xx 噪点。
+
+**发布前待办**：打 tag、`scripts/build_deploy_bundle.sh` 出包、按 `2026-11-01-v0.5.0-deploy-handover.md` 的流程上 waigame（本次无迁移，回滚只需切回 `v0.5.0` 镜像）。
 
 任务跟踪器里已建好 B1~B4 四个条目（#26~#29），B5~B7 未建——接手者从 B1 开始按计划逐个派发即可。
 

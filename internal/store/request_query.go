@@ -17,10 +17,15 @@ type RequestFilter struct {
 	Protocol   string
 	ProviderID int64
 	ModelID    int64
-	BeforeID   int64
-	FromUTC    *time.Time
-	ToUTC      *time.Time
-	Limit      int
+	// GroupID / KeyID 是可见性裁剪用的行级条件，0 表示不过滤。
+	// 管理台把登录主体换算成这两个值传进来：管理员都是 0（看全量），
+	// 密钥主体是 {自己的 keyID} 或 {所属分组}。
+	GroupID  int64
+	KeyID    int64
+	BeforeID int64
+	FromUTC  *time.Time
+	ToUTC    *time.Time
+	Limit    int
 }
 
 type AnalyticsFilter struct {
@@ -32,6 +37,9 @@ type AnalyticsFilter struct {
 	ModelID  int64
 	ModelIDs []int64
 	Status   string
+	// GroupID 非 0 时只统计归属该分组的请求（账目行上的 group_id）。
+	// 0 表示全量；密钥主体由 handler 填成自己所属的分组。
+	GroupID int64
 }
 
 type RequestPage struct {
@@ -130,6 +138,14 @@ func (s *Store) QueryRequests(ctx context.Context, filter RequestFilter) (Reques
 		where = append(where, "model_id = ?")
 		args = append(args, filter.ModelID)
 	}
+	if filter.GroupID > 0 {
+		where = append(where, "group_id = ?")
+		args = append(args, filter.GroupID)
+	}
+	if filter.KeyID > 0 {
+		where = append(where, "key_id = ?")
+		args = append(args, filter.KeyID)
+	}
 	if filter.BeforeID > 0 {
 		where = append(where, "id < ?")
 		args = append(args, filter.BeforeID)
@@ -182,4 +198,21 @@ func (s *Store) GetRequest(ctx context.Context, requestID string) (map[string]an
 	row := s.db.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM requests WHERE request_id = ?`, requestID)
 	_, item, err := scanRequestRow(row)
 	return item, err
+}
+
+// RequestOwner 返回一条请求记录的归属（key_id, group_id），供管理端做单条越界判定。
+//
+// 单条请求不能只靠列表裁剪：request_id 是外部可见的，能遍历就直接看到别人的
+// 记录。调用方拿到归属后自己决定 404 —— 用 404 而不是 403，否则等于确认
+// 「这个 ID 存在」。
+func (s *Store) RequestOwner(ctx context.Context, requestID string) (keyID, groupID int64, err error) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return 0, 0, fmt.Errorf("%w: request_id is required", ErrInvalidRequestQuery)
+	}
+	var key, group sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT key_id,group_id FROM requests WHERE request_id = ?`, requestID).Scan(&key, &group); err != nil {
+		return 0, 0, err
+	}
+	return key.Int64, group.Int64, nil
 }

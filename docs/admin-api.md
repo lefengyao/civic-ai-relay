@@ -1,8 +1,22 @@
 # Civic Relay API 参考
 
-> 与 `internal/httpapi/admin.go`、`public.go`、`server.go` 保持同步（2026-09-10 核对）。
+> 与 `internal/httpapi/admin.go`、`public.go`、`server.go` 保持同步（2026-11-01 核对）。
 
-所有管理接口挂在 `/admin/api/` 下，认证方式为请求头 `X-Admin-Key: <管理员密钥>`。公共转发接口挂在 `/v1/` 下，认证方式为 `Authorization: Bearer crk_...`。两种密钥不通用。
+所有管理接口挂在 `/admin/api/` 下，**没有任何匿名路径**：要么用管理员密钥（请求头 `X-Admin-Key: <管理员密钥>`，能读写一切），要么用分发出去的客户端密钥（`Authorization: Bearer crk_...`，只读且只能看到自己所属分组）。公共转发接口挂在 `/v1/` 下，同样用 `Authorization: Bearer crk_...`。
+
+控制台（`/admin/`）打开即是登录页，输入框自动判别两种密钥：`crk_` 开头按客户端密钥校验，其余按管理员密钥校验。登录探针是 `GET /admin/api/session`：成功返回 `{"admin":true}` 或 `{"admin":false,"scope":{"key_id":1,"group_id":2,"group_name":"福利"}}`；凭据缺失或无效返回 401。
+
+**密钥主体的可见范围**（写操作一律 404，跨组一律 404 而非 403 —— 组 ID 是自增整数，403 等于确认它存在）：
+
+| 路径 | 管理员 | 客户端密钥 |
+|---|---|---|
+| `overview` / `analytics` / `requests` | 全站，可按 `?group_id=N` 收窄 | 只有自己那一组；`requests` 只有自己那把密钥的行 |
+| `me` | 400 `not_applicable` | 自己这把密钥的用量、限额、有效期、可用模型数 |
+| `providers` / `models` | 全部 | 仅组内渠道（**不含 `base_url`**）与该组授权模型 |
+| `groups` / `groups/{id}` / `groups/{id}/overview` / `groups/health` | 全部 | 只有自己那一个组 |
+| `keys`、`keys/hints`、`config`、`plugins`、`providers/{id}/remote-models`、一切写操作 | 允许 | 404 |
+
+认证失败一律 401，码分四种：`authentication_required`（没带凭据或管理员密钥不对）、`invalid_api_key`（客户端密钥不存在或已停用）、`token_expired`（短时令牌已过期 —— 凭据没错，只是该换新令牌了，客户端不应把它当服务故障重试）、`console_login_not_supported`（用应用型 `app_...` 标识登录控制台；它的密钥创建时即丢弃，无可验证物）。
 
 错误统一返回 `{"error": {"message": "...", "type": "relay_error", "code": "...", "request_id": "..."}}`；`request_id` 同时出现在响应头 `X-Request-Id`，用于把客户端错误、流内错误和账本记录关联起来。服务端始终生成新的 request ID，客户端提供的 `X-Client-Request-Id`（兼容读取 `X-Request-Id`）只作为关联字段。认证失败一律 401，但码分三种：管理端是 `authentication_required`，公共接口是 `invalid_api_key`（令牌不存在或已停用）与 `token_expired`（短时令牌已过期 —— 凭据没错，只是该换新令牌了，客户端不应把它当服务故障重试）。所有列表字段在无数据时返回 `[]` 而非 `null`（含 `data`、`trend`、各组 `provider_ids`/`model_ids` 等），客户端无需额外判空。公共接口的请求体解析错误和上游错误会携带具体原因（`message = code: detail`）；服务层 `invalid_request` 和其他内部错误使用稳定提示，不回传底层错误正文。管理端的渠道建/改失败（`provider_invalid`）同样携带具体原因，并额外附 `code` 字段（`message` 带原因便于管理台直接展示，`code` 保持稳定便于程序匹配）。当进程 RSS 超过 `MEMORY_LIMIT_MB` 时，公共对话请求返回 503 `memory_limit_exceeded`，进行中的流式响应会被中止（按 aborted 结算）；管理接口不受内存保护影响。
 
@@ -27,7 +41,8 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/overview` | 账本概览 + 全局并发（active/limit）。返回 `{rpm{used,limit}, concurrency{active,limit}, last_hour{...}, trend[], recent[], model_calls[]}`。**v0.5.0 起不再含五个额度窗口**——额度按分组分配，全局视图没有可展示的限额（要看某组的额度与用量用 `/admin/api/groups/{id}/overview`）。 |
+| GET | `/admin/api/overview` | 账本概览 + 全局并发（active/limit）。返回 `{rpm{used,limit}, concurrency{active,limit}, last_hour{...}, trend[], recent[], model_calls[]}`。**v0.5.0 起不再含五个额度窗口**——额度按分组分配，全局视图没有可展示的限额。带 `?group_id=N` 时额外返回 `group`（与 `/admin/api/groups/{id}/overview` 同形状：四个窗口的已用/限额、本组 RPM、进行中、近一小时成功率）并把 `recent` 换成该组的最近请求；全局字段原样保留，两份数据语义不同，不能互相顶替。密钥主体调用时 `group` 恒为它自己那组，另带 `scope` 与 `me`，`recent` 只有自己那把密钥的行 |
+| GET | `/admin/api/me` | 仅客户端密钥主体：`{key_id, name, group_id, group_name, concurrency_limit, token_limit, amount_limit_microyuan, used_tokens, used_microyuan, requests, expires_at_utc, expires_in_secs, authorized_models}`。管理员调用返回 400 `not_applicable`（管理员没有「自己那把密钥」） |
 | GET | `/admin/api/config` | 读取运行配置（敏感项返回空字符串） |
 | PUT/POST | `/admin/api/config` | 保存配置；body `{"settings": {...}}`。`ADMIN_API_KEY`、`RELAY_ENCRYPTION_KEY` 传空串表示保持不变；保存后**原子写回 relay.env 并热应用到运行中的服务**（配额、输出上限、并发闸门、内存保护、`LOG_LEVEL`、监测与同步间隔都即时生效）；仅 `HOST`/`PORT`/`DB_PATH` 与四个 `UPSTREAM_*_TIMEOUT` 需要重启（超时在启动时按值交给上游 HTTP 客户端），见 `pending_restart_fields`。`LOG_LEVEL` 只接受 `DEBUG`/`INFO`/`WARN`/`ERROR`（大小写不敏感，另接受 `TRACE`/`WARNING`/`FATAL` 别名），写错返回 400 `invalid_config` |
 

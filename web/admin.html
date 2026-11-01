@@ -28,9 +28,12 @@ input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--a
 .btn-sm{padding:5px 12px;font-size:13px}
 
 /* ── 布局 ─────────────────────────── */
-#login-screen{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(28,36,51,.38);backdrop-filter:blur(2px);z-index:50}
+#login-screen{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:var(--bg);z-index:50}
 #login-screen.on{display:flex}
 body.readonly .admin-only{display:none!important}
+/* 密钥主体（客户端密钥登录）看得见请求日志，但看不到任何写入口；admin-only 已覆盖大部分，
+   这里再收掉只有管理员才该点的几个全局动作。 */
+body.mode-key #monitor-all,body.mode-key #monitor-state{display:none!important}
 .top-actions{display:flex;align-items:center;gap:8px}
 .login-card{background:#fff;border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);padding:40px 44px;width:360px;animation:rise .45s ease both}
 .login-card h1{margin:0 0 4px;font-size:22px}
@@ -79,6 +82,10 @@ main{flex:1;overflow-y:auto;padding:26px 32px 48px}
 .stat-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.quota-refresh{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:2px 7px;font-size:14px;line-height:1.2}.quota-refresh:hover{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}.quota-refresh:disabled{opacity:.55;cursor:wait}
 .stat .hint{font-size:12px;color:var(--muted);margin-top:4px}
 .quota-wide{grid-column:1/-1}
+/* 概览页一张卡片里要同时放 4 个窗口，全通栏会让页面拉得很长；改成两列。
+   分组弹窗（560px）里仍然按 .quota-wide 通栏，那里一列更好读。 */
+#stat-cards .quota-wide{grid-column:span 2}
+@media (max-width:1000px){#stat-cards .quota-wide{grid-column:1/-1}}
 .quota-metrics{display:flex;flex-wrap:wrap;gap:6px 40px;margin-top:6px}
 .quota-metric{display:flex;align-items:baseline;gap:8px;flex:1 1 260px;font-variant-numeric:tabular-nums;min-width:0}
 .quota-metric .qname{color:var(--muted);font-size:12px}
@@ -252,16 +259,15 @@ details .card{margin-bottom:0}
 </head>
 <body>
 
-<!-- 登录 -->
+<!-- 登录：没有任何匿名可见的数据，打开页面先认人 -->
 <div id="login-screen">
   <div class="login-card">
     <div class="logo">CR</div>
     <h1>Civic Relay</h1>
-    <p>输入管理员密钥查看完整信息并管理</p>
-    <input id="admin-key" type="password" placeholder="管理员密钥" autocomplete="current-password">
+    <p><b>管理员密钥</b>（adm_…）可管理全部配置；<b>客户端密钥</b>（crk_…）只能查看自己所属分组的用量。</p>
+    <input id="login-key" type="password" placeholder="管理员密钥或客户端密钥" autocomplete="current-password">
     <p id="login-error" class="login-error"></p>
     <button id="login-button" class="btn" style="width:100%">登录</button>
-    <button id="login-cancel" class="btn-ghost" style="width:100%;margin-top:8px">取消</button>
   </div>
 </div>
 
@@ -275,7 +281,7 @@ details .card{margin-bottom:0}
       <button data-view="providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><circle cx="6" cy="7.5" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="16.5" r="1" fill="currentColor" stroke="none"/></svg>供应商</button>
       <button data-view="groups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 8.5L10.5 15.5M16.5 8.5L13.5 15.5M9 6h6"/></svg>模型组</button>
       <button data-view="keys" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M11 12L21 2M17 6l3 3M14 9l2 2"/></svg>客户端 Key</button>
-      <button data-view="requests" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>请求日志</button>
+      <button data-view="requests"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>请求日志</button>
       <button data-view="plugins" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3v3a3 3 0 0 1-3 3H3v6h3a3 3 0 0 1 3 3v3h6v-3a3 3 0 0 1 3-3h3V9h-3a3 3 0 0 1-3-3V3H9Z"/></svg>WASM 插件</button>
       <button data-view="settings" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 008 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H2a2 2 0 110-4h.09A1.65 1.65 0 004.6 8a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V2a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>运行配置</button>
     </nav>
@@ -292,8 +298,13 @@ details .card{margin-bottom:0}
     </div>
     <!-- 概览 -->
     <section id="view-overview" class="view active">
+      <div class="card">
+        <div class="card-head"><h3>统计范围</h3><span class="sub" id="overview-scope-hint"></span></div>
+        <div id="overview-scope"></div>
+      </div>
       <div class="stats" id="stat-cards"></div>
-      <div class="card"><h3>最近请求</h3><div id="overview-recent"></div></div>
+      <div class="card" id="me-card" hidden></div>
+      <div class="card"><h3 id="overview-recent-title">最近请求</h3><div id="overview-recent"></div></div>
     </section>
 
     <section id="view-analytics" class="view">
@@ -306,6 +317,7 @@ details .card{margin-bottom:0}
           <div class="field"><label for="analytics-bucket">时间粒度</label><select name="bucket" id="analytics-bucket"><option value="day">按天</option><option value="hour">按小时</option></select></div>
           <div class="field"><label for="analytics-metric">统计指标</label><select name="metric" id="analytics-metric"><option value="requests">请求次数</option><option value="amount">消费金额</option><option value="tokens">Token 用量</option></select></div>
           <div class="field"><label for="analytics-status">请求状态</label><select name="status" id="analytics-status"><option value="all">全部状态</option><option value="completed">成功</option><option value="failed">失败</option><option value="aborted">中止</option><option value="rejected">拒绝</option><option value="reserved">进行中</option></select></div>
+          <div class="field admin-only" id="analytics-group-field"><label for="analytics-group">分组</label><select id="analytics-group" name="group_id"><option value="">全部分组</option></select></div>
           <div class="field analytics-model-picker" id="analytics-model-picker"><label id="analytics-model-label">模型</label><button type="button" class="analytics-model-trigger" id="analytics-model-trigger" aria-labelledby="analytics-model-label analytics-model-summary" aria-haspopup="listbox" aria-expanded="false"><span id="analytics-model-summary">全部模型</span><span aria-hidden="true">▾</span></button><div class="analytics-model-menu" id="analytics-model-menu" role="listbox" aria-labelledby="analytics-model-label" aria-multiselectable="true" hidden></div></div>
           <div class="field"><label for="analytics-chart-type">趋势样式</label><select id="analytics-chart-type" aria-label="趋势图类型"><option value="line">曲线</option><option value="stacked">状态堆叠</option></select></div>
           <button class="btn btn-sm" type="submit">查询</button>
@@ -456,9 +468,17 @@ details .card{margin-bottom:0}
 
 <script>
 "use strict";
-let adminKey = localStorage.getItem("cr_admin_key") || sessionStorage.getItem("cr_admin_key") || "";
+/* ── 凭据 ──
+   两种主体互斥，只存一个：
+     admin → X-Admin-Key（管理员密钥，能改一切）
+     key   → Authorization: Bearer crk_…（分发出去的客户端密钥，只读且只看得见自己那组）
+   没有任何匿名视图：没凭据就停在登录页。 */
+const ADMIN_STORE = "cr_admin_key", CLIENT_STORE = "cr_client_key";
+let credential = localStorage.getItem(ADMIN_STORE) || localStorage.getItem(CLIENT_STORE) || "";
+let authMode = localStorage.getItem(ADMIN_STORE) ? "admin" : (localStorage.getItem(CLIENT_STORE) ? "key" : "");
 let isAdmin = false;
-if (adminKey) localStorage.setItem("cr_admin_key", adminKey);
+let scope = null; // 管理员为 {admin:true}；密钥主体为 {key_id, group_id, group_name}
+let currentView = "overview";
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtYuan = micro => micro == null ? "—" : "¥" + (micro / 1e6).toFixed(micro % 1e6 === 0 ? 2 : 6).replace(/\.?0+$/, m => m.length > 3 ? m : "");
@@ -474,11 +494,27 @@ function toast(msg, type = "") {
   setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 260); }, type === "err" ? 6000 : 2600);
 }
 
+function authHeaders() {
+  if (!credential) return {};
+  return authMode === "key" ? { "Authorization": "Bearer " + credential } : { "X-Admin-Key": credential };
+}
+function saveCredential(mode, value) {
+  credential = value; authMode = mode;
+  localStorage.removeItem(ADMIN_STORE); localStorage.removeItem(CLIENT_STORE);
+  if (mode === "admin") localStorage.setItem(ADMIN_STORE, value);
+  else localStorage.setItem(CLIENT_STORE, value);
+}
+function clearCredential() {
+  credential = ""; authMode = ""; isAdmin = false; scope = null;
+  localStorage.removeItem(ADMIN_STORE); localStorage.removeItem(CLIENT_STORE);
+  sessionStorage.removeItem(ADMIN_STORE); sessionStorage.removeItem(CLIENT_STORE);
+}
+
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  headers.set("X-Admin-Key", adminKey);
+  for (const [k, v] of Object.entries(authHeaders())) headers.set(k, v);
   const r = await fetch(path, { ...options, headers });
-  if (r.status === 401) { if (isAdmin) logout(); throw new Error("认证失败"); }
+  if (r.status === 401) { logout("登录已失效，请重新登录"); throw new Error("认证失败"); }
   return r;
 }
 async function apiJSON(path, options) {
@@ -488,32 +524,27 @@ async function apiJSON(path, options) {
   return body;
 }
 
-/* 公开只读视图：概览、用量分析、供应商、模型组。其余入口只对管理员显示。 */
-const PUBLIC_VIEWS = new Set(["overview", "analytics", "providers", "groups"]);
-
 function applyAuth() {
   document.body.classList.toggle("readonly", !isAdmin);
+  document.body.classList.toggle("mode-key", authMode === "key");
   const btn = $("auth-btn");
-  btn.textContent = isAdmin ? "退出登录" : "登录";
-  btn.title = isAdmin ? "当前为管理员模式" : "输入管理员密钥查看完整信息并编辑";
-  btn.onclick = isAdmin ? logout : openLogin;
+  btn.textContent = scope ? "退出登录" : "登录";
+  btn.title = isAdmin ? "当前为管理员" : scope ? "当前为客户端密钥（只读，仅本分组）" : "";
+  btn.onclick = scope ? () => logout() : openLogin;
 }
 function openLogin() {
   $("login-error").textContent = "";
+  $("shell").classList.remove("on");
   $("login-screen").classList.add("on");
-  setTimeout(() => $("admin-key").focus(), 30);
+  setTimeout(() => $("login-key").focus(), 30);
 }
-function closeLogin() {
-  $("login-screen").classList.remove("on");
-  $("admin-key").value = "";
-}
-function logout() {
-  adminKey = ""; isAdmin = false;
-  localStorage.removeItem("cr_admin_key"); sessionStorage.removeItem("cr_admin_key");
+function logout(message) {
+  clearCredential();
+  resetCaches();
   applyAuth();
-  if (!PUBLIC_VIEWS.has(currentView)) showView("overview");
-  else refreshView(currentView);
-  toast("已退出管理员", "ok");
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  openLogin();
+  if (message) toast(message, "err");
 }
 function showView(view) {
   currentView = view;
@@ -528,33 +559,50 @@ function setSvc(ok, text) {
 
 /* ── 状态缓存 ── */
 const cache = { providers: [], models: [], groups: [], keys: [], groupHealth: {} };
+/* 换主体时必须清掉缓存：管理员登出后换客户端密钥登录，如果沿用上一轮的分组列表，
+   概览里的分组下拉会把别的组也列出来（后端虽然会 404，前端已经泄露了组名）。 */
+function resetCaches() {
+  cache.providers = []; cache.models = []; cache.groups = []; cache.keys = []; cache.groupHealth = {};
+  Object.keys(cache).forEach(k => { if (Array.isArray(cache[k])) cache[k].length = 0; else cache[k] = {}; });
+}
 
-/* ── 登录：右上角按钮唤起，校验通过后解锁全部视图与编辑按钮 ── */
+/* ── 登录：输入框自动判别主体（crk_ → 客户端密钥，其余 → 管理员密钥） ── */
+const AUTH_ERROR_TEXT = {
+  token_expired: "令牌已过期，请联系管理员续期",
+  invalid_api_key: "密钥无效或已停用",
+  console_login_not_supported: "应用型凭据（app_…）没有可验证的密钥，无法登录控制台",
+  authentication_required: "密钥不正确",
+};
 async function login() {
-  const candidate = $("admin-key").value.trim();
+  const candidate = $("login-key").value.trim();
   $("login-error").textContent = "";
-  if (!candidate) { $("login-error").textContent = "请输入管理员密钥"; return; }
+  if (!candidate) { $("login-error").textContent = "请输入密钥"; return; }
+  const mode = candidate.startsWith("crk_") ? "key" : "admin";
+  const headers = mode === "key" ? { "Authorization": "Bearer " + candidate } : { "X-Admin-Key": candidate };
   try {
-    const r = await fetch("/admin/api/session", { headers: { "X-Admin-Key": candidate } });
-    if (!r.ok) throw new Error("请求失败 (" + r.status + ")");
-    const body = await r.json();
-    if (!body.admin) { $("login-error").textContent = "管理员密钥无效"; return; }
-    adminKey = candidate; isAdmin = true;
-    localStorage.setItem("cr_admin_key", adminKey);
+    const r = await fetch("/admin/api/session", { headers });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      $("login-error").textContent = AUTH_ERROR_TEXT[body?.error?.code] || ("登录失败（" + r.status + "）");
+      return;
+    }
+    saveCredential(mode, candidate);
+    resetCaches();
+    isAdmin = !!body.admin;
+    scope = isAdmin ? { admin: true } : (body.scope || {});
     applyAuth();
+    $("login-key").value = "";
     $("login-screen").classList.remove("on");
-    $("admin-key").value = "";
+    $("shell").classList.add("on");
     setSvc(true, "服务正常");
-    toast("已登录管理员", "ok");
-    await refreshView(currentView);
+    showView("overview");
+    toast(isAdmin ? "已登录管理员" : (scope.group_name ? `已登录：分组「${scope.group_name}」` : "已登录：该密钥未绑定分组"), "ok");
   } catch (e) {
     $("login-error").textContent = "无法连接服务：" + e.message;
   }
 }
 $("login-button").onclick = login;
-$("admin-key").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
-$("login-cancel").onclick = closeLogin;
-$("login-screen").addEventListener("click", e => { if (e.target.id === "login-screen") closeLogin(); });
+$("login-key").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
 
 /* ── 视图切换 ── */
 const titles = {
@@ -567,12 +615,12 @@ const titles = {
   plugins: ["WASM 插件", "安装、启停和审计外部插件包"],
   settings: ["运行配置", "查看与修改运行参数"],
 };
-let currentView = "overview";
 const loaders = {
   overview: loadOverview, analytics: loadAnalytics, providers: loadProviders,
   groups: loadGroups, keys: loadKeys, requests: loadRequests, plugins: loadPlugins, settings: loadConfig,
 };
 async function refreshView(v) {
+  if (!scope) return; // 未登录：停在登录页，不去打接口
   $("page-title").textContent = titles[v][0];
   $("page-sub").textContent = titles[v][1];
   try { await loaders[v](); } catch (e) { if (e.message !== "认证失败") toast(e.message, "err"); }
@@ -625,20 +673,86 @@ function quotaCard(label, hint, w, scope) {
     (tokenLimit > 0 || amountLimit > 0 ? `<div class="bar"><i class="${cls}" style="width:${Math.min(pct, 100).toFixed(1)}%"></i></div>` : "") +
     `</div>`;
 }
+/* 概览：全站数据始终保留，另可用「统计范围」切到某个分组。
+   额度是「每个模型组一份」，所以只有选中分组（或是密钥主体登录）时才有额度卡片；
+   全站视角硬塞一份「不限」的额度卡片等于撒谎，所以那里不渲染。 */
+async function ensureGroups() {
+  try { if (!cache.groups.length) cache.groups = (await apiJSON("/admin/api/groups")).data || []; } catch {}
+}
+function renderOverviewScope(d) {
+  const box = $("overview-scope"), hint = $("overview-scope-hint");
+  if (isAdmin) {
+    const current = $("overview-group") ? $("overview-group").value : "";
+    box.innerHTML = `<select id="overview-group" style="max-width:320px" aria-label="统计范围">` +
+      `<option value="">全部分组（全站数据）</option>` +
+      cache.groups.map(g => `<option value="${g.ID}"${String(g.ID) === current ? " selected" : ""}>${esc(g.Name)}${g.Enabled ? "" : "（已停用）"}</option>`).join("") +
+      `</select>`;
+    $("overview-group").onchange = () => loadOverview().catch(e => toast(e.message, "err"));
+    hint.textContent = "全站数据始终保留；选一个分组改看该组的额度与用量";
+  } else {
+    const name = d.scope && d.scope.group_name;
+    box.innerHTML = name
+      ? `<div><b>${esc(name)}</b> <span class="tag">只读</span></div>`
+      : `<div class="empty" style="padding:4px 0">该密钥未绑定分组，暂时没有可查看的数据</div>`;
+    hint.textContent = "客户端密钥只能查看自己所属分组";
+  }
+}
+function renderMyUsage(me) {
+  const card = $("me-card");
+  if (!me) { card.hidden = true; card.innerHTML = ""; return; }
+  card.hidden = false;
+  const pct = (used, limit) => limit > 0 ? used / limit * 100 : null;
+  const expiry = me.expires_at_utc
+    ? `${fmtTime(me.expires_at_utc)}`
+    : "永久有效";
+  const expiryHint = me.expires_in_secs != null
+    ? `剩余 ${(me.expires_in_secs / 3600).toFixed(1)} 小时，到期后需联系管理员续期`
+    : "不会自动失效";
+  card.innerHTML = `<div class="card-head"><h3>我的用量（这把密钥）</h3><span class="sub">${esc(me.name || "")}</span></div>` +
+    `<div class="stats" style="margin:0">` +
+    statCard("累计 Token", fmtNum(me.used_tokens), me.token_limit ? `总量限额 ${fmtNum(me.token_limit)}` : "总量不限", pct(me.used_tokens, me.token_limit)) +
+    statCard("累计金额", fmtYuan(me.used_microyuan), me.amount_limit_microyuan ? `总量限额 ${fmtYuan(me.amount_limit_microyuan)}` : "总量不限", pct(me.used_microyuan, me.amount_limit_microyuan)) +
+    statCard("请求数", fmtNum(me.requests), "含进行中的预留", null) +
+    statCard("并发 / 可用模型", `${fmtNum(me.concurrency_limit)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(me.authorized_models)} 个模型</span>`, "超过并发会排队等待", null) +
+    statCard("有效期", esc(expiry), esc(expiryHint), null) +
+    `</div>`;
+}
 async function loadOverview() {
-  const d = await apiJSON("/admin/api/overview");
+  const picked = isAdmin && $("overview-group") ? $("overview-group").value : "";
+  const d = await apiJSON("/admin/api/overview" + (picked ? "?group_id=" + encodeURIComponent(picked) : ""));
+  await ensureGroups();
   ensureNameCaches();
   setSvc(true, "服务正常");
-  const rpmPct = d.rpm.limit ? d.rpm.used / d.rpm.limit * 100 : 0;
-  const lh = d.last_hour || {};
-  const errPct = Math.round((lh.error_rate || 0) * 100);
-  const conc = d.concurrency || { active: 0, limit: "—" };
-  // 额度卡片已从这里移除：限额是「每个模型组一份」，全局概览没有可展示的限额，
-  // 硬渲染只会显示「不限」——那是在撒谎。按组的用量与限额在分组概览里看。
-  $("stat-cards").innerHTML =
-    statCard("RPM（每分钟请求）", `${fmtNum(d.rpm.used)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(d.rpm.limit)}</span>`, "全局滚动一分钟", rpmPct) +
-    statCard("并发", `${fmtNum(conc.active)} <span style="font-size:13px;color:var(--muted)">/ ${esc(conc.limit)}</span>`, "当前进行中的请求", null) +
-    statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null);
+  renderOverviewScope(d);
+  const g = d.group || null;
+  if (!isAdmin && !g) {
+    // 密钥未绑分组：没有可统计的范围，也没有额度可说——明确讲清楚比显示一片 0 强。
+    $("stat-cards").innerHTML = `<div class="empty">该密钥未绑定分组，暂时没有可查看的数据。请联系管理员把密钥绑定到模型组。</div>`;
+    $("overview-recent-title").textContent = "最近请求";
+  } else if (g) {
+    const lh = g.last_hour || {};
+    const errPct = Math.round((lh.error_rate || 0) * 100);
+    $("stat-cards").innerHTML =
+      statCard("RPM（每分钟请求）", fmtNum(g.rpm.used), "归属本组的请求，滚动一分钟", null) +
+      quotaCard("5 小时额度", "滚动 5 小时，含进行中请求的预留", g.five_hour, "five-hour") +
+      quotaCard("当日额度", "北京时间自然日，含进行中请求的预留", g.daily, "daily") +
+      quotaCard((g.period && g.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (g.period && g.period.active) ? `至 ${fmtTime(g.period.end_utc)}；用满或到期后切换周限额` : ((g.period && g.period.transition_utc) ? `已切换周限额：${fmtTime(g.period.transition_utc)}` : "未启用"), g.period) +
+      quotaCard((g.weekly && g.weekly.active === false) ? "本周额度（等待周期结束）" : "本周额度", (g.weekly && g.weekly.active === false) ? "周期期间不计入周限额" : "北京时间自然周（周一起），含进行中请求的预留", g.weekly, "weekly") +
+      statCard("进行中请求", fmtNum(g.active), "状态为进行中的请求", null) +
+      statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null);
+    $("overview-recent-title").textContent = `最近请求（${g.group_name || "本组"}）`;
+  } else {
+    const rpmPct = d.rpm.limit ? d.rpm.used / d.rpm.limit * 100 : 0;
+    const lh = d.last_hour || {};
+    const errPct = Math.round((lh.error_rate || 0) * 100);
+    const conc = d.concurrency || { active: 0, limit: "—" };
+    $("stat-cards").innerHTML =
+      statCard("RPM（每分钟请求）", `${fmtNum(d.rpm.used)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(d.rpm.limit)}</span>`, "全站滚动一分钟", rpmPct) +
+      statCard("并发", `${fmtNum(conc.active)} <span style="font-size:13px;color:var(--muted)">/ ${esc(conc.limit)}</span>`, "当前进行中的请求", null) +
+      statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null);
+    $("overview-recent-title").textContent = "最近请求（全站）";
+  }
+  renderMyUsage(isAdmin ? null : d.me);
   renderRequests(d.recent || [], "overview-recent");
 }
 const modelChartColors = ["#087e8b", "#ed6a5a", "#5b8e7d", "#f2a541", "#5c6bc0", "#8f5d8f", "#65a765", "#d1495d", "#4f86c6", "#9c755f"];
@@ -807,14 +921,32 @@ $("analytics-model-trigger").addEventListener("keydown", event => {
     event.currentTarget.setAttribute("aria-expanded", "false");
   }
 });
+/* 用量分析的分组筛选：管理员可切视角，密钥主体由服务端锁定在自己那组，
+   选择器直接隐藏（仍显示「分组」会让用户以为可以切换）。 */
+function renderAnalyticsGroupPicker() {
+  const field = $("analytics-group-field"), sel = $("analytics-group");
+  if (!isAdmin) { field.hidden = true; return; }
+  field.hidden = false;
+  const current = sel.value;
+  sel.innerHTML = `<option value="">全部分组</option>` +
+    cache.groups.map(g => `<option value="${g.ID}">${esc(g.Name)}${g.Enabled ? "" : "（已停用）"}</option>`).join("");
+  sel.value = cache.groups.some(g => String(g.ID) === current) ? current : "";
+  sel.onchange = () => loadAnalytics().catch(e => toast(e.message, "err"));
+}
 async function loadAnalytics() {
   try { if (!cache.models.length) await ensureModels(); } catch {}
+  await ensureGroups();
   renderAnalyticsModelPicker();
+  renderAnalyticsGroupPicker();
   const filters = new FormData($("analytics-filters"));
   const params = new URLSearchParams();
-  for (const [name, value] of filters.entries()) if (name !== "model_id") params.append(name, value);
+  // group_id 由主体决定，不走表单：密钥主体若把为空的分组传给服务端没有意义，
+  // 而管理员的选择必须显式带上。
+  for (const [name, value] of filters.entries()) if (name !== "model_id" && name !== "group_id") params.append(name, value);
+  if (isAdmin && $("analytics-group").value) params.set("group_id", $("analytics-group").value);
   for (const id of selectedAnalyticsModelIDs) params.append("model_id", id);
-  renderAnalytics(await apiJSON(`/admin/api/analytics?${params}`));
+  const data = await apiJSON(`/admin/api/analytics?${params}`);
+  renderAnalytics(data);
 }
 $("analytics-filters").addEventListener("submit", event => { event.preventDefault(); loadAnalytics().catch(error => toast(error.message, "err")); });
 $("analytics-chart-type").addEventListener("change", () => { if (lastAnalyticsData) renderAnalytics(lastAnalyticsData); });
@@ -1857,22 +1989,29 @@ $("save-config").onclick = async () => {
   } catch (e) { toast(e.message, "err"); }
 };
 
-/* ── 启动：默认公开只读；记住的密钥静默校验，通过则直接进入管理员模式 ── */
+/* ── 启动：没有凭据就停在登录页；记住的凭据静默校验，通过才把主界面放出来 ── */
 (async function boot() {
-  $("shell").classList.add("on");
   applyAuth();
-  if (adminKey) {
-    try {
-      const r = await fetch("/admin/api/session", { headers: { "X-Admin-Key": adminKey } });
-      const body = r.ok ? await r.json() : {};
+  if (!credential) { openLogin(); return; }
+  let ok = false;
+  try {
+    const r = await fetch("/admin/api/session", { headers: authHeaders() });
+    if (r.ok) {
+      const body = await r.json();
       isAdmin = !!body.admin;
-    } catch { isAdmin = false; }
-    if (!isAdmin) {
-      adminKey = "";
-      localStorage.removeItem("cr_admin_key"); sessionStorage.removeItem("cr_admin_key");
+      scope = isAdmin ? { admin: true } : (body.scope || {});
+      ok = true;
     }
+  } catch { ok = false; }
+  if (!ok) {
+    clearCredential();
     applyAuth();
+    openLogin();
+    return;
   }
+  applyAuth();
+  $("login-screen").classList.remove("on");
+  $("shell").classList.add("on");
   await refreshView(currentView);
 })();
 </script>

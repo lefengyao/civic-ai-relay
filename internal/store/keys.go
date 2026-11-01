@@ -304,6 +304,23 @@ func (s *Store) KeyUsage(ctx context.Context) (map[int64]KeyUsageStat, error) {
 	return out, rows.Err()
 }
 
+// KeyUsageByID 只统计一把密钥的用量。控制台的密钥主体每次打开概览都要读它，
+// 复用 KeyUsage（全表 GROUP BY）在大账目上会变成一次全表扫描。
+func (s *Store) KeyUsageByID(ctx context.Context, keyID int64) (KeyUsageStat, error) {
+	if keyID <= 0 {
+		return KeyUsageStat{}, errors.New("key ID is required")
+	}
+	var stat KeyUsageStat
+	err := s.db.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(charged_tokens+reserved_tokens),0),
+		COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0),
+		COUNT(*)
+		FROM key_reservations
+		WHERE key_id=? AND status IN ('reserved','completed','failed','aborted')`, keyID).
+		Scan(&stat.Tokens, &stat.AmountMicroyuan, &stat.Requests)
+	return stat, err
+}
+
 // AuthenticateClientKey resolves a plaintext client token to its redacted
 // database record. The token is compared only through its keyed digest.
 //

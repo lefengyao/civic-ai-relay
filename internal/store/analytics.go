@@ -94,6 +94,10 @@ func (s *Store) Analytics(ctx context.Context, now time.Time, filter AnalyticsFi
 	}
 	where := `r.created_at_utc>=? AND r.created_at_utc<=?`
 	args := []any{fromText, toText}
+	if filter.GroupID > 0 {
+		where += ` AND r.group_id=?`
+		args = append(args, filter.GroupID)
+	}
 	if len(modelIDs) > 0 {
 		where += ` AND r.model_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(modelIDs)), ",") + `)`
 		for _, id := range modelIDs {
@@ -193,6 +197,10 @@ func (s *Store) Analytics(ctx context.Context, now time.Time, filter AnalyticsFi
 
 	modelWhere := `r.created_at_utc>=? AND r.created_at_utc<=?`
 	modelArgs := []any{fromText, toText}
+	if filter.GroupID > 0 {
+		modelWhere += ` AND r.group_id=?`
+		modelArgs = append(modelArgs, filter.GroupID)
+	}
 	if filter.Status != "" && filter.Status != "all" {
 		modelWhere += ` AND r.status=?`
 		modelArgs = append(modelArgs, filter.Status)
