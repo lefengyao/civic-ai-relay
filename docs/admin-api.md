@@ -27,7 +27,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/overview` | 账本概览 + 全局并发（active/limit）。返回 `{rpm{used,limit}, five_hour{used_tokens,limit,used_microyuan,amount_limit}, daily{...}, period{used_tokens,limit,used_microyuan,amount_limit,active,start_utc,end_utc}, weekly{used_tokens,limit,used_microyuan,amount_limit,active,from_utc}, concurrency{active,limit}, last_hour{...}, trend[], recent[]}`；窗口均为「已用 / 限额」，含未结算预留；限额为 `0` 即**不限**（前端显示为「不限」）。周期 active 时周限额暂停，from_utc 记录恢复统计的时间。 |
+| GET | `/admin/api/overview` | 账本概览 + 全局并发（active/limit）。返回 `{rpm{used,limit}, concurrency{active,limit}, last_hour{...}, trend[], recent[], model_calls[]}`。**v0.5.0 起不再含五个额度窗口**——额度按分组分配，全局视图没有可展示的限额（要看某组的额度与用量用 `/admin/api/groups/{id}/overview`）。 |
 | GET | `/admin/api/config` | 读取运行配置（敏感项返回空字符串） |
 | PUT/POST | `/admin/api/config` | 保存配置；body `{"settings": {...}}`。`ADMIN_API_KEY`、`RELAY_ENCRYPTION_KEY` 传空串表示保持不变；保存后**原子写回 relay.env 并热应用到运行中的服务**（配额、输出上限、并发闸门、内存保护、`LOG_LEVEL`、监测与同步间隔都即时生效）；仅 `HOST`/`PORT`/`DB_PATH` 与四个 `UPSTREAM_*_TIMEOUT` 需要重启（超时在启动时按值交给上游 HTTP 客户端），见 `pending_restart_fields`。`LOG_LEVEL` 只接受 `DEBUG`/`INFO`/`WARN`/`ERROR`（大小写不敏感，另接受 `TRACE`/`WARNING`/`FATAL` 别名），写错返回 400 `invalid_config` |
 
@@ -72,14 +72,22 @@
 
 ### 额度模型与错误码
 
-六个固定额度维度：`5 小时`（滚动窗口）、`当日`（北京时间自然日）、`本周`（北京时间自然周，周一起）× `Token` / `金额`；另有可选的自定义周期 Token/金额额度。
-配置项为 `TOKEN_LIMIT_5H` / `TOKEN_LIMIT_DAILY` / `TOKEN_LIMIT_WEEKLY` 与
-`AMOUNT_LIMIT_5H` / `AMOUNT_LIMIT_DAILY` / `AMOUNT_LIMIT_WEEKLY`（金额单位是**元**，可带小数如 `12.5`，内部换算成微元存储）。
+**额度按分组分配**（v0.5.0 起，取代原来的全局配置项）。每个模型组有 4 个窗口 × `Token` / `金额` 共 9 个可填项（加上周期长度与周期起点共 10 列）：
 
-自定义周期使用 `PERIOD_LIMIT_DAYS`、`PERIOD_LIMIT_START`、`TOKEN_LIMIT_PERIOD` 和 `AMOUNT_LIMIT_PERIOD`。周期天数大于 0 时，若开始时间为空则从保存配置时开始。周期有效期间不统计/拦截周限额；周期 Token 或金额任一用满，或到达周期截止日后，后续请求切换到周限额。周期内最后一笔请求仍只计入周期，周限额从交接时刻之后开始累计。管理台的「+1 天」「+7 天」按钮用于延长进行中的周期；周期已结束时从当前时刻新开周期。
+| 窗口 | 字段 | 说明 |
+|---|---|---|
+| 5 小时 | `token_limit_5h` / `amount_limit_5h` | **滚动** 5 小时 |
+| 当日 | `token_limit_daily` / `amount_limit_daily` | **北京时间自然日** |
+| 本周 | `token_limit_weekly` / `amount_limit_weekly` | **北京时间自然周（周一起）** |
+| 自定义周期 | `period_limit_days` + `token_limit_period` / `amount_limit_period` | 天数 + 起点；金额单位是**元**，内部换算成微元（`*_microyuan` 列） |
+
+判定时读的是**该请求密钥所属分组**的那一行，在预留事务内读取，所以改完下一次请求即生效。
+
+自定义周期需要**同时**设置 `period_limit_days` 与至少一项周期限额才生效（只填天数不起作用）。`period_limit_start` 为空时，设置天数的那一刻自动填 `now`。周期有效期间不统计/拦截周限额；周期 Token 或金额任一用满，或到达周期截止日后，后续请求切换到周限额——周期内最后一笔请求仍只计入周期，周限额从**交接时刻之后**开始累计。
+
 另有两项不随窗口轮换的 Key 总额度：`token_limit`、`amount_limit_microyuan`。
 
-**任何一项填 `0` 或留空都表示不限**，出厂默认全部不限。
+**任何一项填 `0` 或留空都表示不限**，出厂默认所有分组都不限。
 
 **判定口径 = 先欠费后停服**：只检查「该窗口是否已用满」，不再要求「已用 + 本次预留 ≤ 限额」。
 只要窗口还有余量就放行（本次请求可能让它略微超出），用到限额之后才拒绝后续请求。
@@ -89,17 +97,17 @@
 
 | `error.code` | 含义 |
 |---|---|
-| `token_quota_exceeded` | 某个全局 Token 窗口已用满，`error.message` 写明是 5 小时 / 当日 / 本周 |
-| `amount_quota_exceeded` | 某个全局金额窗口已用满 |
+| `token_quota_exceeded` | 所属分组的某个 Token 窗口已用满 |
+| `amount_quota_exceeded` | 所属分组的某个金额窗口已用满 |
 | `key_token_quota_exceeded` | Key 的 Token 总额度已用满 |
 | `key_amount_quota_exceeded` | Key 的金额总额度已用满 |
 | `rpm_exceeded` | 超过 `RPM_LIMIT`（滚动一分钟） |
 | `rate_limit_exceeded` | 全局并发或 Key 并发达到上限 |
 
-`error.message` 形如：
+`error.message` 形如（`error.detail` 还会带上**分组名与 ID**，一眼看出是哪一组的额度咬住了）：
 
 ```
-token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，限额 5,000,000）。当前处于欠费状态，请等待窗口轮换或在管理台调大限额
+token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，限额 5,000,000，分组「团队A」#3）。当前处于欠费状态，请等待窗口轮换或在管理台调大限额
 ```
 
 > 额度用满**不会**停用 Key。Key 停用只能手动操作；停用后公共接口返回 401 `invalid_api_key`。
@@ -156,13 +164,13 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/groups` | 列表（含 rate_milli） |
-| POST | `/admin/api/groups` | 创建；body `{name, rate?, rate_milli?, provider_ids?}` |
-| PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` |
-| DELETE | `/admin/api/groups/{id}` | 删除；重复删除返回 404 |
+| GET | `/admin/api/groups` | 列表。每项含 `ID/Name/Enabled/RateMilli`、`BoundKeys`（绑定到该组的密钥数）、10 个额度字段（`TokenLimit5H` … `PeriodLimitStart`）以及 `TensionPct` / `Overdrawn`（三个主窗口中最高用量占比按 Token 计；`Overdrawn=true` 表示至少一个窗口已用满）。 |
+| POST | `/admin/api/groups` | 创建；body `{name, rate?, rate_milli?, provider_ids?}`。**创建不带额度字段**，额度创建后在 PUT 里设 |
+| PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` + 9 个额度字段（`token_limit_5h`/`amount_limit_5h`/`token_limit_daily`/`amount_limit_daily`/`token_limit_weekly`/`amount_limit_weekly`/`period_limit_days`/`token_limit_period`/`amount_limit_period`）与 `period_limit_start`。**缺省 = 保持原值**，`0` = 不限，负数 400（`group_invalid`）。`period_limit_days > 0` 且起点为空时自动填 `now`；天数归零会清掉起点 |
+| DELETE | `/admin/api/groups/{id}` | 删除；返回 `{"ok": true, "unbound_keys": N}`（N = 刚才被解绑的密钥数，解绑后它们立即无法调用任何模型）；重复删除返回 404 |
 | GET | `/admin/api/groups/{id}/providers` | 组内渠道 ID 列表 |
 | PUT | `/admin/api/groups/{id}/providers` | **整体替换**组内渠道；body `{"provider_ids": [...]}`；拒绝停用渠道 |
-| GET | `/admin/api/groups/{id}/overview` | **分组概览**：仅统计走组内渠道的请求。返回 `{rpm.used, five_hour{used_tokens,used_microyuan}, daily{used_tokens,used_microyuan}, weekly{used_tokens,used_microyuan}, last_hour{completed,failed,aborted,rejected,reserved,error_rate}, active, generated_at_utc, group_id}`；令牌/金额含未结算预留；限额为全局配置，分组不设限额 |
+| GET | `/admin/api/groups/{id}/overview` | **分组概览**：仅统计**归属本组**的请求（按账目行上的 `group_id`，与额度扣减同口径；切换分组不搬历史）。返回 `{group_id, group_name, rpm{used,limit}, five_hour/daily/weekly/period{used_tokens,used_microyuan,limit,amount_limit}, weekly{active,from_utc}, period{active,start_utc,end_utc,transition_utc}, last_hour{...}, active, generated_at_utc}`；令牌/金额含未结算预留，`limit`/`amount_limit` 取自本组额度行（0 = 不限） |
 | GET | `/admin/api/groups/health` | **分组可用性**：每个分组最近一轮监测结果（键为分组 ID 字符串）+ `{monitor_enabled, monitor_interval, monitor_interval_ms}`。⚠️ 该路径必须排在 `groups/{id}` 之前匹配，其第一段不是数字 ID |
 | POST | `/admin/api/groups/monitor` | **立即检测全部分组**，不等定时轮询。返回 `{"monitored": N}` |
 | GET | `/admin/api/groups/{id}/monitor` | 该分组最近 50 轮监测结果，最新在前 |
