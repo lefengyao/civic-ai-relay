@@ -22,8 +22,8 @@ func setupGroupScope(t *testing.T) (*Store, int64, int64) {
 	return repo, provider.ID, model.ID
 }
 
-// 未绑分组的密钥没有可授权的模型，预留必须被拒——与旧版「无 key_groups 行 →
-// 计价查询空」走同一个错误出口。
+// 未绑分组的密钥没有可授权的模型，预留必须被拒——沿用计价查询的
+// not-authorized 出口，但给出可诊断的错误消息而不是裸的 ErrNoRows。
 func TestReserveRejectsUnboundKey(t *testing.T) {
 	repo, _, modelID := setupGroupScope(t)
 	key, err := repo.CreateClientKey(context.Background(), NewClientKey{Name: "k", ConcurrencyLimit: 1})
@@ -82,6 +82,14 @@ func TestSwitchingGroupDoesNotMoveHistory(t *testing.T) {
 	if stillA != 1 {
 		t.Fatalf("切换分组搬动了历史：A 组行数变成 %d", stillA)
 	}
+	// requests 表同样记录请求发生时的归属
+	var reqGroupA int64
+	if err := repo.db.QueryRow(`SELECT group_id FROM requests WHERE request_id='in-a'`).Scan(&reqGroupA); err != nil {
+		t.Fatal(err)
+	}
+	if reqGroupA != groupA.ID {
+		t.Fatalf("requests.group_id = %d, want %d", reqGroupA, groupA.ID)
+	}
 	// 新请求记到新组
 	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "in-b", 600)); err != nil {
 		t.Fatal(err)
@@ -92,6 +100,13 @@ func TestSwitchingGroupDoesNotMoveHistory(t *testing.T) {
 	}
 	if inB != 1 {
 		t.Fatalf("B 组预留数 = %d", inB)
+	}
+	var reqGroupB int64
+	if err := repo.db.QueryRow(`SELECT group_id FROM requests WHERE request_id='in-b'`).Scan(&reqGroupB); err != nil {
+		t.Fatal(err)
+	}
+	if reqGroupB != groupB.ID {
+		t.Fatalf("requests.group_id after switch = %d, want %d", reqGroupB, groupB.ID)
 	}
 }
 

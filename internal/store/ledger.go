@@ -82,6 +82,10 @@ type RequestReservation struct {
 
 // ReserveInput 描述一次预扣所需的输入规模信息。字符串字段只参与预估，
 // 不会落库。
+//
+// ProviderID 只作「请求派发渠道」的记录落库，不参与授权判定——授权由
+// Key 所属分组在事务内重查模型归属决定，两者在管理员改配置的极窄窗口内
+// 可能不同，以事务内结果为准。
 type ReserveInput struct {
 	RequestID                                 string
 	KeyID, ModelID, ProviderID                int64
