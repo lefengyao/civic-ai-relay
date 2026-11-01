@@ -36,6 +36,10 @@ type ClientKey struct {
 	// （token_digest 是创建时即丢弃的随机值）。客户端里没有可提取的凭据，用户拿不到
 	// 东西带到应用外去用。应用标识本身是公开的，安全边界在「谁能访问到网关」。
 	PublicID string
+	// GroupID 为 nil 表示未绑分组（授权模型为空，客户端拉不到模型）。
+	// 一对一：一个 Key 只属于一个分组，切换即改绑；历史账目按请求发生时的
+	// 归属记录在 key_reservations.group_id / requests.group_id 上，不随切换搬移。
+	GroupID *int64
 }
 
 // Keyless 报告该记录是否为「应用型凭据」（无密钥，用公开的应用标识接入）。
@@ -244,7 +248,7 @@ func randomClientToken() (string, error) {
 }
 
 func (s *Store) ListClientKeys(ctx context.Context) ([]ClientKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,'') FROM client_keys ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,''),group_id FROM client_keys ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +266,7 @@ func (s *Store) ListClientKeys(ctx context.Context) ([]ClientKey, error) {
 }
 
 func (s *Store) GetClientKey(ctx context.Context, id int64) (ClientKey, error) {
-	return scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,'') FROM client_keys WHERE id=?`, id))
+	return scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,''),group_id FROM client_keys WHERE id=?`, id))
 }
 
 // KeyUsageStat mirrors the quota-check aggregation in ReserveRequest: every
@@ -309,7 +313,7 @@ func (s *Store) AuthenticateClientKey(ctx context.Context, token string) (Client
 	if strings.TrimSpace(token) == "" {
 		return ClientKey{}, errors.New("client token is required")
 	}
-	key, err := scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,'') FROM client_keys WHERE token_digest=?`, s.box.DigestBytes(token)))
+	key, err := scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,''),group_id FROM client_keys WHERE token_digest=?`, s.box.DigestBytes(token)))
 	if err != nil {
 		return ClientKey{}, err
 	}
@@ -329,7 +333,7 @@ func (s *Store) AuthenticateClientApp(ctx context.Context, publicID string) (Cli
 	if id == "" {
 		return ClientKey{}, errors.New("application ID is required")
 	}
-	key, err := scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,'') FROM client_keys WHERE public_id=?`, id))
+	key, err := scanClientKey(s.db.QueryRowContext(ctx, `SELECT id,name,enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(disabled_reason,''),COALESCE(token_label,''),expires_at_utc,COALESCE(public_id,''),group_id FROM client_keys WHERE public_id=?`, id))
 	if err != nil {
 		return ClientKey{}, err
 	}
@@ -342,14 +346,17 @@ func (s *Store) AuthenticateClientApp(ctx context.Context, publicID string) (Cli
 func scanClientKey(src interface{ Scan(...any) error }) (ClientKey, error) {
 	var k ClientKey
 	var enabled int
-	var tokens, amount sql.NullInt64
+	var tokens, amount, group sql.NullInt64
 	var expires sql.NullString
-	if err := src.Scan(&k.ID, &k.Name, &enabled, &k.ConcurrencyLimit, &tokens, &amount, &k.DisabledReason, &k.TokenLabel, &expires, &k.PublicID); err != nil {
+	if err := src.Scan(&k.ID, &k.Name, &enabled, &k.ConcurrencyLimit, &tokens, &amount, &k.DisabledReason, &k.TokenLabel, &expires, &k.PublicID, &group); err != nil {
 		return ClientKey{}, err
 	}
 	k.Enabled = enabled == 1
 	k.TokenLimit, k.AmountLimitMicroyuan = nullableInt(tokens), nullableInt(amount)
 	k.ExpiresAt = nullableTime(expires)
+	if group.Valid {
+		k.GroupID = &group.Int64
+	}
 	k.Token = ""
 	return k, nil
 }
@@ -442,6 +449,42 @@ func (s *Store) KeyGroupIDs(ctx context.Context, keyID int64) ([]int64, error) {
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// SetKeyGroup 把密钥绑到唯一分组，groupID <= 0 表示解绑（授权模型随即为空）。
+// 取代旧的 ReplaceKeyGroups 多对多写入；组必须存在且启用，与旧校验一致。
+func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
+	if keyID <= 0 {
+		return errors.New("key ID is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM client_keys WHERE id=?`, keyID).Scan(&exists); err != nil || exists == 0 {
+		if err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if groupID > 0 {
+		var enabled int
+		if err := tx.QueryRowContext(ctx, `SELECT enabled FROM model_groups WHERE id=?`, groupID).Scan(&enabled); err != nil {
+			return err
+		}
+		if enabled != 1 {
+			return fmt.Errorf("group %d is disabled", groupID)
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE client_keys SET group_id=?, updated_at_utc=? WHERE id=?`, groupID, nowUTC(), keyID)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE client_keys SET group_id=NULL, updated_at_utc=? WHERE id=?`, nowUTC(), keyID)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ReplaceKeyGroups(ctx context.Context, keyID int64, groupIDs []int64) error {

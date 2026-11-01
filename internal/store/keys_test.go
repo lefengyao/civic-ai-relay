@@ -269,3 +269,55 @@ func TestAuthorizedModelsForKeyMatchesTokenLookup(t *testing.T) {
 		t.Fatalf("停用后按 token 必须查不到任何模型：%v %v", models, err)
 	}
 }
+
+func TestSetKeyGroupBindsUnbindsAndValidates(t *testing.T) {
+	ctx := context.Background()
+	repo := newTestStore(t)
+	g, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 新建的 Key 未绑分组
+	if fresh, _ := repo.GetClientKey(ctx, key.ID); fresh.GroupID != nil {
+		t.Fatalf("新建 Key 不应有分组：%v", fresh.GroupID)
+	}
+
+	if err := repo.SetKeyGroup(ctx, key.ID, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.GetClientKey(ctx, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupID == nil || *got.GroupID != g.ID {
+		t.Fatalf("group = %v, want %d", got.GroupID, g.ID)
+	}
+
+	// 解绑：0 = 解绑，授权模型随即为空
+	if err := repo.SetKeyGroup(ctx, key.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = repo.GetClientKey(ctx, key.ID); got.GroupID != nil {
+		t.Fatalf("解绑后 group = %v, want nil", got.GroupID)
+	}
+
+	// 不存在的组
+	if err := repo.SetKeyGroup(ctx, key.ID, 99999); err == nil {
+		t.Fatal("不存在的组被接受")
+	}
+	// 停用的组（与旧 ReplaceKeyGroups 的校验一致）
+	if _, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{Enabled: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, g.ID); err == nil {
+		t.Fatal("停用的组被接受")
+	}
+	// 不存在的 Key
+	if err := repo.SetKeyGroup(ctx, 99999, g.ID); err == nil {
+		t.Fatal("不存在的 Key 被接受")
+	}
+}
