@@ -859,7 +859,7 @@ func (h *AdminHandler) keysList(w http.ResponseWriter, r *http.Request) {
 		item := map[string]any{
 			"ID": k.ID, "Name": k.Name, "TokenLabel": k.TokenLabel,
 			"AuthMode": authMode, "PublicID": k.PublicID,
-			"GroupID":             k.GroupID,
+			"GroupID": k.GroupID,
 			"Enabled": k.Enabled, "ConcurrencyLimit": k.ConcurrencyLimit,
 			"TokenLimit": k.TokenLimit, "AmountLimitMicroyuan": k.AmountLimitMicroyuan,
 			"DisabledReason":      k.DisabledReason,
