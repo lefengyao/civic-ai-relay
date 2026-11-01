@@ -164,7 +164,7 @@ curl http://<relay>:8000/v1/chat/completions \
 # 创建 24 小时后失效的令牌（返回的 token 只显示这一次）
 curl -X POST http://<relay>:8000/admin/api/keys \
   -H "X-Admin-Key: <管理员密钥>" -H "Content-Type: application/json" \
-  -d '{"name":"外包A","max_concurrency":2,"group_ids":[2],"ttl_seconds":86400}'
+  -d '{"name":"外包A","max_concurrency":2,"group_id":2,"ttl_seconds":86400}'
 ```
 
 - 到期后管理台的 Key 列表把它标成**已过期**（红色），「接入信息」里也写明客户端会收到 `token_expired`。

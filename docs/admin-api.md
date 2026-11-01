@@ -200,13 +200,13 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/api/keys` | 列表，含用量统计（见下） |
-| POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_ids?, ttl_seconds?, keyless?}`。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
+| POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_id?, ttl_seconds?, keyless?}`。`group_id > 0` 时创建即绑定到该分组（一对一）；缺省/0 = 不绑；负数 = 400 `invalid_request`；组不存在或已停用 = 400 `key_invalid`。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
 | GET | `/admin/api/keys/hints` | 脱敏缩略 `crk_xxxx…` + 非敏感标识 `key-xxxxxx`（独立接口，保证列表永不泄露密钥字符） |
 | PUT | `/admin/api/keys/{id}` | 更新 `{name?, enabled?, concurrency_limit?, token_limit_total?, money_limit_yuan_total?, ttl_seconds?}`；**nil 字段保持原值**。`ttl_seconds` 三态：缺省 = 不动；`0`/负数 = 改为永久有效；`>0` = 从现在起 N 秒后到期（**续期就是再传一次**） |
 | DELETE | `/admin/api/keys/{id}` | 删除：立即吊销访问；历史账目金额保留；重复删除返回 404 |
 | POST | `/admin/api/keys/{id}/rotate` | 重置密钥：旧 token 立即失效，新 token 只返回一次 |
-| GET | `/admin/api/keys/{id}/groups` | Key 所属分组 ID 列表 |
-| PUT | `/admin/api/keys/{id}/groups` | **整体替换**所属分组；body `{"group_ids": [...]}` |
+| GET | `/admin/api/keys/{id}/group` | Key 所属分组 ID（一对一）；未绑定时返回 `{"data": null}` |
+| PUT | `/admin/api/keys/{id}/group` | 绑定/解绑所属分组；body `{"group_id": <number>}`，`0` = 解绑；组不存在或已停用 = 400 `key_invalid`；负数 = 400 `invalid_request` |
 | GET | `/admin/api/keys/{id}/connection` | **接入信息**：把「其他软件该填什么」一次算全（Base URL、派生地址、凭据、可用模型清单、所属分组、问题清单）。详见下节 |
 
 ### 应用型凭据（客户端不保存密钥）
@@ -255,7 +255,7 @@ curl http://<relay>:8000/v1/chat/completions \
     "expired": false,
     "expires_at_utc": "2026-09-25T05:00:00Z",
     "expires_in_secs": 82800,
-    "groups": [{"id": 2, "name": "写作组", "enabled": true, "rate_milli": 1000}],
+    "group": {"id": 2, "name": "写作组", "enabled": true, "rate_milli": 1000},
     "models": ["deepseek/deepseek-chat"],
     "base_url": "http://10.190.164.209:8000/v1",
     "models_url": "http://10.190.164.209:8000/v1/models",

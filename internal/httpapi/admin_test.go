@@ -690,3 +690,74 @@ func TestAdminKeyTTLThreeStates(t *testing.T) {
 		t.Fatalf("续期后应恢复有效：%+v", row)
 	}
 }
+
+func TestAdminKeyGroupSingleBinding(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey,
+		map[string]any{"name": "主组"})
+	if created.Code != http.StatusCreated {
+		t.Fatal(created.Body.String())
+	}
+	var groupBody struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &groupBody); err != nil {
+		t.Fatal(err)
+	}
+	gid := groupBody.Data.ID
+
+	createdKey := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey,
+		map[string]any{"name": "绑定组", "max_concurrency": 1, "group_id": gid})
+	if createdKey.Code != http.StatusCreated {
+		t.Fatal(createdKey.Body.String())
+	}
+	var keyBody struct {
+		Data struct {
+			ID      int64  `json:"ID"`
+			GroupID *int64 `json:"GroupID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(createdKey.Body.Bytes(), &keyBody); err != nil {
+		t.Fatal(err)
+	}
+	if keyBody.Data.GroupID == nil || *keyBody.Data.GroupID != gid {
+		t.Fatalf("创建响应 GroupID = %v, want %d", keyBody.Data.GroupID, gid)
+	}
+	keyPath := "/admin/api/keys/" + strconv.FormatInt(keyBody.Data.ID, 10)
+
+	// 列表里也要能看到
+	listed := adminRequest(t, handler, http.MethodGet, "/admin/api/keys", adminKey, nil)
+	if !strings.Contains(listed.Body.String(), `"GroupID":`+strconv.FormatInt(gid, 10)) {
+		t.Fatalf("列表缺 GroupID：%s", listed.Body.String())
+	}
+
+	// 显式解绑
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath+"/group", adminKey,
+		map[string]any{"group_id": 0}); resp.Code != http.StatusOK {
+		t.Fatal(resp.Body.String())
+	}
+	current := adminRequest(t, handler, http.MethodGet, keyPath+"/group", adminKey, nil)
+	if !strings.Contains(current.Body.String(), `"data":null`) {
+		t.Fatalf("解绑后应返回 null：%s", current.Body.String())
+	}
+
+	// 不存在的组 → 400 key_invalid
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath+"/group", adminKey,
+		map[string]any{"group_id": 999999}); resp.Code != http.StatusBadRequest {
+		t.Fatalf("不存在的组应 400，实际 %d", resp.Code)
+	}
+
+	// 负数 → 400 invalid_request（审查移交项：旧 ReplaceKeyGroups 对 gid<=0 报错，不能静默吞）
+	if resp := adminRequest(t, handler, http.MethodPut, keyPath+"/group", adminKey,
+		map[string]any{"group_id": -1}); resp.Code != http.StatusBadRequest {
+		t.Fatalf("负数 group_id 应 400，实际 %d", resp.Code)
+	}
+	negCreate := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey,
+		map[string]any{"name": "负数组", "max_concurrency": 1, "group_id": -5})
+	if negCreate.Code != http.StatusBadRequest {
+		t.Fatalf("创建带负数 group_id 应 400，实际 %d：%s", negCreate.Code, negCreate.Body.String())
+	}
+}

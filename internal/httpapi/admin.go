@@ -809,6 +809,10 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
+	if p.GroupID != nil && *p.GroupID < 0 {
+		writeAdminError(w, 400, "invalid_request")
+		return
+	}
 	if p.MaxConcurrency == 0 {
 		p.MaxConcurrency = 1
 	}
@@ -819,7 +823,10 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	k, err := h.repo.CreateClientKey(r.Context(), store.NewClientKey{Name: p.Name, ConcurrencyLimit: p.MaxConcurrency, TokenLimit: p.TokenLimit, AmountLimitMicroyuan: money, ExpiresAt: expiryFromTTL(p.TTLSeconds), Keyless: p.Keyless})
 	if err == nil && p.GroupID != nil && *p.GroupID > 0 {
-		err = h.repo.SetKeyGroup(r.Context(), k.ID, *p.GroupID)
+		if err = h.repo.SetKeyGroup(r.Context(), k.ID, *p.GroupID); err == nil {
+			// 绑定成功后回填，创建响应里能看到归属分组
+			k.GroupID = p.GroupID
+		}
 	}
 	if err != nil {
 		writeAdminError(w, 400, "key_invalid")
@@ -852,6 +859,7 @@ func (h *AdminHandler) keysList(w http.ResponseWriter, r *http.Request) {
 		item := map[string]any{
 			"ID": k.ID, "Name": k.Name, "TokenLabel": k.TokenLabel,
 			"AuthMode": authMode, "PublicID": k.PublicID,
+			"GroupID":             k.GroupID,
 			"Enabled": k.Enabled, "ConcurrencyLimit": k.ConcurrencyLimit,
 			"TokenLimit": k.TokenLimit, "AmountLimitMicroyuan": k.AmountLimitMicroyuan,
 			"DisabledReason":      k.DisabledReason,
@@ -941,6 +949,10 @@ func (h *AdminHandler) keyItem(w http.ResponseWriter, r *http.Request, raw strin
 				GroupID int64 `json:"group_id"`
 			}
 			if json.NewDecoder(r.Body).Decode(&p) != nil {
+				writeAdminError(w, 400, "invalid_request")
+				return
+			}
+			if p.GroupID < 0 {
 				writeAdminError(w, 400, "invalid_request")
 				return
 			}
