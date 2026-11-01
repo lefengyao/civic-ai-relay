@@ -262,6 +262,15 @@ var migrations = []migration{
 		`UPDATE key_reservations SET group_id = COALESCE((SELECT group_id FROM client_keys WHERE id = key_reservations.key_id), 0)`,
 		`UPDATE requests SET group_id = COALESCE((SELECT group_id FROM client_keys WHERE id = requests.key_id), 0)`,
 	}},
+	// v17: key_groups 的历史使命结束（v16 已按它回填 client_keys.group_id），
+	// 删表并建分组维度索引。额度窗口查询在每次请求的事务里按 group_id + 时间
+	// 过滤，没这两个索引就是每次请求全表扫。
+	{version: 17, statements: []string{
+		`DROP INDEX IF EXISTS idx_key_groups_group`,
+		`DROP TABLE key_groups`,
+		`CREATE INDEX idx_key_reservations_group_time ON key_reservations(group_id, created_at_utc)`,
+		`CREATE INDEX idx_requests_group_time ON requests(group_id, created_at_utc)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

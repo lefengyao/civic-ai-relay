@@ -35,7 +35,7 @@ func newReservationFixture(t *testing.T, tokenLimit, amountLimit int64) (repo *S
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceKeyGroups(context.Background(), key.ID, []int64{g.ID}); err != nil {
+	if err := repo.SetKeyGroup(context.Background(), key.ID, g.ID); err != nil {
 		t.Fatal(err)
 	}
 	return repo, key, model

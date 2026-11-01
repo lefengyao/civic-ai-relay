@@ -53,7 +53,7 @@ func TestModelsRequiresBearerAndFiltersAuthorizedModels(t *testing.T) {
 	g, _ := repo.CreateModelGroup(t.Context(), store.NewModelGroup{Name: "g"})
 	_ = repo.ReplaceGroupProviders(t.Context(), g.ID, []int64{p.ID})
 	key, _ := repo.CreateClientKey(t.Context(), store.NewClientKey{Name: "k", ConcurrencyLimit: 1})
-	_ = repo.ReplaceKeyGroups(t.Context(), key.ID, []int64{g.ID})
+	_ = repo.SetKeyGroup(t.Context(), key.ID, g.ID)
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, TokenLimit5H: 100000, TokenLimitDaily: 20000, MaxOutputTokens: 16}
 	service := relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
 	h := NewPublicHandler(service, 1<<20)
@@ -97,7 +97,7 @@ func TestExpiredTokenGetsDistinctErrorCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = repo.ReplaceKeyGroups(t.Context(), key.ID, []int64{group.ID})
+	_ = repo.SetKeyGroup(t.Context(), key.ID, group.ID)
 
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 16}
 	service := relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
@@ -228,9 +228,9 @@ func TestAppIdentifierIsAValidCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = repo.ReplaceKeyGroups(t.Context(), app.ID, []int64{group.ID})
+	_ = repo.SetKeyGroup(t.Context(), app.ID, group.ID)
 	normal, _ := repo.CreateClientKey(t.Context(), store.NewClientKey{Name: "普通", ConcurrencyLimit: 1})
-	_ = repo.ReplaceKeyGroups(t.Context(), normal.ID, []int64{group.ID})
+	_ = repo.SetKeyGroup(t.Context(), normal.ID, group.ID)
 
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 16}
 	service := relay.NewService(repo, &testFactory{}, func() config.Settings { return settings })
@@ -293,7 +293,7 @@ func TestQuotaRejectionReturns429WithReason(t *testing.T) {
 	_ = repo.ReplaceGroupProviders(t.Context(), g.ID, []int64{p.ID})
 	limit := int64(1)
 	key, _ := repo.CreateClientKey(t.Context(), store.NewClientKey{Name: "k", ConcurrencyLimit: 4, TokenLimit: &limit})
-	_ = repo.ReplaceKeyGroups(t.Context(), key.ID, []int64{g.ID})
+	_ = repo.SetKeyGroup(t.Context(), key.ID, g.ID)
 	// 先直接占掉这唯一的 1 个 token 总额度，让后续请求处于「已欠费」状态。
 	if _, err := repo.ReserveRequest(t.Context(), store.ReserveInput{
 		RequestID: "seed", KeyID: key.ID, ModelID: model.ID, ProviderID: p.ID,

@@ -331,7 +331,7 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 		return rollback(&QuotaError{Code: "concurrency_exceeded"})
 	}
 	var inputPrice, outputPrice, cachedPrice, rate sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),MAX(g.rate_milli) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE kg.key_id=? AND p.id=?`, in.ModelID, in.KeyID, in.ProviderID).Scan(&inputPrice, &outputPrice, &cachedPrice, &rate); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE k.id=? AND p.id=?`, in.ModelID, in.KeyID, in.ProviderID).Scan(&inputPrice, &outputPrice, &cachedPrice, &rate); err != nil {
 		return rollback(err)
 	}
 	if !inputPrice.Valid || !outputPrice.Valid || !cachedPrice.Valid || !rate.Valid {

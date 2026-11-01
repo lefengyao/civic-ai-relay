@@ -33,7 +33,7 @@ func TestDeletesCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceKeyGroups(ctx, key.ID, []int64{group.ID}); err != nil {
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -59,17 +59,14 @@ func TestDeletesCascade(t *testing.T) {
 		t.Fatalf("group should survive model delete, groups = %v", groups)
 	}
 
-	// Deleting the group drops the key's grant but keeps the key.
+	// Deleting the group unbinds the key (group_id → NULL) but keeps the key.
 	if err := repo.DeleteModelGroup(ctx, group.ID); err != nil {
 		t.Fatal(err)
 	}
-	if ids, err := repo.KeyGroupIDs(ctx, key.ID); err != nil {
-		t.Fatal(err)
-	} else if len(ids) != 0 {
-		t.Fatalf("key grants after group delete = %v", ids)
-	}
-	if _, err := repo.GetClientKey(ctx, key.ID); err != nil {
+	if bound, err := repo.GetClientKey(ctx, key.ID); err != nil {
 		t.Fatalf("key should survive group delete: %v", err)
+	} else if bound.GroupID != nil {
+		t.Fatalf("key group after group delete = %v, want nil", bound.GroupID)
 	}
 
 	// Deleting the key keeps the ledger row and its amount.

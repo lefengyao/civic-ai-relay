@@ -68,7 +68,7 @@ func NewRelayFixture(t *testing.T, client relay.UpstreamClient) RelayFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceKeyGroups(ctx, key.ID, []int64{group.ID}); err != nil {
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
 		t.Fatal(err)
 	}
 	settings := config.Settings{GlobalConcurrencyLimit: 2, RPMLimit: 30, MaxOutputTokens: 64}

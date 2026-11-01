@@ -797,7 +797,7 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 		MaxConcurrency int      `json:"max_concurrency"`
 		TokenLimit     *int64   `json:"token_limit_total"`
 		MoneyLimitYuan *float64 `json:"money_limit_yuan_total"`
-		GroupIDs       []int64  `json:"group_ids"`
+		GroupID        *int64   `json:"group_id"`
 		// TTLSeconds > 0 时创建为「短时令牌」：从现在起 N 秒后自动失效。
 		// 缺省 / 0 / 负数 = 永久有效（与升级前的行为一致）。
 		TTLSeconds *int64 `json:"ttl_seconds"`
@@ -818,8 +818,8 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 		money = &v
 	}
 	k, err := h.repo.CreateClientKey(r.Context(), store.NewClientKey{Name: p.Name, ConcurrencyLimit: p.MaxConcurrency, TokenLimit: p.TokenLimit, AmountLimitMicroyuan: money, ExpiresAt: expiryFromTTL(p.TTLSeconds), Keyless: p.Keyless})
-	if err == nil && len(p.GroupIDs) > 0 {
-		err = h.repo.ReplaceKeyGroups(r.Context(), k.ID, p.GroupIDs)
+	if err == nil && p.GroupID != nil && *p.GroupID > 0 {
+		err = h.repo.SetKeyGroup(r.Context(), k.ID, *p.GroupID)
 	}
 	if err != nil {
 		writeAdminError(w, 400, "key_invalid")
@@ -922,25 +922,29 @@ func (h *AdminHandler) keyItem(w http.ResponseWriter, r *http.Request, raw strin
 		h.keyConnection(w, r, id)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "groups" {
+	if len(parts) == 2 && parts[1] == "group" {
 		if r.Method == http.MethodGet {
-			ids, err := h.repo.KeyGroupIDs(r.Context(), id)
+			key, err := h.repo.GetClientKey(r.Context(), id)
 			if err != nil {
-				writeAdminError(w, 400, "key_invalid")
+				writeAdminError(w, 404, "not_found")
 				return
 			}
-			writeJSON(w, 200, map[string]any{"data": ids})
+			var groupID any
+			if key.GroupID != nil {
+				groupID = *key.GroupID
+			}
+			writeJSON(w, 200, map[string]any{"data": groupID})
 			return
 		}
 		if r.Method == http.MethodPut {
 			var p struct {
-				GroupIDs []int64 `json:"group_ids"`
+				GroupID int64 `json:"group_id"`
 			}
 			if json.NewDecoder(r.Body).Decode(&p) != nil {
 				writeAdminError(w, 400, "invalid_request")
 				return
 			}
-			if err := h.repo.ReplaceKeyGroups(r.Context(), id, p.GroupIDs); err != nil {
+			if err := h.repo.SetKeyGroup(r.Context(), id, p.GroupID); err != nil {
 				writeAdminError(w, 400, "key_invalid")
 				return
 			}
@@ -1014,35 +1018,27 @@ func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, key
 		writeAdminError(w, 500, "store_error")
 		return
 	}
-	groupIDs, err := h.repo.KeyGroupIDs(r.Context(), keyID)
-	if err != nil {
-		writeAdminError(w, 500, "store_error")
-		return
-	}
-	// 分组详情拿不到时降级为「只有 ID」，不影响接入信息整体可用。
-	groups := make([]map[string]any, 0, len(groupIDs))
-	enabledGroups := 0
-	if catalog, err := h.repo.ListModelGroups(r.Context()); err == nil {
-		index := make(map[int64]store.ModelGroup, len(catalog))
-		for _, g := range catalog {
-			index[g.ID] = g
-		}
-		for _, id := range groupIDs {
-			g, ok := index[id]
-			if !ok {
-				groups = append(groups, map[string]any{"id": id, "name": "", "enabled": false, "rate_milli": store.DefaultGroupRateMilli})
-				continue
+	// 一对一：接入信息里的分组是单个对象。组详情拿不到时降级为「只有 ID」，
+	// 不影响接入信息整体可用。
+	var group any
+	enabledGroup := false
+	if key.GroupID != nil {
+		entry := map[string]any{"id": *key.GroupID, "name": "", "enabled": false, "rate_milli": store.DefaultGroupRateMilli}
+		if catalog, err := h.repo.ListModelGroups(r.Context()); err == nil {
+			for _, g := range catalog {
+				if g.ID == *key.GroupID {
+					entry["name"] = g.Name
+					entry["enabled"] = g.Enabled
+					entry["rate_milli"] = g.RateMilli
+					enabledGroup = g.Enabled
+					break
+				}
 			}
-			if g.Enabled {
-				enabledGroups++
-			}
-			groups = append(groups, map[string]any{"id": g.ID, "name": g.Name, "enabled": g.Enabled, "rate_milli": g.RateMilli})
+		} else {
+			entry["enabled"] = true
+			enabledGroup = true
 		}
-	} else {
-		enabledGroups = len(groupIDs)
-		for _, id := range groupIDs {
-			groups = append(groups, map[string]any{"id": id, "name": "", "enabled": true, "rate_milli": store.DefaultGroupRateMilli})
-		}
+		group = entry
 	}
 
 	names := make([]string, 0, len(models))
@@ -1071,12 +1067,10 @@ func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, key
 	} else if key.ExpiresAt != nil && key.ExpiresAt.Sub(now) < 24*time.Hour {
 		warnings = append(warnings, "该令牌将在 24 小时内过期，记得提前续期")
 	}
-	if len(groupIDs) == 0 {
+	if key.GroupID == nil {
 		issues = append(issues, "该 Key 未绑定任何分组：客户端拉不到模型，对话返回 400 model_not_allowed")
-	} else if enabledGroups == 0 {
-		issues = append(issues, "所属分组已全部停用：授权模型为空")
-	} else if enabledGroups < len(groupIDs) {
-		warnings = append(warnings, "部分分组已停用，这些分组下的模型不会授权给该 Key")
+	} else if !enabledGroup {
+		issues = append(issues, "所属分组已停用：授权模型为空")
 	}
 	if len(names) == 0 {
 		issues = append(issues, "没有可用模型：分组内渠道下要有「已启用且已定价」的模型，客户端 /v1/models 才会返回内容")
@@ -1109,7 +1103,7 @@ func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, key
 		"expired":         key.Expired(now),
 		"expires_at_utc":  expiresAtUTC,
 		"expires_in_secs": expiresInSecs,
-		"groups":          groups,
+		"group":           group,
 		"models":          names,
 		"base_url":        base,
 		"models_url":      base + "/models",

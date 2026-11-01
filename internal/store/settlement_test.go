@@ -136,7 +136,7 @@ func newSettlementFixture(t *testing.T) (*store.Store, store.ClientKey, store.Mo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceKeyGroups(ctx, key.ID, []int64{group.ID}); err != nil {
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
 		t.Fatal(err)
 	}
 	return repo, key, model

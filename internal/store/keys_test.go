@@ -238,7 +238,7 @@ func TestAuthorizedModelsForKeyMatchesTokenLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceKeyGroups(ctx, key.ID, []int64{group.ID}); err != nil {
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -314,7 +314,7 @@ func TestSetKeyGroupBindsUnbindsAndValidates(t *testing.T) {
 	if err := repo.SetKeyGroup(ctx, key.ID, 99999); err == nil {
 		t.Fatal("不存在的组被接受")
 	}
-	// 停用的组（与旧 ReplaceKeyGroups 的校验一致）
+	// 停用的组（SetKeyGroup 的校验与旧多对多写入一致）
 	if _, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{Enabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}

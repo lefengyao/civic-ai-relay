@@ -218,7 +218,7 @@ func TestAdminDeleteRoutes(t *testing.T) {
 	}
 	groupID := created.Data.ID
 
-	clientKey := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", key, map[string]any{"name": "k", "max_concurrency": 1, "group_ids": []int64{groupID}})
+	clientKey := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", key, map[string]any{"name": "k", "max_concurrency": 1, "group_id": groupID})
 	if clientKey.Code != http.StatusCreated {
 		t.Fatal(clientKey.Body.String())
 	}
@@ -493,7 +493,7 @@ func TestAdminKeyConnectionTellsClientsWhatToFill(t *testing.T) {
 	groupID := created.Data.ID
 
 	createdKey := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey,
-		map[string]any{"name": "其他软件", "max_concurrency": 2, "group_ids": []int64{groupID}})
+		map[string]any{"name": "其他软件", "max_concurrency": 2, "group_id": groupID})
 	if createdKey.Code != http.StatusCreated {
 		t.Fatal(createdKey.Body.String())
 	}
@@ -518,10 +518,10 @@ func TestAdminKeyConnectionTellsClientsWhatToFill(t *testing.T) {
 			Issues    []string `json:"issues"`
 			Ready     bool     `json:"ready"`
 			TokenHint string   `json:"token_hint"`
-			Groups    []struct {
+			Group     struct {
 				ID   int64  `json:"id"`
 				Name string `json:"name"`
-			} `json:"groups"`
+			} `json:"group"`
 		} `json:"data"`
 	}
 	decode := func(response *httptest.ResponseRecorder) {
@@ -548,7 +548,7 @@ func TestAdminKeyConnectionTellsClientsWhatToFill(t *testing.T) {
 	if len(payload.Data.Models) != 1 || payload.Data.Models[0] != "p/chat" {
 		t.Fatalf("模型清单应与公共 /v1/models 一致：%v", payload.Data.Models)
 	}
-	if len(payload.Data.Groups) != 1 || payload.Data.Groups[0].Name != "客户端组" {
+	if payload.Data.Group.ID != groupID || payload.Data.Group.Name != "客户端组" {
 		t.Fatalf("分组信息缺失：%s", response.Body.String())
 	}
 	// 库里只有摘要，接口只能给脱敏缩略；明文与上游密钥都不得出现
@@ -575,7 +575,7 @@ func TestAdminKeyConnectionTellsClientsWhatToFill(t *testing.T) {
 	}
 	response = adminRequest(t, handler, http.MethodGet, path, adminKey, nil)
 	decode(response)
-	if len(payload.Data.Models) != 0 || !containsText(payload.Data.Issues, "分组已全部停用") {
+	if len(payload.Data.Models) != 0 || !containsText(payload.Data.Issues, "所属分组已停用") {
 		t.Fatalf("分组停用后应提示无可授权模型：%v %v", payload.Data.Models, payload.Data.Issues)
 	}
 

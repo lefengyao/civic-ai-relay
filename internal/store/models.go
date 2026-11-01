@@ -199,7 +199,9 @@ func (s *Store) DeleteModel(ctx context.Context, id int64) error {
 	return nil
 }
 
-// DeleteModelGroup removes a group. Its memberships and key grants cascade;
+// DeleteModelGroup removes a group. Its provider memberships cascade; bound
+// client keys survive but become unbound (group_id → NULL via ON DELETE SET
+// NULL), so they can no longer authorize any model until rebound.
 // models themselves are untouched.
 func (s *Store) DeleteModelGroup(ctx context.Context, id int64) error {
 	if id <= 0 {

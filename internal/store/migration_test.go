@@ -119,4 +119,12 @@ func TestMigrationV16BackfillPicksHighestRate(t *testing.T) {
 	if bound.Valid {
 		t.Fatalf("无分组密钥的 group_id = %v, want NULL", bound)
 	}
+
+	applyMigration(db, t, 17)
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='key_groups'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Fatal("v17 应删除 key_groups")
+	}
 }

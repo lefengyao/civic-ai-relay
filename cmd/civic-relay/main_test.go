@@ -208,7 +208,7 @@ func TestBuildApplicationRecoversCrashReservationBeforeServing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceKeyGroups(ctx, clientKey.ID, []int64{group.ID}); err != nil {
+	if err := repo.SetKeyGroup(ctx, clientKey.ID, group.ID); err != nil {
 		t.Fatal(err)
 	}
 	// A previous process can leave a timestamp in the startup millisecond (or

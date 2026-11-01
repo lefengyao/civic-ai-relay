@@ -428,33 +428,8 @@ func (s *Store) UpdateClientKey(ctx context.Context, id int64, in UpdateClientKe
 	return k, nil
 }
 
-// KeyGroupIDs returns the group IDs currently authorized for a client key,
-// ordered by group ID. Used by the administration console to prefill editing.
-func (s *Store) KeyGroupIDs(ctx context.Context, keyID int64) ([]int64, error) {
-	if keyID <= 0 {
-		return nil, errors.New("key ID is required")
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT group_id FROM key_groups WHERE key_id=? ORDER BY group_id`, keyID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
-	out := make([]int64, 0)
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
-}
-
 // SetKeyGroup 把密钥绑到唯一分组，groupID <= 0 表示解绑（授权模型随即为空）。
-// 取代旧的 ReplaceKeyGroups 多对多写入；组必须存在且启用，与旧校验一致。
-// 注意：Task 3 切换之前，授权/计价读路径（authorizedModelsSelect、ledger 计价）
-// 仍走 key_groups，本函数暂不影响实际授权口径；ReplaceKeyGroups 暂勿删除。
+// 组必须存在且启用。
 func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 	if keyID <= 0 {
 		return errors.New("key ID is required")
@@ -489,61 +464,19 @@ func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 	return tx.Commit()
 }
 
-func (s *Store) ReplaceKeyGroups(ctx context.Context, keyID int64, groupIDs []int64) error {
-	if keyID <= 0 {
-		return errors.New("key ID is required")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM client_keys WHERE id=?`, keyID).Scan(&exists); err != nil || exists == 0 {
-		if err != nil {
-			return err
-		}
-		return sql.ErrNoRows
-	}
-	seen := make(map[int64]struct{}, len(groupIDs))
-	for _, gid := range groupIDs {
-		if gid <= 0 {
-			return errors.New("invalid group ID")
-		}
-		if _, ok := seen[gid]; ok {
-			return errors.New("duplicate group ID")
-		}
-		seen[gid] = struct{}{}
-		var enabled int
-		if err := tx.QueryRowContext(ctx, `SELECT enabled FROM model_groups WHERE id=?`, gid).Scan(&enabled); err != nil {
-			return err
-		}
-		if enabled != 1 {
-			return fmt.Errorf("group %d is disabled", gid)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM key_groups WHERE key_id=?`, keyID); err != nil {
-		return err
-	}
-	for _, gid := range groupIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO key_groups(key_id,group_id) VALUES (?,?)`, keyID, gid); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 // KeyModelRateMilli returns the billing rate multiplier (in thousandths, 1000 = 1.0x)
-// that applies to a model for a given client key: the highest rate among the key's
-// enabled groups whose providers include the model's provider. Falls back to the
-// default rate when no matching group carries an explicit multiplier.
+// for a model under the key's single group. Falls back to the default rate when the
+// key has no group, the group is disabled, or the model's provider is not in it.
 func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (int64, error) {
 	if keyID <= 0 || modelID <= 0 {
 		return DefaultGroupRateMilli, errors.New("key and model IDs are required")
 	}
 	var rate sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT MAX(g.rate_milli) FROM key_groups kg JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id WHERE kg.key_id=?`, modelID, keyID).Scan(&rate)
+	err := s.db.QueryRowContext(ctx, `SELECT g.rate_milli FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id WHERE k.id=?`, modelID, keyID).Scan(&rate)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DefaultGroupRateMilli, nil
+		}
 		return DefaultGroupRateMilli, err
 	}
 	if !rate.Valid || rate.Int64 <= 0 {
@@ -572,10 +505,11 @@ func (s *Store) AuthorizedModelsForKey(ctx context.Context, keyID int64) ([]Mode
 }
 
 // authorizedModelsSelect 是「客户端实际能用哪些模型」的唯一口径：
-// Key 所属启用分组 → 组内渠道 → 渠道下已启用且已定价的模型 → 渠道本身启用。
+// Key 的唯一所属分组（client_keys.group_id，NULL = 未绑）→ 组内渠道 →
+// 渠道下已启用且已定价的模型 → 渠道本身启用。
 // 公共 /v1/models 与管理端「接入信息」共用这一份 SQL，避免两处判断漂移出
 // 「客户端报 404、管理台却显示已授权」这类最难查的问题。
-const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN key_groups kg ON kg.key_id=k.id JOIN model_groups g ON g.id=kg.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
+const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
 
 func (s *Store) queryAuthorizedModels(ctx context.Context, where string, args ...any) ([]Model, error) {
 	rows, err := s.db.QueryContext(ctx, authorizedModelsSelect+where+" ORDER BY m.id", args...)
