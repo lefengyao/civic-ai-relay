@@ -127,4 +127,13 @@ func TestMigrationV16BackfillPicksHighestRate(t *testing.T) {
 	if tables != 0 {
 		t.Fatal("v17 应删除 key_groups")
 	}
+	for _, idx := range []string{"idx_key_reservations_group_time", "idx_requests_group_time"} {
+		var count int
+		if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("missing index %s", idx)
+		}
+	}
 }

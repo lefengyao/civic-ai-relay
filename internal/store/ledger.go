@@ -317,7 +317,8 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	}
 	var enabled, concurrency int
 	var tokenLimit, amountLimit sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT enabled,concurrency_limit,token_limit,amount_limit_microyuan FROM client_keys WHERE id=?`, in.KeyID).Scan(&enabled, &concurrency, &tokenLimit, &amountLimit); err != nil {
+	var groupID int64
+	if err := conn.QueryRowContext(ctx, `SELECT enabled,concurrency_limit,token_limit,amount_limit_microyuan,COALESCE(group_id,0) FROM client_keys WHERE id=?`, in.KeyID).Scan(&enabled, &concurrency, &tokenLimit, &amountLimit, &groupID); err != nil {
 		return rollback(err)
 	}
 	if enabled != 1 {
@@ -330,8 +331,13 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if active >= concurrency {
 		return rollback(&QuotaError{Code: "concurrency_exceeded"})
 	}
+	// 未绑分组的密钥没有可授权的模型：与「模型不在组内」同一个错误出口。
+	// 顺序不能动——停用/并发的错误优先级保持与旧版一致。
+	if groupID == 0 {
+		return rollback(errors.New("model is not authorized for key"))
+	}
 	var inputPrice, outputPrice, cachedPrice, rate sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE k.id=? AND p.id=?`, in.ModelID, in.KeyID, in.ProviderID).Scan(&inputPrice, &outputPrice, &cachedPrice, &rate); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli FROM model_groups g JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE g.id=? AND g.enabled=1`, in.ModelID, groupID).Scan(&inputPrice, &outputPrice, &cachedPrice, &rate); err != nil {
 		return rollback(err)
 	}
 	if !inputPrice.Valid || !outputPrice.Valid || !cachedPrice.Valid || !rate.Valid {
@@ -444,7 +450,7 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 			return rollback(err)
 		}
 	}
-	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,reserved_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc,quote_input_microyuan,quote_output_microyuan,quote_cached_microyuan,quote_rate_milli) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, "reserved", inputTokens, reservedTokens, amount, boolInt(in.Stream), date, started, inputPrice.Int64, outputPrice.Int64, cachedPrice.Int64, rate.Int64)
+	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,group_id,status,input_tokens,reserved_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc,quote_input_microyuan,quote_output_microyuan,quote_cached_microyuan,quote_rate_milli) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, groupID, "reserved", inputTokens, reservedTokens, amount, boolInt(in.Stream), date, started, inputPrice.Int64, outputPrice.Int64, cachedPrice.Int64, rate.Int64)
 	if err != nil {
 		return rollback(err)
 	}
@@ -452,7 +458,7 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if err != nil {
 		return rollback(err)
 	}
-	result, err = conn.ExecContext(ctx, `INSERT INTO key_reservations(request_id,billing_date_bj,key_id,model_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (?,?,?,?,?,?,?,?)`, in.RequestID, date, in.KeyID, in.ModelID, reservedTokens, amount, "reserved", started)
+	result, err = conn.ExecContext(ctx, `INSERT INTO key_reservations(request_id,billing_date_bj,key_id,model_id,group_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (?,?,?,?,?,?,?,?,?)`, in.RequestID, date, in.KeyID, in.ModelID, groupID, reservedTokens, amount, "reserved", started)
 	if err != nil {
 		return rollback(err)
 	}
