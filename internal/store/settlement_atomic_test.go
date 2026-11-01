@@ -8,7 +8,7 @@ import (
 )
 
 func TestFinishReservationRollsBackBothLedgerRows(t *testing.T) {
-	repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+	repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 	ctx := context.Background()
 	r, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, model.ID, "atomic-failure", 10))
 	if err != nil {
@@ -41,7 +41,7 @@ func TestFinishReservationRollsBackBothLedgerRows(t *testing.T) {
 }
 
 func TestReaperReleasesLegacyOrphanReservation(t *testing.T) {
-	repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+	repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 	ctx := context.Background()
 	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
 	result, err := repo.db.ExecContext(ctx, `INSERT INTO key_reservations(key_id,model_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (?,?,?,?,?,?)`, key.ID, model.ID, 3, 7, "reserved", old)
@@ -66,7 +66,7 @@ func TestReaperReleasesLegacyOrphanReservation(t *testing.T) {
 }
 
 func TestReaperReleasesKeyReservationWhoseRequestAlreadyFinished(t *testing.T) {
-	repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+	repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 	ctx := context.Background()
 	input := newReservationArgs(key.ID, model.ID, "orphaned-key", 10)
 	input.StartedAt = time.Now().UTC().Add(-time.Hour)
@@ -95,7 +95,7 @@ func TestReaperComparesFractionalTimestampsChronologically(t *testing.T) {
 		{"whole second is older", base, base.Add(500 * time.Millisecond), 1, "aborted"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+			repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 			ctx := context.Background()
 			input := newReservationArgs(key.ID, model.ID, "fractional-reap", 10)
 			input.StartedAt = tc.startedAt
@@ -122,7 +122,7 @@ func TestReaperComparesFractionalTimestampsChronologically(t *testing.T) {
 }
 
 func TestFinishReservationConcurrentDuplicateChargesOnce(t *testing.T) {
-	repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+	repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 	ctx := context.Background()
 	r, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, model.ID, "concurrent-finish", 10))
 	if err != nil {
@@ -157,7 +157,7 @@ func TestFinishReservationConcurrentDuplicateChargesOnce(t *testing.T) {
 func TestDeletingResourcesCannotEraseActiveSettlement(t *testing.T) {
 	for _, target := range []string{"key", "model", "provider"} {
 		t.Run(target, func(t *testing.T) {
-			repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+			repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 			ctx := context.Background()
 			reservation, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, model.ID, "active-delete", 10))
 			if err != nil {

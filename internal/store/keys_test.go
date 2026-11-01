@@ -38,7 +38,7 @@ func TestNewKeyIsReturnedOnceAndStoredAsDigest(t *testing.T) {
 // 注意这里刻意不再断言"Key 用满即自动停用"——v0.3.2 起已移除该行为（旧行为会
 // 让运维调大限额后 Key 依然用不了），额度判定改由每次请求时进行。
 func TestSettlementIsIdempotent(t *testing.T) {
-	repo, key, model := newReservationFixture(t, 1000, 1_000_000)
+	repo, key, model, _ := newReservationFixture(t, 1000, 1_000_000)
 	reservation, err := repo.ReserveRequest(context.Background(), newReservationArgs(key.ID, model.ID, "request-idempotent", 10))
 	if err != nil {
 		t.Fatal(err)

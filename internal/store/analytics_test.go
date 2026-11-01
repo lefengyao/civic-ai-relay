@@ -7,7 +7,7 @@ import (
 )
 
 func TestAnalyticsFiltersRangeStatusModelAndBuckets(t *testing.T) {
-	repo, _, model := newReservationFixture(t, 100000, 100000000)
+	repo, _, model, _ := newReservationFixture(t, 100000, 100000000)
 	ctx := context.Background()
 	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 	seed := func(id, status string, at time.Time, tokens, amount int64) {
@@ -66,7 +66,7 @@ func TestAnalyticsRejectsInvalidRange(t *testing.T) {
 }
 
 func TestAnalyticsCalendarRangeUsesBeijingDaysAndZeroFills(t *testing.T) {
-	repo, _, model := newReservationFixture(t, 100000, 100000000)
+	repo, _, model, _ := newReservationFixture(t, 100000, 100000000)
 	ctx := context.Background()
 	now := time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC)
 	seedAt := time.Date(2026, 10, 28, 0, 30, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))

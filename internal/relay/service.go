@@ -370,23 +370,14 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		ledgerRequestID = trace.ID
 		clientRequestID = trace.ClientID
 	}
-	periodStart, _ := time.Parse(time.RFC3339, settings.PeriodLimitStart)
+	// 窗口额度不在这里传：判定在事务内从密钥所属分组读取（v18 起），
+	// 配置里只剩全局的 RPM 与本文件其他全局项。
 	reservation, err := s.store.ReserveRequest(ctx, store.ReserveInput{
 		RequestID: ledgerRequestID, KeyID: key.ID, ModelID: model.ID, ProviderID: model.ProviderID,
 		Stream: req.Stream, InputText: req.InputText, StringFields: stringFields,
 		OutputTokenCeiling: output, MaxOutputTokens: output,
 		InputPriceMicroyuan: valueOrZero(model.InputPriceMicroyuan), OutputPriceMicroyuan: valueOrZero(model.OutputPriceMicroyuan),
-		Limits: store.QuotaLimits{
-			RPMLimit:     int64(settings.RPMLimit),
-			Token5H:      settings.TokenLimit5H,
-			TokenDaily:   settings.TokenLimitDaily,
-			TokenWeekly:  settings.TokenLimitWeekly,
-			Amount5H:     settings.AmountLimit5H,
-			AmountDaily:  settings.AmountLimitDaily,
-			AmountWeekly: settings.AmountLimitWeekly,
-			TokenPeriod:  settings.TokenLimitPeriod, AmountPeriod: settings.AmountLimitPeriod,
-			PeriodDays: settings.PeriodLimitDays, PeriodStart: periodStart,
-		},
+		Limits: store.QuotaLimits{RPMLimit: int64(settings.RPMLimit)},
 	})
 	if err != nil {
 		s.keys.Release(key.ID)

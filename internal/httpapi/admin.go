@@ -248,17 +248,8 @@ func (h *AdminHandler) overview(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	settings := h.settings
 	h.mu.RUnlock()
-	data, err := h.repo.Overview(r.Context(), time.Now().UTC(), store.QuotaLimits{
-		RPMLimit:     int64(settings.RPMLimit),
-		Token5H:      settings.TokenLimit5H,
-		TokenDaily:   settings.TokenLimitDaily,
-		TokenWeekly:  settings.TokenLimitWeekly,
-		Amount5H:     settings.AmountLimit5H,
-		AmountDaily:  settings.AmountLimitDaily,
-		AmountWeekly: settings.AmountLimitWeekly,
-		TokenPeriod:  settings.TokenLimitPeriod, AmountPeriod: settings.AmountLimitPeriod,
-		PeriodDays: settings.PeriodLimitDays, PeriodStart: parsePeriodStart(settings.PeriodLimitStart),
-	})
+	// 概览只传全局 RPM：窗口额度已按分组存放，由 Overview 自己按组汇总。
+	data, err := h.repo.Overview(r.Context(), time.Now().UTC(), store.QuotaLimits{RPMLimit: int64(settings.RPMLimit)})
 	if err != nil {
 		writeAdminError(w, 500, "ledger_unavailable")
 		return

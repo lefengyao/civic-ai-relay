@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -134,5 +135,252 @@ func TestReserveQuotesRateFromSingleGroup(t *testing.T) {
 	}
 	if res.QuoteRateMilli != 1500 {
 		t.Fatalf("QuoteRateMilli = %d, want 1500", res.QuoteRateMilli)
+	}
+}
+
+// 分组额度取代全局额度后，窗口判定的数据来源是分组行：A 组用满不影响 B 组。
+func TestGroupQuotasAreIndependentAcrossGroups(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupB, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []ModelGroup{groupA, groupB} {
+		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keyA, err := repo.CreateClientKey(ctx, NewClientKey{Name: "ka", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := repo.CreateClientKey(ctx, NewClientKey{Name: "kb", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, keyA.ID, groupA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, keyB.ID, groupB.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A 组当日 Token 限额 50：一次预留（约 608）就把窗口灌满
+	if _, err := repo.UpdateModelGroup(ctx, groupA.ID, UpdateModelGroup{TokenLimitDaily: intPtr(50)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "a-first", 600)); err != nil {
+		t.Fatalf("A 组首笔应按先欠费后停服放行：%v", err)
+	}
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "a-second", 600))
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "daily" || quota.Code != "token_quota_exceeded" {
+		t.Fatalf("err = %v, want daily token_quota_exceeded", err)
+	}
+	// B 组没有限额：同样的负载完全不受 A 组影响
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelID, "b-first", 600)); err != nil {
+		t.Fatalf("B 组不应被 A 组的额度咬住：%v", err)
+	}
+	// 错误 detail 带分组信息（spec 第七节：运维要知道是哪个组咬住的）
+	if quota.Group == "" || quota.GroupID != groupA.ID {
+		t.Fatalf("quota detail 缺分组信息：group=%q id=%d", quota.Group, quota.GroupID)
+	}
+}
+
+// 每组各自独立周期：A 组周期用满切周限额，B 组的周期不受影响。
+func TestGroupPeriodsAreIndependent(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupB, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []ModelGroup{groupA, groupB} {
+		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keyA, err := repo.CreateClientKey(ctx, NewClientKey{Name: "ka", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, keyA.ID, groupA.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A 组：周期 50 tokens（起点自动填 now）+ 本周 50。
+	// 周期用满后按既有语义切到「本周」窗口（periodQuotaTransition 的交接），
+	// 所以第 2 笔被放行、第 3 笔才被本周额度挡下——两笔都算在 A 组自己的账上。
+	if _, err := repo.UpdateModelGroup(ctx, groupA.ID, UpdateModelGroup{
+		TokenLimitPeriod: intPtr(50),
+		TokenLimitWeekly: intPtr(50),
+		PeriodLimitDays:  daysPtr(3),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "period-a-1", 600)); err != nil {
+		t.Fatalf("A 组周期首笔应放行：%v", err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "period-a-2", 600)); err != nil {
+		t.Fatalf("A 组周期用满后应切到本周窗口继续放行：%v", err)
+	}
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "period-a-3", 600))
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "token_quota_exceeded" {
+		t.Fatalf("err = %v, want weekly token_quota_exceeded", err)
+	}
+	if quota.GroupID != groupA.ID {
+		t.Fatalf("quota 归属 = #%d, want A 组 #%d", quota.GroupID, groupA.ID)
+	}
+	// 周期是 A 组的状态：没有配周期也没有额度的 B 组完全不受影响
+	keyB, err := repo.CreateClientKey(ctx, NewClientKey{Name: "kb", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, keyB.ID, groupB.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelID, "period-b-1", 600)); err != nil {
+		t.Fatalf("B 组不应感知 A 组的周期：%v", err)
+	}
+}
+
+// 8 个维度里既有测试没覆盖的三条：5h Token、5h 金额、本周金额。
+func TestFiveHourTokenWindowBlocksAfterItIsSpent(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	group, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateModelGroup(ctx, group.ID, UpdateModelGroup{TokenLimit5H: intPtr(50)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "five-token-1", 600)); err != nil {
+		t.Fatalf("首笔应按先欠费后停服放行：%v", err)
+	}
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "five-token-2", 600))
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "5h" || quota.Code != "token_quota_exceeded" {
+		t.Fatalf("err = %v, want 5h token_quota_exceeded", err)
+	}
+}
+
+func TestFiveHourAmountWindowBlocksAfterItIsSpent(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	group, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateModelGroup(ctx, group.ID, UpdateModelGroup{AmountLimit5H: intPtr(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "five-amount-1", 600)); err != nil {
+		t.Fatalf("首笔应放行：%v", err)
+	}
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "five-amount-2", 600))
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "5h" || quota.Code != "amount_quota_exceeded" || quota.Metric != "amount" {
+		t.Fatalf("err = %v, want 5h amount_quota_exceeded", err)
+	}
+}
+
+func TestWeeklyAmountWindowBlocksAfterItIsSpent(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	group, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateModelGroup(ctx, group.ID, UpdateModelGroup{AmountLimitWeekly: intPtr(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "week-amount-1", 600)); err != nil {
+		t.Fatalf("首笔应放行：%v", err)
+	}
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "week-amount-2", 600))
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "amount_quota_exceeded" {
+		t.Fatalf("err = %v, want weekly amount_quota_exceeded", err)
+	}
+}
+
+// 周期起点自动填充之后，周期额度必须真的生效——这是 settings.go 那个
+// 「只填天数、起点留空」的坑在分组层的对应防线。
+func TestAutoFilledPeriodStartTakesEffect(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	group, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateModelGroup(ctx, group.ID, UpdateModelGroup{
+		TokenLimitPeriod: intPtr(50),
+		TokenLimitWeekly: intPtr(50),
+		PeriodLimitDays:  daysPtr(3),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "auto-period-1", 600)); err != nil {
+		t.Fatalf("首笔应放行：%v", err)
+	}
+	// 判别信号：起点被自动填充 → 第一笔落在周期内 → 周期用满后切到本周窗口
+	// （从切换点起算），第二笔仍放行。若起点没被填充，周期不生效、本周窗口从
+	// 周一算起，第二笔会立刻被本周额度拒掉——正是这里要防的静默失效。
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "auto-period-2", 600)); err != nil {
+		t.Fatalf("起点自动填充后第二笔应切到本周窗口放行，实际被拒：%v", err)
+	}
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "auto-period-3", 600))
+	var quota *QuotaError
+	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "token_quota_exceeded" {
+		t.Fatalf("err = %v, want weekly token_quota_exceeded（周期交接后的本周额度）", err)
 	}
 }
