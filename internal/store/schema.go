@@ -237,6 +237,29 @@ var migrations = []migration{
 		`ALTER TABLE providers ADD COLUMN protocol TEXT NOT NULL DEFAULT 'openai'`,
 		`CREATE INDEX idx_providers_protocol_enabled ON providers(protocol, enabled, id)`,
 	}},
+	// v16: 密钥与分组改为一对一（设计见 docs/superpowers/specs/2026-11-01-civic-relay-
+	// group-scoping-design.md 第五节）。client_keys.group_id 取代 key_groups
+	// 多对多表；两张账目表冗余一份 group_id，记录请求发生时的归属 —— 否则
+	// 「切换分组」会把历史用量整体搬到新组：旧组已用凭空减少、新组凭空增加，
+	// 额度判定被篡改。
+	//
+	// 回填规则取「倍率最大的组，同倍率取 id 最小」：这正是旧 MAX(g.rate_milli)
+	// 的计价口径，保证曾经多组的密钥迁移后计费倍率不变。
+	//
+	// key_groups 此时**保留**，由 v17 删除 —— 本条回填要以它为数据源。
+	// 对曾经属于多个组的密钥，账目表的历史行只能按迁移后的单一归属回填，是近似值。
+	{version: 16, statements: []string{
+		`ALTER TABLE client_keys ADD COLUMN group_id INTEGER REFERENCES model_groups(id) ON DELETE SET NULL`,
+		`UPDATE client_keys SET group_id = (
+			SELECT kg.group_id FROM key_groups kg JOIN model_groups g ON g.id = kg.group_id
+			WHERE kg.key_id = client_keys.id
+			ORDER BY g.rate_milli DESC, g.id ASC LIMIT 1
+		)`,
+		`ALTER TABLE key_reservations ADD COLUMN group_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN group_id INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE key_reservations SET group_id = COALESCE((SELECT group_id FROM client_keys WHERE id = key_reservations.key_id), 0)`,
+		`UPDATE requests SET group_id = COALESCE((SELECT group_id FROM client_keys WHERE id = requests.key_id), 0)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {
