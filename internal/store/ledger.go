@@ -614,10 +614,10 @@ func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	return result.RowsAffected()
 }
 
-// GroupOverview mirrors Overview but scopes every counter to requests that
-// went through providers currently attached to the given group. Token totals
-// read key_reservations (the authoritative ledger), joined back to requests
-// for the provider filter. No limits are applied here: quotas are global.
+// GroupOverview 返回单个分组的用量与额度。统计口径是「归属该组的请求」
+// （账目行的 group_id，由阶段 A 落下）——必须与额度扣减同口径，否则管理台
+// 显示的「已用/限额」和实际判定用的数字对不上；共享渠道不再被重复计入多个组。
+// 限额来自分组行（v18），与 ReserveRequest 的判定来源一致。
 func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time) (map[string]any, error) {
 	if groupID <= 0 {
 		return nil, errors.New("group ID is required")
@@ -629,25 +629,76 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 	nowText := now.Format(time.RFC3339Nano)
 	minuteStart := now.Add(-time.Minute).Format(time.RFC3339Nano)
 	fiveHourStart := now.Add(-5 * time.Hour).Format(time.RFC3339Nano)
-	weekStart := billingWeekStart(now).Format(time.RFC3339Nano)
 	hourStart := now.Add(-time.Hour).Format(time.RFC3339Nano)
 	date := billingDate(now)
-	scope := `provider_id IN (SELECT provider_id FROM group_providers WHERE group_id=?)`
+	var limits QuotaLimits
+	var groupName string
+	var periodDays int64
+	var periodStartRaw sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(name,''),COALESCE(token_limit_5h,0),COALESCE(amount_limit_5h,0),COALESCE(token_limit_daily,0),COALESCE(amount_limit_daily,0),COALESCE(token_limit_weekly,0),COALESCE(amount_limit_weekly,0),COALESCE(period_limit_days,0),COALESCE(token_limit_period,0),COALESCE(amount_limit_period,0),COALESCE(period_limit_start,'') FROM model_groups WHERE id=?`, groupID).
+		Scan(&groupName, &limits.Token5H, &limits.Amount5H, &limits.TokenDaily, &limits.AmountDaily,
+			&limits.TokenWeekly, &limits.AmountWeekly, &periodDays, &limits.TokenPeriod,
+			&limits.AmountPeriod, &periodStartRaw); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// 组不存在时按「空概览」处理（沿用旧行为）：管理台在组被删掉的瞬间
+		// 仍可能在轮询这个端点，返回 500 只会制造误报。
+		return nil, err
+	}
+	limits.PeriodDays = int(periodDays)
+	if periodStartRaw.Valid && periodStartRaw.String != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339, periodStartRaw.String); parseErr == nil {
+			limits.PeriodStart = parsed
+		}
+	}
 	var rpm int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE `+scope+` AND created_at_utc>=? AND created_at_utc<=?`, groupID, minuteStart, nowText).Scan(&rpm); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE group_id=? AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<=julianday(?)`, groupID, minuteStart, nowText).Scan(&rpm); err != nil {
 		return nil, err
 	}
-	var fiveHour, fiveHourAmount, daily, dailyAmount, weekly, weeklyAmount int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0),COALESCE(SUM(kr.charged_amount_microyuan+kr.reserved_amount_microyuan),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.created_at_utc>=? AND kr.created_at_utc<=?`, groupID, fiveHourStart, nowText).Scan(&fiveHour, &fiveHourAmount); err != nil {
+	fiveHour, fiveHourAmount, err := s.windowUsage(ctx, `group_id=? AND created_at_utc>=? AND created_at_utc<=?`, groupID, fiveHourStart, nowText)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0),COALESCE(SUM(kr.charged_amount_microyuan+kr.reserved_amount_microyuan),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.billing_date_bj=? AND kr.created_at_utc<=?`, groupID, date, nowText).Scan(&daily, &dailyAmount); err != nil {
+	daily, dailyAmount, err := s.windowUsage(ctx, `group_id=? AND billing_date_bj=? AND created_at_utc<=?`, groupID, date, nowText)
+	if err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(kr.reserved_tokens+kr.charged_tokens),0),COALESCE(SUM(kr.charged_amount_microyuan+kr.reserved_amount_microyuan),0) FROM key_reservations kr JOIN requests r ON r.request_id=kr.request_id WHERE kr.request_id IS NOT NULL AND kr.status IN ('reserved','completed','failed','aborted') AND `+scope+` AND kr.created_at_utc>=? AND kr.created_at_utc<=?`, groupID, weekStart, nowText).Scan(&weekly, &weeklyAmount); err != nil {
+	// 周期窗口的边界同样交给 periodQuotaTransition 判定：它与扣减同口径，
+	// 周期用满后本周窗口自动退化为「从交接点算起」。
+	weekStart, periodActiveNow := weeklyWindowStart(now, limits)
+	var periodTransition time.Time
+	if periodActiveNow {
+		conn, connErr := s.db.Conn(ctx)
+		if connErr != nil {
+			return nil, connErr
+		}
+		periodTransition, _, _, connErr = periodQuotaTransition(ctx, conn, limits, groupID, nowText)
+		conn.Close()
+		if connErr != nil {
+			return nil, connErr
+		}
+		if !periodTransition.IsZero() {
+			periodActiveNow = false
+			weekStart = periodTransition
+		}
+	}
+	weekFilter := `group_id=? AND created_at_utc>=? AND created_at_utc<=?`
+	if !periodTransition.IsZero() {
+		weekFilter = `group_id=? AND created_at_utc>? AND created_at_utc<=?`
+	}
+	weekly, weeklyAmount, err := s.windowUsage(ctx, weekFilter, groupID, weekStart.Format(time.RFC3339Nano), nowText)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE `+scope+` AND created_at_utc>=? AND created_at_utc<=? GROUP BY status`, groupID, hourStart, nowText)
+	periodStartText, periodEndText := "", ""
+	var periodTokens, periodAmount int64
+	if limits.PeriodDays > 0 && !limits.PeriodStart.IsZero() {
+		periodStartText = limits.PeriodStart.Format(time.RFC3339Nano)
+		periodEndText = limits.PeriodStart.AddDate(0, 0, limits.PeriodDays).Format(time.RFC3339Nano)
+		periodTokens, periodAmount, err = s.windowUsage(ctx, `group_id=? AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<julianday(?)`, groupID, periodStartText, periodEndText)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE group_id=? AND created_at_utc>=? AND created_at_utc<=? GROUP BY status`, groupID, hourStart, nowText)
 	if err != nil {
 		return nil, err
 	}
@@ -667,7 +718,7 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 		return nil, err
 	}
 	var active int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE `+scope+` AND status='reserved'`, groupID).Scan(&active); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE group_id=? AND status='reserved'`, groupID).Scan(&active); err != nil {
 		return nil, err
 	}
 	denominator := outcomes["completed"] + outcomes["failed"]
@@ -677,14 +728,62 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 	}
 	return map[string]any{
 		"group_id":         groupID,
+		"group_name":       groupName,
 		"generated_at_utc": nowText,
-		"rpm":              map[string]any{"used": rpm},
-		"five_hour":        map[string]any{"used_tokens": fiveHour, "used_microyuan": fiveHourAmount},
-		"daily":            map[string]any{"used_tokens": daily, "used_microyuan": dailyAmount},
-		"weekly":           map[string]any{"used_tokens": weekly, "used_microyuan": weeklyAmount},
-		"last_hour":        map[string]any{"completed": outcomes["completed"], "failed": outcomes["failed"], "aborted": outcomes["aborted"], "rejected": outcomes["rejected"], "reserved": outcomes["reserved"], "error_rate": errorRate},
-		"active":           active,
+		"rpm":              map[string]any{"used": rpm, "limit": limits.RPMLimit},
+		"five_hour":        map[string]any{"used_tokens": fiveHour, "limit": limits.Token5H, "used_microyuan": fiveHourAmount, "amount_limit": limits.Amount5H},
+		"daily":            map[string]any{"used_tokens": daily, "limit": limits.TokenDaily, "used_microyuan": dailyAmount, "amount_limit": limits.AmountDaily},
+		"weekly":           map[string]any{"used_tokens": weekly, "limit": limits.TokenWeekly, "used_microyuan": weeklyAmount, "amount_limit": limits.AmountWeekly, "active": !periodActiveNow, "from_utc": weekStart.Format(time.RFC3339Nano)},
+		"period": map[string]any{"used_tokens": periodTokens, "limit": limits.TokenPeriod, "used_microyuan": periodAmount, "amount_limit": limits.AmountPeriod, "active": periodActiveNow, "start_utc": periodStartText, "end_utc": periodEndText, "transition_utc": func() string {
+			if periodTransition.IsZero() {
+				return ""
+			}
+			return periodTransition.Format(time.RFC3339Nano)
+		}()},
+		"last_hour": map[string]any{"completed": outcomes["completed"], "failed": outcomes["failed"], "aborted": outcomes["aborted"], "rejected": outcomes["rejected"], "reserved": outcomes["reserved"], "error_rate": errorRate},
+		"active":    active,
 	}, nil
+}
+
+// GroupUsageBuckets 返回每个分组在三个主窗口的 (token, 微元) 用量，供分组
+// 列表渲染额度紧张标记。周期窗口不参与：它按组独立启停，批量算切换点成本高，
+// 是否咬住看各组概览弹窗。
+func (s *Store) GroupUsageBuckets(ctx context.Context, now time.Time) (five, daily, weekly map[int64][2]int64, err error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	nowText := now.Format(time.RFC3339Nano)
+	fiveHourStart := now.Add(-5 * time.Hour).Format(time.RFC3339Nano)
+	date := billingDate(now)
+	weekStart := billingWeekStart(now).Format(time.RFC3339Nano)
+	five, daily, weekly = make(map[int64][2]int64), make(map[int64][2]int64), make(map[int64][2]int64)
+	load := func(into map[int64][2]int64, filter string, args ...any) error {
+		rows, err := s.db.QueryContext(ctx, `SELECT group_id,COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND group_id>0 AND `+filter+` GROUP BY group_id`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			var bucket [2]int64
+			if err := rows.Scan(&id, &bucket[0], &bucket[1]); err != nil {
+				return err
+			}
+			into[id] = bucket
+		}
+		return rows.Err()
+	}
+	if err = load(five, `created_at_utc>=? AND created_at_utc<=?`, fiveHourStart, nowText); err != nil {
+		return nil, nil, nil, err
+	}
+	if err = load(daily, `billing_date_bj=? AND created_at_utc<=?`, date, nowText); err != nil {
+		return nil, nil, nil, err
+	}
+	if err = load(weekly, `created_at_utc>=? AND created_at_utc<=?`, weekStart, nowText); err != nil {
+		return nil, nil, nil, err
+	}
+	return five, daily, weekly, nil
 }
 
 // windowUsage 汇总 key_reservations 在给定条件下的（token, 微元）用量。
@@ -705,7 +804,9 @@ func (s *Store) windowUsage(ctx context.Context, extra string, args ...any) (int
 // Overview returns metadata-only counters used by the administrator console.
 // It deliberately accepts limits as arguments so configuration remains outside
 // the store and no credentials or prompts can enter the response.
-// 限额为 0 表示该窗口不限，原样回传，由前端显示为「不限」。
+//
+// 额度不再出现在全局概览里：v18 起额度按分组分配（见 GroupOverview），
+// 这里只剩全局限流（RPM）与健康度指标。
 func (s *Store) Overview(ctx context.Context, now time.Time, limits QuotaLimits) (map[string]any, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -713,42 +814,10 @@ func (s *Store) Overview(ctx context.Context, now time.Time, limits QuotaLimits)
 	now = now.UTC()
 	nowText := now.Format(time.RFC3339Nano)
 	minuteStart := now.Add(-time.Minute).Format(time.RFC3339Nano)
-	fiveHourStart := now.Add(-5 * time.Hour).Format(time.RFC3339Nano)
 	hourStart := now.Add(-time.Hour)
-	date := billingDate(now)
 	var rpm int
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE created_at_utc>=? AND created_at_utc<=?`, minuteStart, nowText).Scan(&rpm); err != nil {
 		return nil, err
-	}
-	fiveTokens, fiveAmount, err := s.windowUsage(ctx, `created_at_utc>=? AND created_at_utc<=?`, fiveHourStart, nowText)
-	if err != nil {
-		return nil, err
-	}
-	dayTokens, dayAmount, err := s.windowUsage(ctx, `billing_date_bj=? AND created_at_utc<=?`, date, nowText)
-	if err != nil {
-		return nil, err
-	}
-	// 周期窗口已改为按组归属（见 GroupOverview）：全局概览不再有「周期」这一层，
-	// limits 里也不会再带周期参数，这里只剩自然周起点。
-	weekStart, _ := weeklyWindowStart(now, limits)
-	var periodTransition time.Time
-	weekFilter := `created_at_utc>=? AND created_at_utc<=?`
-	if !periodTransition.IsZero() {
-		weekFilter = `created_at_utc>? AND created_at_utc<=?`
-	}
-	weekTokens, weekAmount, err := s.windowUsage(ctx, weekFilter, weekStart.Format(time.RFC3339Nano), nowText)
-	if err != nil {
-		return nil, err
-	}
-	periodStart, periodEnd := "", ""
-	var periodTokens, periodAmount int64
-	if limits.PeriodDays > 0 && !limits.PeriodStart.IsZero() {
-		periodStart = limits.PeriodStart.Format(time.RFC3339Nano)
-		periodEnd = limits.PeriodStart.AddDate(0, 0, limits.PeriodDays).Format(time.RFC3339Nano)
-		periodTokens, periodAmount, err = s.windowUsage(ctx, `created_at_utc>=? AND created_at_utc<?`, periodStart, periodEnd)
-		if err != nil {
-			return nil, err
-		}
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE created_at_utc>=? AND created_at_utc<=? GROUP BY status`, hourStart.Format(time.RFC3339Nano), nowText)
 	if err != nil {
@@ -833,18 +902,9 @@ func (s *Store) Overview(ctx context.Context, now time.Time, limits QuotaLimits)
 	return map[string]any{
 		"generated_at_utc": nowText,
 		"rpm":              map[string]any{"used": rpm, "limit": limits.RPMLimit},
-		"five_hour":        map[string]any{"used_tokens": fiveTokens, "limit": limits.Token5H, "used_microyuan": fiveAmount, "amount_limit": limits.Amount5H},
-		"daily":            map[string]any{"used_tokens": dayTokens, "limit": limits.TokenDaily, "used_microyuan": dayAmount, "amount_limit": limits.AmountDaily},
-		"weekly":           map[string]any{"used_tokens": weekTokens, "limit": limits.TokenWeekly, "used_microyuan": weekAmount, "amount_limit": limits.AmountWeekly, "active": true, "from_utc": weekStart.Format(time.RFC3339Nano)},
-		"period": map[string]any{"used_tokens": periodTokens, "limit": limits.TokenPeriod, "used_microyuan": periodAmount, "amount_limit": limits.AmountPeriod, "active": false, "start_utc": periodStart, "end_utc": periodEnd, "transition_utc": func() string {
-			if periodTransition.IsZero() {
-				return periodEnd
-			}
-			return periodTransition.Format(time.RFC3339Nano)
-		}()},
-		"last_hour":   map[string]any{"completed": outcomes["completed"], "failed": outcomes["failed"], "aborted": outcomes["aborted"], "rejected": outcomes["rejected"], "reserved": outcomes["reserved"], "error_rate": errorRate},
-		"trend":       trend,
-		"model_calls": modelCalls,
-		"recent":      recent,
+		"last_hour":        map[string]any{"completed": outcomes["completed"], "failed": outcomes["failed"], "aborted": outcomes["aborted"], "rejected": outcomes["rejected"], "reserved": outcomes["reserved"], "error_rate": errorRate},
+		"trend":            trend,
+		"model_calls":      modelCalls,
+		"recent":           recent,
 	}, nil
 }

@@ -764,3 +764,96 @@ func TestAdminKeyGroupSingleBinding(t *testing.T) {
 		t.Fatalf("创建带负数 group_id 应 400 invalid_request，实际 %d：%s", negCreate.Code, negCreate.Body.String())
 	}
 }
+
+// 分组额度：PUT 认字段、groupsList 回显（编辑弹窗靠它 prefill）、
+// DELETE 带解绑密钥数（删组确认框靠它告知影响面）。
+func TestAdminGroupQuotaFieldsRoundTrip(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey, map[string]any{"name": "额度组"})
+	if created.Code != http.StatusCreated {
+		t.Fatal(created.Body.String())
+	}
+	var groupBody struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &groupBody); err != nil {
+		t.Fatal(err)
+	}
+	path := "/admin/api/groups/" + itoa(groupBody.Data.ID)
+
+	put := adminRequest(t, handler, http.MethodPut, path, adminKey, map[string]any{
+		"token_limit_daily": 5000, "amount_limit_daily": 1_500_000, "period_limit_days": 7,
+	})
+	if put.Code != http.StatusOK {
+		t.Fatalf("PUT 额度失败：%d %s", put.Code, put.Body.String())
+	}
+
+	list := adminRequest(t, handler, http.MethodGet, "/admin/api/groups", adminKey, nil)
+	if list.Code != http.StatusOK {
+		t.Fatal(list.Body.String())
+	}
+	var listBody struct {
+		Data []struct {
+			ID               int64   `json:"ID"`
+			TokenLimitDaily  *int64  `json:"TokenLimitDaily"`
+			AmountLimitDaily *int64  `json:"AmountLimitDaily"`
+			PeriodLimitDays  *int    `json:"PeriodLimitDays"`
+			PeriodLimitStart *string `json:"PeriodLimitStart"`
+			BoundKeys        int64   `json:"BoundKeys"`
+			Overdrawn        bool    `json:"Overdrawn"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(listBody.Data) != 1 {
+		t.Fatalf("分组数 = %d", len(listBody.Data))
+	}
+	got := listBody.Data[0]
+	if got.TokenLimitDaily == nil || *got.TokenLimitDaily != 5000 ||
+		got.AmountLimitDaily == nil || *got.AmountLimitDaily != 1_500_000 ||
+		got.PeriodLimitDays == nil || *got.PeriodLimitDays != 7 {
+		t.Fatalf("列表未回显额度：%+v", got)
+	}
+	// 周期天数 > 0 且起点留空 → 后端自动填起点（否则周期静默不生效）
+	if got.PeriodLimitStart == nil || *got.PeriodLimitStart == "" {
+		t.Fatal("period_limit_start 应被自动填充")
+	}
+	if got.Overdrawn {
+		t.Fatal("没有任何用量时不应标记欠费")
+	}
+
+	// 只改名（不传额度）不应清掉额度：nil = 不动
+	rename := adminRequest(t, handler, http.MethodPut, path, adminKey, map[string]any{"name": "改个名"})
+	if rename.Code != http.StatusOK {
+		t.Fatalf("改名失败：%d %s", rename.Code, rename.Body.String())
+	}
+	var renamed struct {
+		Data struct {
+			TokenLimitDaily *int64 `json:"TokenLimitDaily"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rename.Body.Bytes(), &renamed); err != nil {
+		t.Fatal(err)
+	}
+	if renamed.Data.TokenLimitDaily == nil || *renamed.Data.TokenLimitDaily != 5000 {
+		t.Fatalf("改名误清额度：%+v", renamed.Data)
+	}
+
+	del := adminRequest(t, handler, http.MethodDelete, path, adminKey, nil)
+	if del.Code != http.StatusOK {
+		t.Fatalf("删除失败：%d %s", del.Code, del.Body.String())
+	}
+	var delBody struct {
+		OK          bool  `json:"ok"`
+		UnboundKeys int64 `json:"unbound_keys"`
+	}
+	if err := json.Unmarshal(del.Body.Bytes(), &delBody); err != nil {
+		t.Fatal(err)
+	}
+	if !delBody.OK || delBody.UnboundKeys != 0 {
+		t.Fatalf("删组响应 = %+v，want ok 且 unbound_keys 0", delBody)
+	}
+}

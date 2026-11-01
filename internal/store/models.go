@@ -422,6 +422,17 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 	return out, rows.Err()
 }
 
+// CountKeysInGroup 数出绑定到某分组的密钥数，供删除确认框告知影响面：
+// 一对一之后删组会把该组所有密钥变成未绑、立即无法调用（spec 5.1）。
+func (s *Store) CountKeysInGroup(ctx context.Context, groupID int64) (int64, error) {
+	if groupID <= 0 {
+		return 0, errors.New("group ID is required")
+	}
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM client_keys WHERE group_id=?`, groupID).Scan(&n)
+	return n, err
+}
+
 // GroupProviderIDs returns the provider (channel) IDs currently assigned to a
 // group, ordered by provider ID. Used by the administration console to prefill
 // group editing. A group manages providers; authorized models are derived from

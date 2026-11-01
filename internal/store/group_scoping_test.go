@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setupGroupScope(t *testing.T) (*Store, int64, int64) {
@@ -382,5 +383,139 @@ func TestAutoFilledPeriodStartTakesEffect(t *testing.T) {
 	var quota *QuotaError
 	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "token_quota_exceeded" {
 		t.Fatalf("err = %v, want weekly token_quota_exceeded（周期交接后的本周额度）", err)
+	}
+}
+
+// GroupOverview 的限额来自分组行，且统计口径是「归属该组的请求」（group_id 列），
+// 不再是「走组内渠道的请求」——共享渠道不再被重复计入多个组。
+func TestGroupOverviewCarriesGroupLimits(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupB, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range []ModelGroup{groupA, groupB} {
+		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := repo.UpdateModelGroup(ctx, groupA.ID, UpdateModelGroup{TokenLimitDaily: intPtr(5000)}); err != nil {
+		t.Fatal(err)
+	}
+	keyA, err := repo.CreateClientKey(ctx, NewClientKey{Name: "ka", ConcurrencyLimit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, keyA.ID, groupA.ID); err != nil {
+		t.Fatal(err)
+	}
+	res, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "ov-a", 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SettleRequest(ctx, res.ID, 10, 20, 0, 30, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	ov, err := repo.GroupOverview(ctx, groupA.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ov["daily"].(map[string]any)["limit"]; got != int64(5000) {
+		t.Fatalf("daily limit = %v, want 5000（来自分组行）", got)
+	}
+	// keyB 的请求不属于 A 组，即使渠道共享：B 组的组概览看得到，A 组看不到
+	keyB, err := repo.CreateClientKey(ctx, NewClientKey{Name: "kb", ConcurrencyLimit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, keyB.ID, groupB.ID); err != nil {
+		t.Fatal(err)
+	}
+	resB, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelID, "ov-b", 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SettleRequest(ctx, resB.ID, 7, 8, 0, 15, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	ovA, err := repo.GroupOverview(ctx, groupA.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ovA["daily"].(map[string]any)["used_tokens"]; got != int64(30) {
+		t.Fatalf("A 组 daily tokens = %v, want 30（B 组的 15 不计入）", got)
+	}
+	ovB, err := repo.GroupOverview(ctx, groupB.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ovB["daily"].(map[string]any)["used_tokens"]; got != int64(15) {
+		t.Fatalf("B 组 daily tokens = %v, want 15", got)
+	}
+	if got := ovB["group_name"]; got != "b" {
+		t.Fatalf("group_name = %v, want b", got)
+	}
+}
+
+// 删组影响面：删除前能数出将解绑多少把密钥（spec 5.1 末尾）。
+func TestCountKeysInGroup(t *testing.T) {
+	ctx := context.Background()
+	repo, _, _ := setupGroupScope(t)
+	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := repo.CountKeysInGroup(ctx, groupA.ID)
+	if err != nil || n != 0 {
+		t.Fatalf("n = %d, %v", n, err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, groupA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = repo.CountKeysInGroup(ctx, groupA.ID); err != nil || n != 1 {
+		t.Fatalf("n = %d, %v", n, err)
+	}
+}
+
+// 分组列表的紧张度：只有三个主窗口的 Token 限额参与，全部不限时为 0。
+func TestGroupUsageBucketsGroupsByOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	group, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	res, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "bucket", 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SettleRequest(ctx, res.ID, 10, 20, 0, 30, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	five, daily, weekly, err := repo.GroupUsageBuckets(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if daily[group.ID][0] != 30 || five[group.ID][0] != 30 || weekly[group.ID][0] != 30 {
+		t.Fatalf("buckets = five %v daily %v weekly %v, want 30 each", five[group.ID], daily[group.ID], weekly[group.ID])
 	}
 }

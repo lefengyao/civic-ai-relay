@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -624,7 +625,56 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 500, "store_error")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"data": data})
+	five, daily, weekly, err := h.repo.GroupUsageBuckets(r.Context(), time.Now().UTC())
+	if err != nil {
+		writeAdminError(w, 500, "usage_error")
+		return
+	}
+	// 紧张度：三个主窗口里「有限额的」取已用/限额的最大百分比；全部不限则 0。
+	// ≥100 的组已欠费，下一个请求就会被拒——与 quotaCard 的着色阈值一致。
+	// 金额窗口不参与标记：Token 更直观，且金额含预留波动大（取舍，非遗漏）。
+	// 自定义周期不参与：按组独立启停，批量算切换点成本高，看组概览弹窗。
+	tension := func(limit *int64, used int64) (float64, bool) {
+		if limit == nil || *limit <= 0 {
+			return 0, false
+		}
+		return float64(used) / float64(*limit) * 100, used >= *limit
+	}
+	// 响应保持与旧 struct 相同的键名（前端按 ID/Name/Enabled/RateMilli 读），
+	// 另加额度字段供编辑弹窗回显，加 BoundKeys/TensionPct/Overdrawn 供列表展示。
+	items := make([]map[string]any, 0, len(data))
+	for _, g := range data {
+		pct, over := 0.0, false
+		for _, c := range []struct {
+			limit *int64
+			used  [2]int64
+		}{
+			{g.TokenLimit5H, five[g.ID]},
+			{g.TokenLimitDaily, daily[g.ID]},
+			{g.TokenLimitWeekly, weekly[g.ID]},
+		} {
+			p, o := tension(c.limit, c.used[0])
+			if o {
+				over = true
+			}
+			if p > pct {
+				pct = p
+			}
+		}
+		items = append(items, map[string]any{
+			"ID": g.ID, "Name": g.Name, "Enabled": g.Enabled, "RateMilli": g.RateMilli,
+			"BoundKeys":       g.BoundKeys,
+			"TokenLimit5H":    g.TokenLimit5H,
+			"AmountLimit5H":   g.AmountLimit5H,
+			"TokenLimitDaily": g.TokenLimitDaily, "AmountLimitDaily": g.AmountLimitDaily,
+			"TokenLimitWeekly": g.TokenLimitWeekly, "AmountLimitWeekly": g.AmountLimitWeekly,
+			"PeriodLimitDays": g.PeriodLimitDays, "PeriodLimitStart": g.PeriodLimitStart,
+			"TokenLimitPeriod": g.TokenLimitPeriod, "AmountLimitPeriod": g.AmountLimitPeriod,
+			"TensionPct": math.Round(pct*10) / 10,
+			"Overdrawn":  over,
+		})
+	}
+	writeJSON(w, 200, map[string]any{"data": items})
 }
 
 // groupsHealth 返回每个分组最近一次监测结果（键为分组 ID），以及当前是否开启了
@@ -695,7 +745,18 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 		return
 	}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
-		writeDeleteResult(w, h.repo.DeleteModelGroup(r.Context(), id))
+		// 一对一之后删组会把组内密钥变成未绑、立即无法调用任何模型（spec 5.1），
+		// 所以响应里带上影响面，让确认框与 API 调用方都能看到「解绑了几把密钥」。
+		bound, err := h.repo.CountKeysInGroup(r.Context(), id)
+		if err != nil {
+			writeAdminError(w, 500, "store_error")
+			return
+		}
+		if err := h.repo.DeleteModelGroup(r.Context(), id); err != nil {
+			writeDeleteResult(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "unbound_keys": bound})
 		return
 	}
 	if len(parts) == 1 && r.Method == http.MethodPut {
@@ -704,6 +765,17 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			Enabled   *bool    `json:"enabled"`
 			Rate      *float64 `json:"rate"`
 			RateMilli *int64   `json:"rate_milli"`
+			// 分组额度（v18）：缺省 = 不动；0 = 不限；负数由 store 拒绝。
+			TokenLimit5H      *int64  `json:"token_limit_5h"`
+			AmountLimit5H     *int64  `json:"amount_limit_5h"`
+			TokenLimitDaily   *int64  `json:"token_limit_daily"`
+			AmountLimitDaily  *int64  `json:"amount_limit_daily"`
+			TokenLimitWeekly  *int64  `json:"token_limit_weekly"`
+			AmountLimitWeekly *int64  `json:"amount_limit_weekly"`
+			PeriodLimitDays   *int    `json:"period_limit_days"`
+			TokenLimitPeriod  *int64  `json:"token_limit_period"`
+			AmountLimitPeriod *int64  `json:"amount_limit_period"`
+			PeriodLimitStart  *string `json:"period_limit_start"`
 		}
 		if json.NewDecoder(r.Body).Decode(&p) != nil {
 			writeAdminError(w, 400, "invalid_request")
@@ -714,7 +786,14 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			v := rateMilli(p.Rate, p.RateMilli)
 			rate = &v
 		}
-		g, err := h.repo.UpdateModelGroup(r.Context(), id, store.UpdateModelGroup{Name: p.Name, Enabled: p.Enabled, RateMilli: rate})
+		g, err := h.repo.UpdateModelGroup(r.Context(), id, store.UpdateModelGroup{
+			Name: p.Name, Enabled: p.Enabled, RateMilli: rate,
+			TokenLimit5H: p.TokenLimit5H, AmountLimit5H: p.AmountLimit5H,
+			TokenLimitDaily: p.TokenLimitDaily, AmountLimitDaily: p.AmountLimitDaily,
+			TokenLimitWeekly: p.TokenLimitWeekly, AmountLimitWeekly: p.AmountLimitWeekly,
+			PeriodLimitDays: p.PeriodLimitDays, TokenLimitPeriod: p.TokenLimitPeriod,
+			AmountLimitPeriod: p.AmountLimitPeriod, PeriodStart: p.PeriodLimitStart,
+		})
 		if err != nil {
 			writeAdminError(w, 400, "group_invalid")
 			return

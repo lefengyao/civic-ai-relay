@@ -376,7 +376,7 @@ func TestHealthcheckAndPruneOperateOnMetadata(t *testing.T) {
 	}
 }
 
-func TestGroupOverviewScopesToGroupProviders(t *testing.T) {
+func TestGroupOverviewScopesToGroupOwnership(t *testing.T) {
 	repo, key, model, _ := newReservationFixture(t, 600, 1_000_000)
 	reservation, err := repo.ReserveRequest(context.Background(), newReservationArgs(key.ID, model.ID, "request-group-overview", 100))
 	if err != nil {
@@ -411,7 +411,7 @@ func TestGroupOverviewScopesToGroupProviders(t *testing.T) {
 	if overview["active"].(int) != 0 {
 		t.Fatalf("active = %d, want 0", overview["active"])
 	}
-	// 未包含任何渠道的组不应看到任何统计
+	// 没有任何请求归属的组不应看到任何统计
 	empty, err := repo.GroupOverview(context.Background(), 999, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
