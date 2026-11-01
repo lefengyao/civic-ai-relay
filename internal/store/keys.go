@@ -453,6 +453,8 @@ func (s *Store) KeyGroupIDs(ctx context.Context, keyID int64) ([]int64, error) {
 
 // SetKeyGroup 把密钥绑到唯一分组，groupID <= 0 表示解绑（授权模型随即为空）。
 // 取代旧的 ReplaceKeyGroups 多对多写入；组必须存在且启用，与旧校验一致。
+// 注意：Task 3 切换之前，授权/计价读路径（authorizedModelsSelect、ledger 计价）
+// 仍走 key_groups，本函数暂不影响实际授权口径；ReplaceKeyGroups 暂勿删除。
 func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 	if keyID <= 0 {
 		return errors.New("key ID is required")

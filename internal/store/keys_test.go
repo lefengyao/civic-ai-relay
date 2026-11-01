@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -282,7 +283,11 @@ func TestSetKeyGroupBindsUnbindsAndValidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 新建的 Key 未绑分组
-	if fresh, _ := repo.GetClientKey(ctx, key.ID); fresh.GroupID != nil {
+	fresh, err := repo.GetClientKey(ctx, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.GroupID != nil {
 		t.Fatalf("新建 Key 不应有分组：%v", fresh.GroupID)
 	}
 
@@ -313,11 +318,11 @@ func TestSetKeyGroupBindsUnbindsAndValidates(t *testing.T) {
 	if _, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{Enabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.SetKeyGroup(ctx, key.ID, g.ID); err == nil {
-		t.Fatal("停用的组被接受")
+	if err := repo.SetKeyGroup(ctx, key.ID, g.ID); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("停用的组应报 disabled，实际 %v", err)
 	}
 	// 不存在的 Key
-	if err := repo.SetKeyGroup(ctx, 99999, g.ID); err == nil {
-		t.Fatal("不存在的 Key 被接受")
+	if err := repo.SetKeyGroup(ctx, 99999, g.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("不存在的 Key 应报 ErrNoRows，实际 %v", err)
 	}
 }
