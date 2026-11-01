@@ -271,6 +271,26 @@ var migrations = []migration{
 		`CREATE INDEX idx_key_reservations_group_time ON key_reservations(group_id, created_at_utc)`,
 		`CREATE INDEX idx_requests_group_time ON requests(group_id, created_at_utc)`,
 	}},
+	// v18: 分组额度（取代全局额度，设计见 docs/superpowers/specs/2026-11-01-…
+	// -group-scoping-design.md 第 5.1/5.3 节）。10 列全部可空：NULL 或 0 = 不限，
+	// 沿用「限额是运维显式选择」的既有口径——升级后所有分组默认不限，不会突然
+	// 出现意外拒绝。
+	//
+	// 全局额度值在 relay.env（配置）而不是数据库，所以「搬进每个现有分组」
+	// 不能用 SQL 迁移完成：由启动时的播种逻辑读原值 → 只填 IS NULL 的列 →
+	// 从 relay.env 删键（删键本身就是幂等标记，见 cmd/civic-relay/main.go）。
+	{version: 18, statements: []string{
+		`ALTER TABLE model_groups ADD COLUMN token_limit_5h INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN amount_limit_5h INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN token_limit_daily INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN amount_limit_daily INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN token_limit_weekly INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN amount_limit_weekly INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN period_limit_days INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN token_limit_period INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN amount_limit_period INTEGER`,
+		`ALTER TABLE model_groups ADD COLUMN period_limit_start TEXT`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

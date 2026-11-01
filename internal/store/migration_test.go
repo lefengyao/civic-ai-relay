@@ -136,4 +136,23 @@ func TestMigrationV16BackfillPicksHighestRate(t *testing.T) {
 			t.Fatalf("missing index %s", idx)
 		}
 	}
+
+	// v18: model_groups 的 10 个额度列。全部可空，NULL/0 = 不限；
+	// 全局额度值在 relay.env（配置）而非数据库，播种由 Go 侧在启动时做。
+	applyMigration(db, t, 18)
+	for _, col := range []string{
+		"token_limit_5h", "amount_limit_5h",
+		"token_limit_daily", "amount_limit_daily",
+		"token_limit_weekly", "amount_limit_weekly",
+		"period_limit_days", "token_limit_period", "amount_limit_period",
+		"period_limit_start",
+	} {
+		var count int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('model_groups') WHERE name=?`, col).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("missing column model_groups.%s", col)
+		}
+	}
 }
