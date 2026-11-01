@@ -10,6 +10,8 @@ import (
 
 // openLegacyV15 在临时文件上手工执行 v1..v15 的迁移语句，构造一个「升级前」的
 // 库。迁移是包级变量，测试与实现在同一个包里，可以直接遍历执行。
+// 与 applySchema 的差异：不走事务、不写 schema_migrations 版本记录——
+// 本测试只验证语句本身的语义；若将来 applySchema 给迁移加事务外的逻辑，这里测不到。
 func openLegacyV15(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "legacy.db")) + "?_pragma=foreign_keys(ON)"
@@ -62,10 +64,15 @@ func TestMigrationV16BackfillPicksHighestRate(t *testing.T) {
 	mustExec(`INSERT INTO models(id,provider_id,public_name,upstream_name,enabled,created_at_utc,updated_at_utc) VALUES (1,1,'m','m',1,` + ts + `,` + ts + `)`)
 	mustExec(`INSERT INTO model_groups(id,name,rate_milli,enabled,created_at_utc,updated_at_utc) VALUES (1,'cheap',1000,1,` + ts + `,` + ts + `)`)
 	mustExec(`INSERT INTO model_groups(id,name,rate_milli,enabled,created_at_utc,updated_at_utc) VALUES (2,'premium',2000,1,` + ts + `,` + ts + `)`)
+	mustExec(`INSERT INTO model_groups(id,name,rate_milli,enabled,created_at_utc,updated_at_utc) VALUES (3,'premium-alt',2000,1,` + ts + `,` + ts + `)`)
 	mustExec(`INSERT INTO client_keys(id,name,token_digest,enabled,concurrency_limit,created_at_utc,updated_at_utc) VALUES (7,'alice',x'00',1,1,` + ts + `,` + ts + `)`)
 	mustExec(`INSERT INTO key_groups(key_id,group_id) VALUES (7,1),(7,2)`)
+	mustExec(`INSERT INTO key_groups(key_id,group_id) VALUES (7,3)`)
 	mustExec(`INSERT INTO key_reservations(key_id,model_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (7,1,10,10,'completed',` + ts + `)`)
 	mustExec(`INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,output_tokens,amount_microyuan,created_at_utc) VALUES ('r1',7,1,1,'completed',1,1,1,` + ts + `)`)
+	mustExec(`INSERT INTO client_keys(id,name,token_digest,enabled,concurrency_limit,created_at_utc,updated_at_utc) VALUES (8,'bob',x'01',1,1,` + ts + `,` + ts + `)`)
+	mustExec(`INSERT INTO key_reservations(key_id,model_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (8,1,5,5,'completed',` + ts + `)`)
+	mustExec(`INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,output_tokens,amount_microyuan,created_at_utc) VALUES ('r2',8,1,1,'completed',1,1,1,` + ts + `)`)
 
 	applyMigration(db, t, 16)
 
@@ -93,5 +100,23 @@ func TestMigrationV16BackfillPicksHighestRate(t *testing.T) {
 	}
 	if tables != 1 {
 		t.Fatal("v16 不应删除 key_groups（回填要以它为数据源）")
+	}
+	// 同倍率（2000）的组有两个（id=2 与 id=3），必须取 id 最小的那个
+	var resGroup8, reqGroup8 int
+	if err := db.QueryRow(`SELECT group_id FROM key_reservations WHERE key_id=8`).Scan(&resGroup8); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT group_id FROM requests WHERE request_id='r2'`).Scan(&reqGroup8); err != nil {
+		t.Fatal(err)
+	}
+	if resGroup8 != 0 || reqGroup8 != 0 {
+		t.Fatalf("无分组密钥的账目回填 = %d, %d, want 0, 0", resGroup8, reqGroup8)
+	}
+	var bound sql.NullInt64
+	if err := db.QueryRow(`SELECT group_id FROM client_keys WHERE id=8`).Scan(&bound); err != nil {
+		t.Fatal(err)
+	}
+	if bound.Valid {
+		t.Fatalf("无分组密钥的 group_id = %v, want NULL", bound)
 	}
 }
