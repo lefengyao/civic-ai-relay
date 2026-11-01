@@ -71,7 +71,7 @@
 
 - §12.1 「中间提交不保证单独可编译」的范围扩大到 `2245471..05671ff` 之外：阶段 A 的 13 个提交里**每个都是绿的**（子代理流程保证了），这个警告只适用于 9/29~10/31 那段历史
 - §12.2 生产版本 v0.3.9 → v0.4.0 → **v0.5.0**（2026-11-01）；镜像四个（见第三节）；部署目录多了 `backups/`、`DEPLOYED_COMMIT` 与 `.env.bak-*`
-- §12.5 SSH 仍然敞开（`permitrootlogin yes` + 密码认证 + 日均数十万次爆破），**阶段 A/B 全部结束后仍未处理**——这是当前最大的悬留风险
+- §12.5 SSH 加固**已做一半**（2026-11-01 12:20）：**fail2ban 0.11.2 已装并开机自启**（sshd jail：10 分钟 5 次失败封 1 小时，屡犯每次翻倍、上限 7 天）；头号爆破源 `195.178.110.220`（TECHOFF SRV LIMITED，每分钟 399 次字典爆破）已用 ufw 永久封禁；`PubkeyAuthentication` 已打开、密钥 `~/.ssh/civic_waigame_ed25519` 已写入服务器 `authorized_keys`（回环 `KEY_LOGIN_OK` 验证通过）。**`PasswordAuthentication` 仍为 yes**——老板选择过渡，确认密钥连得稳之后再关，关掉后爆破才彻底归零
 - §12.6 本机留存敏感文件新增：`civic-backups\waigame-pre-v0.4.0-20261101.tar.gz`、`civic-backups\civic-{data,config}-20261101-040557.tar.gz`（含完整账目库与 `RELAY_ENCRYPTION_KEY`，别外传）
 
 ## 七、已知欠账（都排了去处，别新开摊子）
