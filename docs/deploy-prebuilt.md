@@ -81,6 +81,22 @@ docker compose up -d         # 不要加 --build：那会走 Dockerfile.relay �
 `docker compose up -d` 会重建容器，有几秒停机。命名卷不受影响，配置与账目都在。
 **永远不要用 `docker compose down -v`**——那会删掉配置卷与数据库。
 
+**含 schema 迁移的版本升级前必须先停机做一致备份。** 项目没有 down-migration 机制，
+迁移是单向的（例如 v0.4.0 的 v16/v17 会给账目表加列并 `DROP TABLE key_groups`，
+旧版二进制的授权查询依赖该表，删了就起不来）——回滚只能整库恢复备份，不是切回
+旧镜像。停容器后把数据卷里的 `relay.db` 连 `-wal`/`-shm` 一起拷走（WAL 模式下
+只拷主文件会丢最近的账目），配置卷的 `relay.env` 一并备份：
+
+```bash
+cd /opt/civic-ai-relay && docker compose stop
+TS=$(date +%Y%m%d-%H%M%S)
+docker run --rm -v civic-ai-relay_civic-relay-data:/d -v /tmp:/out alpine:3.20 \
+  tar -czf /out/civic-data-$TS.tar.gz -C /d .
+docker run --rm -v civic-ai-relay_civic-relay-config:/c -v /tmp:/out alpine:3.20 \
+  tar -czf /out/civic-config-$TS.tar.gz -C /c .
+# 确认两个 tar.gz 落在 /tmp 后再 docker compose up -d
+```
+
 ## 5. 验证
 
 ```bash
