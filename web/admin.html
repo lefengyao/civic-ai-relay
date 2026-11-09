@@ -760,7 +760,7 @@ async function loadOverview() {
       statCard("RPM（每分钟请求）", fmtNum(g.rpm.used), "归属本组的请求，滚动一分钟", null) +
       quotaCard("5 小时额度", "滚动 5 小时，含进行中请求的预留", g.five_hour, "five-hour") +
       quotaCard("当日额度", "北京时间自然日，含进行中请求的预留", g.daily, "daily") +
-      quotaCard((g.period && g.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (g.period && g.period.active) ? `至 ${fmtTime(g.period.end_utc)}；用满或到期后切换周限额` : ((g.period && g.period.transition_utc) ? `已切换周限额：${fmtTime(g.period.transition_utc)}` : "未启用"), g.period) +
+      quotaCard((g.period && g.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (g.period && g.period.active) ? `至 ${fmtTime(g.period.end_utc)}；用满即拒绝新请求（429），调大限额后恢复` : "未启用或已到期", g.period) +
       quotaCard((g.weekly && g.weekly.active === false) ? "本周额度（等待周期结束）" : "本周额度", (g.weekly && g.weekly.active === false) ? "周期期间不计入周限额" : "北京时间自然周（周一起），含进行中请求的预留", g.weekly, "weekly") +
       statCard("进行中请求", fmtNum(g.active), "状态为进行中的请求", null) +
       statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null);
@@ -1503,7 +1503,7 @@ window.groupOverview = async id => {
       statCard("RPM（每分钟请求）", fmtNum(d.rpm.used), "归属本组的请求，滚动一分钟", null) +
       quotaCard("5 小时额度", "滚动 5 小时，含进行中请求的预留", d.five_hour, "five-hour") +
       quotaCard("当日额度", "北京时间自然日，含进行中请求的预留", d.daily, "daily") +
-      quotaCard((d.period && d.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (d.period && d.period.active) ? `至 ${fmtTime(d.period.end_utc)}；用满或到期后切换周限额` : (d.period && d.period.transition_utc ? `已切换周限额：${fmtTime(d.period.transition_utc)}` : "未启用"), d.period) +
+      quotaCard((d.period && d.period.active) ? "自定义周期额度（生效中）" : "自定义周期额度", (d.period && d.period.active) ? `至 ${fmtTime(d.period.end_utc)}；用满即拒绝新请求（429），调大限额后恢复` : "未启用或已到期", d.period) +
       quotaCard(d.weekly && d.weekly.active === false ? "本周额度（等待周期结束）" : "本周额度", d.weekly && d.weekly.active === false ? "周期期间不计入周限额" : "北京时间自然周（周一起），含进行中请求的预留", d.weekly, "weekly") +
       statCard("进行中请求", fmtNum(d.active), "状态为进行中的请求", null) +
       statCard("近一小时成功率", lh.completed + lh.failed ? (100 - errPct) + "%" : "—", `成功 ${fmtNum(lh.completed)} · 失败 ${fmtNum(lh.failed)}`, null) +
@@ -1560,7 +1560,7 @@ window.editGroup = async id => {
       <div class="field"><label>计费倍率（该组内请求按模型单价 × 倍率计费）</label><input id="eg-rate" type="number" step="0.01" min="0.01" value="${g.RateMilli != null ? (g.RateMilli / 1000).toFixed(2) : "1.00"}" style="max-width:140px"></div>
     </div>
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">额度（只作用于本组）</h4>
-      <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">任一窗口用满即拒绝该组的新请求（先欠费后停服：已用 ≥ 限额就拒）。<b>0 = 不限；留空 = 保持原值</b>——想把已设的限额改回不限，要填 0 而不是清空。自定义周期要<b>同时</b>填「周期长度」和至少一项「周期限额」才生效；用满后交接到「本周」窗口。</p>
+      <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">任一窗口用满即拒绝该组的新请求（先欠费后停服：已用 ≥ 限额就拒）。<b>0 = 不限；留空 = 保持原值</b>——想把已设的限额改回不限，要填 0 而不是清空。自定义周期要<b>同时</b>填「周期长度」和至少一项「周期限额」才生效；<b>用满即关闭服务</b>（429 拒绝新请求），调大限额后自动恢复，不会从 0 重新计。</p>
       <div class="form-grid">
         ${quotaField("t5h", "5 小时 Token 限额", plainVal(g.TokenLimit5H))}
         ${quotaField("a5h", "5 小时金额限额（元）", moneyVal(g.AmountLimit5H), true)}
@@ -1572,7 +1572,7 @@ window.editGroup = async id => {
         ${quotaField("tp", "自定义周期 Token 限额", plainVal(g.TokenLimitPeriod))}
         ${quotaField("ap", "自定义周期金额限额（元）", moneyVal(g.AmountLimitPeriod), true)}
       </div>
-      ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}（填天数时若起点为空会自动从现在开始；用满后交接到「本周」窗口）</p>` : ""}
+      ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}（填天数时若起点为空会自动从现在开始；周期用满后拒绝新请求，调大限额即恢复）</p>` : ""}
     </div>
     <div class="field" style="margin-top:14px"><label>包含的供应商（渠道）——组管理渠道，渠道下所有已定价启用模型随组授权</label>${checkListHTML(items, memberIds, "暂无启用中的渠道")}</div>
     ${offMembers.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${offMembers.length} 个已停用的成员渠道保存后将被移除</p>` : ""}

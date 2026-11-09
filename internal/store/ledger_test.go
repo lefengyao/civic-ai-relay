@@ -175,7 +175,10 @@ func TestWeeklyTokenWindowBlocksAfterItIsSpent(t *testing.T) {
 	}
 }
 
-func TestPeriodQuotaCompletionHandsOffToWeeklyWindow(t *testing.T) {
+// 周期额度是硬闸：用满后必须关闭（429），不能把周期/周窗口起点挪到
+// 「用满那一刻」让用量从 0 重新计、后续请求继续放行。
+func TestPeriodQuotaCompletionBlocksFurtherRequests(t *testing.T) {
+	ctx := context.Background()
 	repo, key, model, group := newReservationFixture(t, 1_000_000, 1_000_000)
 	setConcurrency(t, repo, key.ID, 8)
 	setGroupLimits(t, repo, group, QuotaLimits{
@@ -183,29 +186,44 @@ func TestPeriodQuotaCompletionHandsOffToWeeklyWindow(t *testing.T) {
 		PeriodStart: time.Now().UTC().Add(-time.Hour), PeriodDays: 3,
 	})
 	args := newReservationArgs(key.ID, model.ID, "period-1", 600)
-	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+	if _, err := repo.ReserveRequest(ctx, args); err != nil {
 		t.Fatalf("first period request must pass: %v", err)
 	}
-	args.RequestID = "weekly-after-period-1"
+	args.RequestID = "period-2"
 	args.StartedAt = args.StartedAt.Add(time.Millisecond)
-	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
-		t.Fatalf("weekly handoff should allow the next request: %v", err)
-	}
-	args.RequestID = "weekly-after-period-2"
-	args.StartedAt = args.StartedAt.Add(time.Millisecond)
-	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
-		t.Fatalf("weekly quota should allow use below its cap: %v", err)
-	}
-	args.RequestID = "weekly-after-period-3"
-	args.StartedAt = args.StartedAt.Add(time.Millisecond)
-	_, err := repo.ReserveRequest(context.Background(), args)
+	_, err := repo.ReserveRequest(ctx, args)
 	var quota *QuotaError
-	if !errors.As(err, &quota) || quota.Scope != "weekly" {
-		t.Fatalf("err = %v, want weekly quota after period", err)
+	if !errors.As(err, &quota) || quota.Scope != "period" || quota.Code != "token_quota_exceeded" {
+		t.Fatalf("err = %v, want period token_quota_exceeded (quota must stop service)", err)
+	}
+	if quota.Used < quota.Limit {
+		t.Fatalf("used %d < limit %d", quota.Used, quota.Limit)
+	}
+	// 管理台里的周期用量不能归零，也不再有交接点。
+	overview, err := repo.GroupOverview(ctx, group.ID, args.StartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	period := overview["period"].(map[string]any)
+	if used := period["used_tokens"].(int64); used < 50 {
+		t.Fatalf("period used_tokens = %d, want the real accumulated usage", used)
+	}
+	if period["transition_utc"] != "" {
+		t.Fatalf("transition_utc = %v, want empty", period["transition_utc"])
+	}
+	// 欠费即拒，不是永久锁死：调大限额后下一次请求立即恢复。
+	if _, err := repo.UpdateModelGroup(ctx, group.ID, UpdateModelGroup{TokenLimitPeriod: intPtr(1_000_000)}); err != nil {
+		t.Fatal(err)
+	}
+	args.RequestID = "period-3"
+	args.StartedAt = args.StartedAt.Add(time.Millisecond)
+	if _, err := repo.ReserveRequest(ctx, args); err != nil {
+		t.Fatalf("raising the limit must restore service immediately: %v", err)
 	}
 }
 
-func TestPeriodAmountQuotaCompletionHandsOffToWeeklyWindow(t *testing.T) {
+func TestPeriodAmountQuotaCompletionBlocksFurtherRequests(t *testing.T) {
+	ctx := context.Background()
 	repo, key, model, group := newReservationFixture(t, 1_000_000, 1_000_000)
 	setConcurrency(t, repo, key.ID, 8)
 	setGroupLimits(t, repo, group, QuotaLimits{
@@ -214,20 +232,15 @@ func TestPeriodAmountQuotaCompletionHandsOffToWeeklyWindow(t *testing.T) {
 		PeriodStart: time.Now().UTC().Add(-time.Hour), PeriodDays: 3,
 	})
 	args := newReservationArgs(key.ID, model.ID, "period-amount-1", 600)
-	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
+	if _, err := repo.ReserveRequest(ctx, args); err != nil {
 		t.Fatalf("first period request must pass: %v", err)
 	}
-	args.RequestID = "weekly-after-period-amount-1"
+	args.RequestID = "period-amount-2"
 	args.StartedAt = args.StartedAt.Add(time.Millisecond)
-	if _, err := repo.ReserveRequest(context.Background(), args); err != nil {
-		t.Fatalf("amount handoff should allow the first weekly request: %v", err)
-	}
-	args.RequestID = "weekly-after-period-amount-2"
-	args.StartedAt = args.StartedAt.Add(time.Millisecond)
-	_, err := repo.ReserveRequest(context.Background(), args)
+	_, err := repo.ReserveRequest(ctx, args)
 	var quota *QuotaError
-	if !errors.As(err, &quota) || quota.Scope != "weekly" || quota.Code != "amount_quota_exceeded" {
-		t.Fatalf("err = %v, want weekly amount_quota_exceeded after period amount handoff", err)
+	if !errors.As(err, &quota) || quota.Scope != "period" || quota.Code != "amount_quota_exceeded" {
+		t.Fatalf("err = %v, want period amount_quota_exceeded (quota must stop service)", err)
 	}
 }
 
