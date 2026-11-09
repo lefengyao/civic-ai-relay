@@ -258,11 +258,17 @@ func (s *Store) ProviderAPIKey(ctx context.Context, id int64) (string, error) {
 // providerConfigured decrypts only to determine whether an API key is empty;
 // the plaintext is never returned or logged.
 // DeleteProvider removes a channel. Its models are removed by the ON DELETE
-// CASCADE foreign key; historical requests keep their amount but lose the
-// provider reference (ON DELETE SET NULL).
+// CASCADE foreign key; settled ledger rows are kept so group quota survives the
+// deletion (historical requests also lose only their provider reference).
+// Deleting a channel that still has an in-flight request is refused.
 func (s *Store) DeleteProvider(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("provider ID is required")
+	}
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
+	if err := s.ensureNoActiveReservation(ctx, `SELECT count(*) FROM key_reservations WHERE status='reserved' AND model_id IN (SELECT id FROM models WHERE provider_id=?)`, id); err != nil {
+		return err
 	}
 	result, err := s.db.ExecContext(ctx, `DELETE FROM providers WHERE id=?`, id)
 	if err != nil {

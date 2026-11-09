@@ -315,6 +315,49 @@ var migrations = []migration{
 		`CREATE INDEX idx_model_pool_members_order ON model_pool_members(pool_id, sort_order, model_id)`,
 		`CREATE INDEX idx_model_pool_members_model ON model_pool_members(model_id, pool_id)`,
 	}},
+	// v20: 账本独立于主数据。旧表的 key_id/model_id 带 ON DELETE CASCADE，
+	// 删一把 Key（或删模型、删渠道）会在级联里把整段额度账目一起删掉——而额度是
+	// 按 group_id 统计的，于是「删一次 Key」就等于把该组的周期/总额度用量清零，
+	// 表现为「额度用满后又从 0 开始计算」。账本行只是计费数字，不含 prompt/密钥/回复，
+	// 没有任何理由跟随主数据消失。
+	//
+	// 重建为不带外键的独立表：key_id / model_id 变成纯归属标记（0 = 对应对象已删除），
+	// group_id 不变，统计口径不受影响。最后按 requests 的实扣值补回旧版本已经丢掉的
+	// 账目（只在缺行时插入，可重复执行）。
+	{version: 20, statements: []string{
+		`CREATE TABLE key_reservations_v20 (
+			id INTEGER PRIMARY KEY,
+			key_id INTEGER NOT NULL DEFAULT 0,
+			model_id INTEGER NOT NULL DEFAULT 0,
+			reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens >= 0),
+			reserved_amount_microyuan INTEGER NOT NULL CHECK (reserved_amount_microyuan >= 0),
+			charged_tokens INTEGER NOT NULL DEFAULT 0 CHECK (charged_tokens >= 0),
+			charged_amount_microyuan INTEGER NOT NULL DEFAULT 0 CHECK (charged_amount_microyuan >= 0),
+			status TEXT NOT NULL CHECK (status IN ('reserved', 'completed', 'failed', 'aborted', 'rejected')),
+			created_at_utc TEXT NOT NULL,
+			finished_at_utc TEXT,
+			request_id TEXT,
+			billing_date_bj TEXT NOT NULL DEFAULT '',
+			group_id INTEGER NOT NULL DEFAULT 0
+		)`,
+		`INSERT INTO key_reservations_v20 (id,key_id,model_id,reserved_tokens,reserved_amount_microyuan,charged_tokens,charged_amount_microyuan,status,created_at_utc,finished_at_utc,request_id,billing_date_bj,group_id)
+			SELECT id,key_id,model_id,reserved_tokens,reserved_amount_microyuan,charged_tokens,charged_amount_microyuan,status,created_at_utc,finished_at_utc,request_id,billing_date_bj,group_id FROM key_reservations`,
+		`DROP TABLE key_reservations`,
+		`ALTER TABLE key_reservations_v20 RENAME TO key_reservations`,
+		`CREATE INDEX idx_key_reservations_key_status_time ON key_reservations(key_id, status, created_at_utc)`,
+		`CREATE INDEX idx_key_reservations_time ON key_reservations(created_at_utc, status)`,
+		`CREATE INDEX idx_key_reservations_request ON key_reservations(request_id)`,
+		`CREATE INDEX idx_key_reservations_group_time ON key_reservations(group_id, created_at_utc)`,
+		`CREATE TRIGGER prevent_active_reservation_delete BEFORE DELETE ON key_reservations
+			WHEN OLD.status='reserved'
+			BEGIN SELECT RAISE(ABORT, 'active reservation must be settled before deletion'); END`,
+		`INSERT INTO key_reservations (key_id,model_id,reserved_tokens,reserved_amount_microyuan,charged_tokens,charged_amount_microyuan,status,created_at_utc,finished_at_utc,request_id,billing_date_bj,group_id)
+			SELECT COALESCE(r.key_id,0),COALESCE(r.model_id,0),0,0,r.charged_tokens,r.amount_microyuan,r.status,r.created_at_utc,r.finished_at_utc,r.request_id,COALESCE(r.billing_date_bj,''),COALESCE(r.group_id,0)
+			FROM requests r
+			WHERE r.request_id IS NOT NULL
+				AND r.status IN ('completed','failed','aborted')
+				AND NOT EXISTS (SELECT 1 FROM key_reservations k WHERE k.request_id=r.request_id)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

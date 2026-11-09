@@ -572,8 +572,30 @@ func (s *Store) Healthcheck(ctx context.Context) error {
 	return err
 }
 
-// Prune removes old request and reservation metadata. The cutoff is supplied
-// by the caller so retention policy remains outside the persistence layer.
+// ensureNoActiveReservation 拒绝删除「还有请求在跑」的 Key / 模型 / 渠道。
+// 旧版依赖 key_reservations 上的外键级联 + prevent_active_reservation_delete
+// 触发器实现这一点；v20 把账本改成独立表之后必须显式检查，否则主体被删掉时
+// 在途请求的结算会落空。结算只会把 status 从 reserved 改走，所以拿到
+// reservationMu 之后检查就不会与 ReserveRequest 竞争。
+func (s *Store) ensureNoActiveReservation(ctx context.Context, query string, args ...any) error {
+	var active int
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&active); err != nil {
+		return err
+	}
+	if active > 0 {
+		return errors.New("resource has an active reservation")
+	}
+	return nil
+}
+
+// Prune removes old request metadata. The cutoff is supplied by the caller so
+// retention policy remains outside the persistence layer.
+//
+// 账目表 key_reservations 不参与裁剪：额度窗口可以比保留期长得多（自定义周期
+// 以 60 天计、Key 总额度是终身），一旦按 RETENTION_DAYS（默认 7 天）删掉旧行，
+// 周期/总额度用量就会随时间「自己减少」，表现为额度明明用满了却又从 0 重新累计。
+// 账本行只存计费数字，不含 prompt、回复、密钥，长期保留的体积与隐私代价都可忽略。
+// 请求明细（requests，含诊断字段）仍按保留期清理。
 func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	cutoffText := cutoff.UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -583,10 +605,6 @@ func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE created_at_utc < ? AND status <> 'reserved'`, cutoffText)
 	if err != nil {
-		return 0, err
-	}
-	// Reservations may include legacy rows without a matching request.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM key_reservations WHERE created_at_utc < ? AND status <> 'reserved'`, cutoffText); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

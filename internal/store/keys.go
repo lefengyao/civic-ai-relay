@@ -169,11 +169,17 @@ func (s *Store) RotateClientKey(ctx context.Context, id int64) (ClientKey, error
 }
 
 // DeleteClientKey removes a key permanently, revoking access immediately.
-// Reservations cascade; historical requests keep their billing amount but lose
-// the key reference, so past ledger totals stay intact.
+// Its settled ledger rows are kept on purpose: quota is counted per group, so
+// dropping them would reset the group's period/total usage. Deleting a key
+// that still has an in-flight request is refused until it settles.
 func (s *Store) DeleteClientKey(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("client key ID is required")
+	}
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
+	if err := s.ensureNoActiveReservation(ctx, `SELECT count(*) FROM key_reservations WHERE key_id=? AND status='reserved'`, id); err != nil {
+		return err
 	}
 	result, err := s.db.ExecContext(ctx, `DELETE FROM client_keys WHERE id=?`, id)
 	if err != nil {

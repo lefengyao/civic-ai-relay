@@ -218,11 +218,17 @@ func (s *Store) GetModelByPublicName(ctx context.Context, name string) (Model, e
 	return scanModel(s.db.QueryRowContext(ctx, "SELECT id,provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled FROM models WHERE public_name=?", name))
 }
 
-// DeleteModel removes a model. Group memberships and reservations cascade;
-// historical requests keep their billing amount but lose the model reference.
+// DeleteModel removes a model. Group memberships and pool memberships cascade;
+// settled ledger rows are kept so group quota is not reset by a deletion.
+// Deleting a model with an in-flight request is refused until it settles.
 func (s *Store) DeleteModel(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("model ID is required")
+	}
+	s.reservationMu.Lock()
+	defer s.reservationMu.Unlock()
+	if err := s.ensureNoActiveReservation(ctx, `SELECT count(*) FROM key_reservations WHERE model_id=? AND status='reserved'`, id); err != nil {
+		return err
 	}
 	result, err := s.db.ExecContext(ctx, `DELETE FROM models WHERE id=?`, id)
 	if err != nil {

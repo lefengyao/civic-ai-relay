@@ -103,6 +103,8 @@
 
 另有两项不随窗口轮换的 Key 总额度：`token_limit`、`amount_limit_microyuan`。
 
+额度账目（`key_reservations`）是独立账本：**不随 `RETENTION_DAYS` 裁剪**（保留期只清 `requests` 请求明细），**也不会因为删除 Key / 模型 / 渠道而消失**。所以周期（最长 60 天）与 Key 总额度统计的是真实累计值，删一把 Key 再建一把不会把用量重置为 0。删除主体时若还有 `reserved` 状态的在途请求会被拒绝，结算后即可删除，历史账目继续保留。
+
 **任何一项填 `0` 或留空都表示不限**，出厂默认所有分组都不限。
 
 **判定口径 = 先欠费后停服**：只检查「该窗口是否已用满」，不再要求「已用 + 本次预留 ≤ 限额」。
@@ -258,7 +260,7 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 | POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_id?, ttl_seconds?, keyless?}`。`group_id > 0` 时创建即绑定到该分组（一对一）；缺省/0 = 不绑；负数 = 400 `invalid_request`；组不存在或已停用 = 400 `key_invalid`——此时 Key 本体已创建（历史保留，需事后在编辑里改绑或删除）。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
 | GET | `/admin/api/keys/hints` | 脱敏缩略 `crk_xxxx…` + 非敏感标识 `key-xxxxxx`（独立接口，保证列表永不泄露密钥字符） |
 | PUT | `/admin/api/keys/{id}` | 更新 `{name?, enabled?, concurrency_limit?, token_limit_total?, money_limit_yuan_total?, ttl_seconds?}`；**nil 字段保持原值**。`ttl_seconds` 三态：缺省 = 不动；`0`/负数 = 改为永久有效；`>0` = 从现在起 N 秒后到期（**续期就是再传一次**） |
-| DELETE | `/admin/api/keys/{id}` | 删除：立即吊销访问；历史账目金额保留；重复删除返回 404 |
+| DELETE | `/admin/api/keys/{id}` | 删除：立即吊销访问；已结算账目保留（组用量不归零，A），有在途请求时拒绝；重复删除返回 404 |
 | POST | `/admin/api/keys/{id}/rotate` | 重置密钥：旧 token 立即失效，新 token 只返回一次 |
 | GET | `/admin/api/keys/{id}/group` | Key 所属分组 ID（一对一）；未绑定时返回 `{"data": null}` |
 | PUT | `/admin/api/keys/{id}/group` | 绑定/解绑所属分组；body `{"group_id": <number>}`，`0` = 解绑；组不存在或已停用 = 400 `key_invalid`；负数 = 400 `invalid_request` |
@@ -397,5 +399,6 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v17 | 删 `key_groups`，补分组维度的额度窗口索引 |
 | v18 | `model_groups` 加 10 列分组额度（4 窗口 × Token/金额 + 周期设置） |
 | v19 | **故障转移供应商**：`model_pools`（单模型类别）+ `model_pool_members`（成员与优先级）。纯新增表，不改动任何既有表 |
+| v20 | `key_reservations` 重建为独立账本（去掉 `key_id` / `model_id` 外键），并按 `requests` 补回历史账目：删 Key / 模型 / 渠道不再清零组额度，保留期也不再裁剪账目 |
 
 迁移在启动时自动应用，记录在 `schema_migrations` 表。

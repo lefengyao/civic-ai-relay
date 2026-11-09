@@ -73,8 +73,11 @@ func TestSchemaEnforcesForeignKeysAndChecks(t *testing.T) {
 	if _, err := db.db.Exec(`INSERT INTO client_keys(name, token_digest, enabled, concurrency_limit, created_at_utc) VALUES ('bad', X'01', 2, 1, 'now')`); err == nil {
 		t.Fatal("enabled CHECK accepted invalid value")
 	}
-	if _, err := db.db.Exec(`INSERT INTO key_reservations(key_id, model_id, reserved_tokens, reserved_amount_microyuan, status, created_at_utc) VALUES (999, 999, 0, 0, 'reserved', 'now')`); err == nil {
-		t.Fatal("foreign key CHECK accepted missing references")
+	// v20 起账本是独立表：key_id / model_id 只是归属标记，不再有外键。
+	// 这是刻意的——删 Key / 模型 / 渠道不能连带删掉额度账目，否则按组统计的
+	// 周期与总额度会被一次删除清零。CHECK 约束仍然必须生效。
+	if _, err := db.db.Exec(`INSERT INTO key_reservations(key_id, model_id, reserved_tokens, reserved_amount_microyuan, status, created_at_utc) VALUES (999, 999, 0, 0, 'completed', 'now')`); err != nil {
+		t.Fatalf("ledger row must survive missing key/model references: %v", err)
 	}
 	if _, err := db.db.Exec(`INSERT INTO key_reservations(key_id, model_id, reserved_tokens, reserved_amount_microyuan, status, created_at_utc) VALUES (1, 1, -1, 0, 'reserved', 'now')`); err == nil {
 		t.Fatal("reserved_tokens CHECK accepted negative value")
