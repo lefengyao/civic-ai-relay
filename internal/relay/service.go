@@ -77,6 +77,8 @@ type Service struct {
 	mu       sync.Mutex
 	upstream map[int64]activeUpstream
 	draining bool
+	// pool 记录故障转移供应商成员的短期冷却（进程内、重启清零）。
+	pool poolHealth
 }
 
 // Ready reports whether the relay can serve traffic: the encrypted SQLite
@@ -170,12 +172,16 @@ type Lease struct {
 	protocol        string
 	streamed        bool
 	model           store.Model
-	quote           PriceSnapshot
-	mu              sync.Mutex
-	outcomeFrozen   bool
-	settled         bool
-	frozenOutcome   Outcome
-	releaseOnce     sync.Once
+	// candidates 是本次请求实际可以依次尝试的模型（已按分组倍率折算价格）。
+	// 普通模型只有一个；故障转移供应商是按优先级排好的成员列表。
+	candidates    []store.Model
+	poolID        int64
+	quote         PriceSnapshot
+	mu            sync.Mutex
+	outcomeFrozen bool
+	settled       bool
+	frozenOutcome Outcome
+	releaseOnce   sync.Once
 }
 
 func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
@@ -229,7 +235,10 @@ func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
 		FailureStage: outcome.FailureStage, UsageSource: outcome.UsageSource, Protocol: outcome.Protocol,
 		IncompleteReason: outcome.IncompleteReason,
 		ClientRequestID:  outcome.ClientRequestID,
-		DurationMS:       outcome.DurationMS, HeaderMS: outcome.HeaderMS,
+		// 故障转移切换成员后，账目指向实际成功（或最后尝试）的那个成员。
+		ModelID:    l.model.ID,
+		ProviderID: l.model.ProviderID,
+		DurationMS: outcome.DurationMS, HeaderMS: outcome.HeaderMS,
 		FirstEventMS: outcome.FirstEventMS, LastUpstreamMS: outcome.LastUpstreamMS,
 	}
 	err := settleWithRetry(cleanup, func(attemptCtx context.Context) error {
@@ -252,6 +261,26 @@ func (l *Lease) Close(ctx context.Context, outcome Outcome) error {
 		l.service.global.Release()
 	})
 	return nil
+}
+
+// setModel 记录「本次真正打到上游的是哪个成员」。切换后账目、日志与计费
+// 都必须跟着它走，而不是继续用预留时的首选成员。
+func (l *Lease) setModel(model store.Model) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.model = model
+}
+
+func (l *Lease) Candidates() []store.Model {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]store.Model(nil), l.candidates...)
 }
 
 func (l *Lease) RequestID() string {
@@ -295,16 +324,45 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	if err != nil {
 		return nil, store.Model{}, err
 	}
-	var model store.Model
+	var requested store.Model
 	for _, candidate := range models {
 		if candidate.PublicName == req.Model {
-			model = candidate
+			requested = candidate
 			break
 		}
 	}
-	if model.ID == 0 {
+	if requested.PublicName == "" {
 		return nil, store.Model{}, ErrModelNotAllowed
 	}
+	// 普通模型 = 单候选，行为与升级前完全一致。
+	// 故障转移供应商：成员必须与该 Key 的授权模型求交 —— 授权列表本身已经过滤了
+	// 「组内渠道 / 渠道启用 / 模型启用 / 已定价」，所以候选里不会出现越权模型。
+	// 预留永远落在真实成员上（虚拟池条目不能写账目）。
+	candidates := []store.Model{requested}
+	poolID := requested.PoolID
+	if poolID > 0 {
+		ids, err := s.store.PoolCandidateIDs(ctx, poolID)
+		if err != nil {
+			return nil, store.Model{}, err
+		}
+		byID := make(map[int64]store.Model, len(models))
+		for _, m := range models {
+			if m.ID > 0 {
+				byID[m.ID] = m
+			}
+		}
+		candidates = make([]store.Model, 0, len(ids))
+		for _, id := range ids {
+			if m, ok := byID[id]; ok {
+				candidates = append(candidates, m)
+			}
+		}
+		candidates = orderPoolCandidates(candidates, s.pool.snapshot(), time.Now())
+		if len(candidates) == 0 {
+			return nil, store.Model{}, ErrModelNotAllowed
+		}
+	}
+	model := candidates[0]
 	// 兜底配置只在未注入 settings 时生效（测试用）。额度项留 0 = 不限，
 	// 与出厂默认一致：限额是运维显式选择，不该由兜底值造成意外拒绝。
 	settings := config.Settings{GlobalConcurrencyLimit: 1, RPMLimit: 30, MaxOutputTokens: 4096}
@@ -390,12 +448,24 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	}
 	quote := priceSnapshot(reservation)
 	effective := quote.effective(model)
+	effectiveCandidates := []store.Model{effective}
+	if poolID > 0 {
+		// 每个成员有自己的单价：逐个按分组倍率折算，不能拿首选成员的报价
+		// 快照套到别的成员上，否则切换后会按错误的价格结算。
+		effectiveCandidates = make([]store.Model, len(candidates))
+		for i, candidate := range candidates {
+			effectiveCandidates[i] = effectivePoolModel(candidate, quote.RateMilli)
+		}
+		effective = effectiveCandidates[0]
+	}
 	s.active.Register(reservation.ID)
 	protocol := strings.TrimSpace(req.Protocol)
 	if protocol == "" {
 		protocol = "chat"
 	}
-	return &Lease{service: s, reservation: reservation, keyID: key.ID, token: req.Token, model: effective, quote: quote, clientRequestID: clientRequestID, protocol: protocol, streamed: req.Stream}, effective, nil
+	return &Lease{service: s, reservation: reservation, keyID: key.ID, token: req.Token,
+		model: effective, candidates: effectiveCandidates, poolID: poolID, quote: quote,
+		clientRequestID: clientRequestID, protocol: protocol, streamed: req.Stream}, effective, nil
 }
 
 // applyRate scales a per-million-token price by a group multiplier expressed in
@@ -438,40 +508,66 @@ func postHeaderMillis(duration, header *int64) string {
 
 func (s *Service) Chat(ctx context.Context, req Request) ([]byte, error) {
 	req.Stream = false
-	lease, model, err := s.Begin(ctx, req)
+	lease, _, err := s.Begin(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	client, err := s.clients.ForProvider(ctx, model.ProviderID)
-	if err != nil {
-		return nil, lease.closeAfterFailure(ctx, err)
-	}
-	payload := copyPayload(req.Payload)
-	payload["model"] = model.UpstreamName
-	payload["stream"] = false
 	// 非流式同样要有界：上游客户端已不再设总超时，这里套上同一个上限，
 	// 避免「响应头回来了但 body 永远发不完」把连接和并发槽一直占着。
+	// 故障转移的多次尝试共享这一个上限，不会因为切换而无限拉长请求。
 	ctx, cancel := s.requestContext(ctx)
 	defer cancel()
 	s.setUpstream(lease.reservation.ID, cancel, nil)
-	data, err := client.ChatJSON(ctx, payload)
-	if trace := requestmeta.FromContext(ctx); trace != nil && len(data) > 0 {
-		trace.MarkUpstream()
+	payload := copyPayload(req.Payload)
+	payload["stream"] = false
+	candidates := lease.Candidates()
+	var lastErr error
+	for index, candidate := range candidates {
+		lease.setModel(candidate)
+		payload["model"] = candidate.UpstreamName
+		var data []byte
+		client, clientErr := s.clients.ForProvider(ctx, candidate.ProviderID)
+		if clientErr != nil {
+			lastErr = clientErr
+			if len(candidates) > 1 {
+				// 单模型时保留原始错误（不改变既有错误码）；池里才归一成可切换故障。
+				lastErr = poolClientError(clientErr)
+			}
+		} else {
+			var callErr error
+			data, callErr = client.ChatJSON(ctx, payload)
+			if trace := requestmeta.FromContext(ctx); trace != nil && len(data) > 0 {
+				trace.MarkUpstream()
+			}
+			lastErr = callErr
+			if callErr == nil {
+				usage := struct {
+					Usage upstream.Usage `json:"usage"`
+				}{}
+				if json.Unmarshal(data, &usage) != nil {
+					lastErr = &upstream.Error{Code: "upstream_response_invalid", Status: http.StatusOK}
+				} else {
+					s.pool.clear(candidate.ID)
+					amount := PriceUsage(usage.Usage, candidate)
+					if err := lease.Close(ctx, Outcome{Status: "completed", InputTokens: int64(usage.Usage.PromptTokens), OutputTokens: int64(usage.Usage.CompletionTokens), CachedInputTokens: int64(usage.Usage.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: http.StatusOK, UsageSource: "upstream", Protocol: lease.protocol}); err != nil {
+						return nil, errors.Join(ErrSettlementUnavailable, err)
+					}
+					return data, nil
+				}
+			}
+		}
+		if !retryablePoolFailure(lastErr) {
+			break
+		}
+		s.pool.mark(candidate.ID, time.Now())
+		if index+1 < len(candidates) {
+			logging.Warnf("pool_failover request_id=%s pool_id=%d from_model_id=%d next_model_id=%d code=%s",
+				lease.RequestID(), lease.poolID, candidate.ID, candidates[index+1].ID, poolFailureCode(lastErr))
+			continue
+		}
+		break
 	}
-	if err != nil {
-		return nil, lease.closeAfterFailure(ctx, err)
-	}
-	usage := struct {
-		Usage upstream.Usage `json:"usage"`
-	}{}
-	if json.Unmarshal(data, &usage) != nil {
-		return nil, lease.closeAfterFailure(ctx, &upstream.Error{Code: "upstream_response_invalid", Status: http.StatusOK})
-	}
-	amount := PriceUsage(usage.Usage, model)
-	if err := lease.Close(ctx, Outcome{Status: "completed", InputTokens: int64(usage.Usage.PromptTokens), OutputTokens: int64(usage.Usage.CompletionTokens), CachedInputTokens: int64(usage.Usage.PromptTokensDetails.CachedTokens), AmountMicroyuan: amount, HTTPStatus: http.StatusOK, UsageSource: "upstream", Protocol: lease.protocol}); err != nil {
-		return nil, errors.Join(ErrSettlementUnavailable, err)
-	}
-	return data, nil
+	return nil, lease.closeAfterFailure(ctx, lastErr)
 }
 
 func (s *Service) Stream(ctx context.Context, req Request) (*http.Response, *Lease, store.Model, error) {
@@ -484,15 +580,30 @@ func (s *Service) Stream(ctx context.Context, req Request) (*http.Response, *Lea
 		prepared.Cancel()
 		return nil, nil, store.Model{}, prepared.Lease.closeAfterFailure(ctx, err)
 	}
-	return response, prepared.Lease, prepared.Model, nil
+	return response, prepared.Lease, prepared.CurrentModel(), nil
 }
 
 type PreparedStream struct {
 	Lease             *Lease
-	Model             store.Model
+	mu                sync.Mutex
+	model             store.Model
 	Open              func() (*http.Response, error)
 	Cancel            context.CancelFunc
 	HeartbeatInterval time.Duration
+}
+
+// CurrentModel 返回实际连上的成员。Open 在独立 goroutine 里可能切换成员，
+// 读写都要过锁；下游的流结算必须用它，不能用 Begin 时的首选成员。
+func (p *PreparedStream) CurrentModel() store.Model {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.model
+}
+
+func (p *PreparedStream) setModel(model store.Model) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.model = model
 }
 
 // PrepareStream reserves once, then leaves the upstream request to Open so
@@ -524,7 +635,7 @@ func (s *Service) PrepareStream(ctx context.Context, req Request) (*PreparedStre
 	var body io.ReadCloser
 	var openMu sync.Mutex
 	opened := false
-	prepared := &PreparedStream{Lease: lease, Model: model, HeartbeatInterval: heartbeat}
+	prepared := &PreparedStream{Lease: lease, model: model, HeartbeatInterval: heartbeat}
 	prepared.Cancel = func() {
 		cancel()
 		bodyMu.Lock()
@@ -542,30 +653,58 @@ func (s *Service) PrepareStream(ctx context.Context, req Request) (*PreparedStre
 		}
 		opened = true
 		openMu.Unlock()
-		if err := upstreamCtx.Err(); err != nil {
-			return nil, err
+		// 故障转移只发生在「响应头/首帧之前」：一旦开始向下游写内容，
+		// 切换就会造成重复输出，此时必须按既有结算路径处理，不能重试。
+		candidates := lease.Candidates()
+		var lastErr error
+		for index, candidate := range candidates {
+			if err := upstreamCtx.Err(); err != nil {
+				return nil, err
+			}
+			lease.setModel(candidate)
+			prepared.setModel(candidate)
+			payload["model"] = candidate.UpstreamName
+			var callErr error
+			client, clientErr := s.clients.ForProvider(upstreamCtx, candidate.ProviderID)
+			if clientErr != nil {
+				callErr = clientErr
+				if len(candidates) > 1 {
+					callErr = poolClientError(clientErr)
+				}
+			} else {
+				var response *http.Response
+				response, callErr = client.Stream(upstreamCtx, payload)
+				if callErr == nil {
+					if response == nil || response.Body == nil {
+						callErr = &upstream.Error{Code: "upstream_response_invalid"}
+					} else {
+						response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
+						bodyMu.Lock()
+						body = response.Body
+						bodyMu.Unlock()
+						if err := upstreamCtx.Err(); err != nil {
+							_ = response.Body.Close()
+							return nil, err
+						}
+						s.setUpstream(lease.reservation.ID, cancel, response.Body)
+						s.pool.clear(candidate.ID)
+						return response, nil
+					}
+				}
+			}
+			lastErr = callErr
+			if !retryablePoolFailure(lastErr) {
+				break
+			}
+			s.pool.mark(candidate.ID, time.Now())
+			if index+1 < len(candidates) {
+				logging.Warnf("pool_failover request_id=%s pool_id=%d from_model_id=%d next_model_id=%d code=%s",
+					lease.RequestID(), lease.poolID, candidate.ID, candidates[index+1].ID, poolFailureCode(lastErr))
+				continue
+			}
+			break
 		}
-		client, err := s.clients.ForProvider(upstreamCtx, model.ProviderID)
-		if err != nil {
-			return nil, err
-		}
-		response, err := client.Stream(upstreamCtx, payload)
-		if err != nil {
-			return nil, err
-		}
-		if response == nil || response.Body == nil {
-			return nil, &upstream.Error{Code: "upstream_response_invalid"}
-		}
-		response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
-		bodyMu.Lock()
-		body = response.Body
-		bodyMu.Unlock()
-		if err := upstreamCtx.Err(); err != nil {
-			_ = response.Body.Close()
-			return nil, err
-		}
-		s.setUpstream(lease.reservation.ID, cancel, response.Body)
-		return response, nil
+		return nil, lastErr
 	}
 	return prepared, nil
 }

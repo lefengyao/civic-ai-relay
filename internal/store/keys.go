@@ -543,5 +543,18 @@ func (s *Store) queryAuthorizedModels(ctx context.Context, where string, args ..
 		}
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 故障转移供应商（池）与真实模型共用 /v1/models 这一份口径：只在「至少一个
+	// 成员确实对该 Key 授权」时才把池名列出来。虚拟条目排在真实模型之后，
+	// Begin 里先匹配真实模型，即便历史数据里出现同名也不会产生歧义。
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	pools, err := s.AuthorizedPoolEntries(ctx, out)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, pools...), nil
 }

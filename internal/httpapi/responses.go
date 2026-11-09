@@ -173,7 +173,7 @@ func (h *PublicHandler) responsesStream(w http.ResponseWriter, r *http.Request, 
 		outcome.OutputTokens = int64(usageEvent.CompletionTokens)
 		outcome.CachedInputTokens = int64(usageEvent.PromptTokensDetails.CachedTokens)
 		outcome.IncompleteReason = incompleteReason
-		outcome.AmountMicroyuan = relay.PriceUsage(usageEvent, prepared.Model)
+		outcome.AmountMicroyuan = relay.PriceUsage(usageEvent, prepared.CurrentModel())
 		if reportedUsage {
 			outcome.UsageSource = "upstream"
 		} else if full.Len() > 0 {

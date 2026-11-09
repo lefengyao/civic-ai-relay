@@ -29,3 +29,12 @@ func (p PriceSnapshot) effective(model store.Model) store.Model {
 	model.CachedInputPriceMicroyuan = cached
 	return model
 }
+
+// effectivePoolModel 按模型自己的单价折算分组倍率。故障转移供应商的成员各自
+// 定价，切换后必须按实际成功成员的价格结算，而不是预留时首选成员的快照。
+func effectivePoolModel(model store.Model, rateMilli int64) store.Model {
+	model.InputPriceMicroyuan = applyRate(model.InputPriceMicroyuan, rateMilli)
+	model.OutputPriceMicroyuan = applyRate(model.OutputPriceMicroyuan, rateMilli)
+	model.CachedInputPriceMicroyuan = applyRate(model.CachedInputPriceMicroyuan, rateMilli)
+	return model
+}

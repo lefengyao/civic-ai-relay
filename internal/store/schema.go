@@ -291,6 +291,30 @@ var migrations = []migration{
 		`ALTER TABLE model_groups ADD COLUMN amount_limit_period INTEGER`,
 		`ALTER TABLE model_groups ADD COLUMN period_limit_start TEXT`,
 	}},
+	// v19: 故障转移供应商（模型池）。与 providers 完全分开的第二种「供应商形式」：
+	// 一个池只对应一个对外模型名（单一模型类别），成员是**已有供应商下的模型**，
+	// 按 sort_order 排优先级；成员故障时按顺序自动切到下一个可用模型。
+	//
+	// 纯新增两张表，不改任何既有表：升级不影响现有渠道、模型、分组、账目。
+	// 成员随模型/池删除级联消失，历史账目仍指向真实模型 ID（不受池删除影响）。
+	{version: 19, statements: []string{
+		`CREATE TABLE model_pools (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			created_at_utc TEXT NOT NULL,
+			updated_at_utc TEXT NOT NULL
+		)`,
+		`CREATE TABLE model_pool_members (
+			pool_id INTEGER NOT NULL REFERENCES model_pools(id) ON DELETE CASCADE,
+			model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+			sort_order INTEGER NOT NULL DEFAULT 0,
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			PRIMARY KEY (pool_id, model_id)
+		)`,
+		`CREATE INDEX idx_model_pool_members_order ON model_pool_members(pool_id, sort_order, model_id)`,
+		`CREATE INDEX idx_model_pool_members_model ON model_pool_members(model_id, pool_id)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

@@ -186,7 +186,7 @@ func (h *PublicHandler) stream(w http.ResponseWriter, r *http.Request, req relay
 			outcome.InputTokens = lease.LeaseInputTokens()
 		}
 		outcome.IncompleteReason = incompleteReason
-		outcome.AmountMicroyuan = relay.PriceUsage(usageEvent, prepared.Model)
+		outcome.AmountMicroyuan = relay.PriceUsage(usageEvent, prepared.CurrentModel())
 		if reportedUsage {
 			outcome.UsageSource = "upstream"
 		} else if outputChars > 0 {

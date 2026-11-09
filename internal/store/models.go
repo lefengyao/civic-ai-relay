@@ -18,6 +18,9 @@ type Model struct {
 	OutputPriceMicroyuan      *int64
 	CachedInputPriceMicroyuan *int64 // 缓存命中输入单价；nil 表示按普通输入价计费
 	Enabled                   bool
+	// PoolID 只在「故障转移供应商」的虚拟条目上非零（见 pools.go）。真实模型
+	// 一律为 0；虚拟条目的 ID 为负数，不会参与预留。
+	PoolID int64
 }
 
 type NewModel struct {
@@ -121,6 +124,9 @@ func (s *Store) CreateModel(ctx context.Context, in NewModel) (Model, error) {
 		return Model{}, err
 	}
 	name, upstream := strings.TrimSpace(in.PublicName), strings.TrimSpace(in.UpstreamName)
+	if err := s.ensureModelNameFree(ctx, s.db, name); err != nil {
+		return Model{}, err
+	}
 	now := nowUTC()
 	result, err := s.db.ExecContext(ctx, `INSERT INTO models(provider_id,public_name,upstream_name,input_price_microyuan,output_price_microyuan,cached_input_price_microyuan,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?)`, in.ProviderID, name, upstream, in.InputPriceMicroyuan, in.OutputPriceMicroyuan, in.CachedInputPriceMicroyuan, boolInt(in.Enabled), now, now)
 	if err != nil {
@@ -149,8 +155,11 @@ func (s *Store) UpdateModel(ctx context.Context, id int64, in UpdateModel) (Mode
 		}
 		m.ProviderID = *in.ProviderID
 	}
-	if strings.TrimSpace(in.PublicName) != "" {
-		m.PublicName = strings.TrimSpace(in.PublicName)
+	if rename := strings.TrimSpace(in.PublicName); rename != "" && rename != m.PublicName {
+		if err := s.ensureModelNameFree(ctx, s.db, rename); err != nil {
+			return Model{}, err
+		}
+		m.PublicName = rename
 	}
 	if strings.TrimSpace(in.UpstreamName) != "" {
 		m.UpstreamName = strings.TrimSpace(in.UpstreamName)

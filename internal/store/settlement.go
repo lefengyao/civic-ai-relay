@@ -26,10 +26,14 @@ type Settlement struct {
 	Protocol          string
 	ClientRequestID   string
 	IncompleteReason  string
-	DurationMS        *int64
-	HeaderMS          *int64
-	FirstEventMS      *int64
-	LastUpstreamMS    *int64
+	// ModelID / ProviderID 是「实际完成请求的模型」：故障转移供应商切换成员后，
+	// 账目必须指向真正成功那个成员，而不是预留时的首选成员。0 = 不改（老调用方）。
+	ModelID        int64
+	ProviderID     int64
+	DurationMS     *int64
+	HeaderMS       *int64
+	FirstEventMS   *int64
+	LastUpstreamMS *int64
 }
 
 func (s *Store) FinishReservation(ctx context.Context, reservationID int64, outcome Settlement) error {
@@ -105,7 +109,9 @@ func (s *Store) FinishReservation(ctx context.Context, reservationID int64, outc
 	}
 	finished := nowUTC()
 	chargedTokens := outcome.InputTokens + outcome.OutputTokens
-	result, err := conn.ExecContext(ctx, `UPDATE key_reservations SET charged_tokens=?,charged_amount_microyuan=?,reserved_tokens=0,reserved_amount_microyuan=0,status=?,finished_at_utc=? WHERE id=? AND status='reserved'`, chargedTokens, outcome.AmountMicroyuan, outcome.Status, finished, keyReservationID)
+	result, err := conn.ExecContext(ctx, `UPDATE key_reservations SET charged_tokens=?,charged_amount_microyuan=?,reserved_tokens=0,reserved_amount_microyuan=0,status=?,finished_at_utc=?,model_id=CASE WHEN ?>0 THEN ? ELSE model_id END WHERE id=? AND status='reserved'`,
+		chargedTokens, outcome.AmountMicroyuan, outcome.Status, finished,
+		outcome.ModelID, outcome.ModelID, keyReservationID)
 	if err != nil {
 		return rollback(err)
 	}
@@ -115,11 +121,12 @@ func (s *Store) FinishReservation(ctx context.Context, reservationID int64, outc
 		}
 		return rollback(ErrSettlementConflict)
 	}
-	result, err = conn.ExecContext(ctx, `UPDATE requests SET reserved_tokens=0,charged_tokens=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,amount_microyuan=?,status=?,upstream_status=?,error_code=?,failure_stage=?,usage_source=?,protocol=?,client_request_id=?,incomplete_reason=?,duration_ms=?,upstream_header_ms=?,first_event_ms=?,last_upstream_ms=?,finished_at_utc=? WHERE id=? AND status='reserved'`,
+	result, err = conn.ExecContext(ctx, `UPDATE requests SET reserved_tokens=0,charged_tokens=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,amount_microyuan=?,status=?,upstream_status=?,error_code=?,failure_stage=?,usage_source=?,protocol=?,client_request_id=?,incomplete_reason=?,duration_ms=?,upstream_header_ms=?,first_event_ms=?,last_upstream_ms=?,finished_at_utc=?,model_id=CASE WHEN ?>0 THEN ? ELSE model_id END,provider_id=CASE WHEN ?>0 THEN ? ELSE provider_id END WHERE id=? AND status='reserved'`,
 		chargedTokens, outcome.InputTokens, outcome.OutputTokens, outcome.CachedInputTokens, outcome.AmountMicroyuan,
 		outcome.Status, upstreamStatusValue(outcome.UpstreamStatus), outcome.ErrorCode, outcome.FailureStage,
 		outcome.UsageSource, outcome.Protocol, outcome.ClientRequestID, outcome.IncompleteReason,
-		outcome.DurationMS, outcome.HeaderMS, outcome.FirstEventMS, outcome.LastUpstreamMS, finished, reservationID)
+		outcome.DurationMS, outcome.HeaderMS, outcome.FirstEventMS, outcome.LastUpstreamMS, finished,
+		outcome.ModelID, outcome.ModelID, outcome.ProviderID, outcome.ProviderID, reservationID)
 	if err != nil {
 		return rollback(err)
 	}

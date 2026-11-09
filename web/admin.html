@@ -255,6 +255,17 @@ details .card{margin-bottom:0}
   .side-foot,.brand small{display:none}
   main{padding:18px}
 }
+/* 故障转移供应商：成员按优先级排序，勾选后可用 ↑↓ 调整 */
+.pool-list{max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:4px}
+.pool-row{display:flex;align-items:center;gap:8px;padding:7px 8px;border-bottom:1px solid var(--border);font-size:13px}
+.pool-row:last-child{border-bottom:none}
+.pool-row.on{background:var(--accent-soft)}
+.pool-row .pool-pick{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.pool-row input[type=checkbox]{width:auto;flex-shrink:0}
+.pool-provider{color:var(--muted);font-size:12px}
+.pool-order{width:22px;text-align:center;color:var(--accent);font-weight:600}
+.pool-enable{display:flex;align-items:center;gap:4px;white-space:nowrap;font-size:12px;color:var(--muted)}
+.pool-member-line{padding:2px 0;font-size:12.5px}
 </style>
 </head>
 <body>
@@ -279,6 +290,7 @@ details .card{margin-bottom:0}
       <button data-view="overview" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>运行概览</button>
       <button data-view="analytics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 6-7"/><circle cx="7" cy="14" r="1"/><circle cx="11" cy="10" r="1"/><circle cx="14" cy="13" r="1"/><circle cx="20" cy="6" r="1"/></svg>用量分析</button>
       <button data-view="providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><circle cx="6" cy="7.5" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="16.5" r="1" fill="currentColor" stroke="none"/></svg>供应商</button>
+      <button data-view="pools" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h9a4 4 0 0 1 4 4v1"/><path d="M4 17h9a4 4 0 0 0 4-4v-1"/><path d="m17 4 3 3-3 3"/><path d="m17 14 3 3-3 3"/></svg>故障转移供应商</button>
       <button data-view="groups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 8.5L10.5 15.5M16.5 8.5L13.5 15.5M9 6h6"/></svg>模型组</button>
       <button data-view="keys" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M11 12L21 2M17 6l3 3M14 9l2 2"/></svg>客户端 Key</button>
       <button data-view="requests"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>请求日志</button>
@@ -351,6 +363,17 @@ details .card{margin-bottom:0}
         </form></div>
       </details>
       <div class="card"><h3>供应商列表</h3><div id="provider-data"></div></div>
+    </section>
+
+    <!-- 故障转移供应商 -->
+    <section id="view-pools" class="view">
+      <div class="card">
+        <div class="card-head"><h3>第二类供应商：单一模型 + 自动故障转移</h3></div>
+        <p class="sub">每条记录只对应<b>一个对外模型名</b>（单一模型类别），下面挂已有供应商下的模型。客户端照常填这个模型名；成员出现连接失败、超时、5xx、429、上游模型下架等故障时，网关按优先级自动切到下一个可用成员，客户端无需改配置。</p>
+        <p class="sub">成员仍须满足原有授权链（模型已定价并启用、所属渠道在该客户端的分组内）；池名只对至少有一个成员可用的客户端显示。流式请求只在响应头之前切换，已开始输出后不会重发内容。请求账目记的是实际成功那个成员。</p>
+        <div class="form-actions admin-only"><button class="btn" id="pool-add-btn">＋ 新建故障转移供应商</button></div>
+      </div>
+      <div class="card"><h3>故障转移供应商列表</h3><div id="pool-data"></div></div>
     </section>
 
     <!-- 模型组 -->
@@ -558,7 +581,7 @@ function setSvc(ok, text) {
 }
 
 /* ── 状态缓存 ── */
-const cache = { providers: [], models: [], groups: [], keys: [], groupHealth: {} };
+const cache = { providers: [], models: [], groups: [], keys: [], pools: [], groupHealth: {} };
 /* 换主体时必须清掉缓存：管理员登出后换客户端密钥登录，如果沿用上一轮的分组列表，
    概览里的分组下拉会把别的组也列出来（后端虽然会 404，前端已经泄露了组名）。 */
 function resetCaches() {
@@ -609,6 +632,7 @@ const titles = {
   overview: ["运行概览", "服务运行状态与用量统计"],
   analytics: ["用量分析", "按日期、指标和模型查看请求趋势与消费分布"],
   providers: ["供应商", "管理上游 OpenAI 兼容服务（点「模型管理」查看渠道模型与计价）"],
+  pools: ["故障转移供应商", "一个对外模型名挂多个已有供应商模型，失败自动切下一个"],
   groups: ["模型组", "将渠道打包授权给客户端"],
   keys: ["客户端 Key", "向局域网客户端发放的访问凭据"],
   requests: ["请求日志", "最近的请求元数据"],
@@ -616,7 +640,7 @@ const titles = {
   settings: ["运行配置", "查看与修改运行参数"],
 };
 const loaders = {
-  overview: loadOverview, analytics: loadAnalytics, providers: loadProviders,
+  overview: loadOverview, analytics: loadAnalytics, providers: loadProviders, pools: loadPools,
   groups: loadGroups, keys: loadKeys, requests: loadRequests, plugins: loadPlugins, settings: loadConfig,
 };
 async function refreshView(v) {
@@ -1247,6 +1271,103 @@ async function ensureModels() {
   const d = await apiJSON("/admin/api/models");
   cache.models = d.data || [];
 }
+
+/* ── 故障转移供应商（模型池）──────────────────────────────────────────────
+   一条记录 = 一个对外模型名 + 有序成员。成员只能从「已有供应商的模型」里挑，
+   顺序即优先级；后端会再与该客户端的授权模型求交，越权的成员不会被调用。 */
+let poolDraft = { id: 0, name: "", enabled: true, members: [] };
+function poolModelOf(id) { return cache.models.find(x => x.ID === id); }
+function poolProviderOf(id) {
+  const m = poolModelOf(id);
+  if (!m) return "";
+  const p = cache.providers.find(x => x.ID === m.ProviderID);
+  return p ? p.Name : ("渠道 #" + m.ProviderID);
+}
+function renderPoolMembers() {
+  const box = $("pool-members");
+  if (!box) return;
+  const chosen = new Set(poolDraft.members.map(x => x.model_id));
+  const rows = poolDraft.members.map((m, i) => ({ id: m.model_id, enabled: m.enabled, on: true, i }))
+    .concat(cache.models.filter(m => !chosen.has(m.ID)).map(m => ({ id: m.ID, enabled: true, on: false, i: -1 })));
+  box.innerHTML = rows.length ? `<div class="pool-list">` + rows.map(r => {
+    const m = poolModelOf(r.id);
+    const label = m ? m.PublicName : ("模型 #" + r.id);
+    const unusable = m && (!m.Enabled || m.InputPriceMicroyuan == null || m.OutputPriceMicroyuan == null);
+    return `<div class="pool-row ${r.on ? "on" : ""}">
+      <label class="pool-pick"><input type="checkbox" ${r.on ? "checked" : ""} onchange="togglePoolMember(${r.id},this.checked)"><span class="mono">${esc(label)}</span><span class="pool-provider">${esc(poolProviderOf(r.id))}${unusable ? "（未定价/停用，不会被调用）" : ""}</span></label>
+      ${r.on ? `<span class="pool-order">${r.i + 1}</span>
+        <button class="btn-ghost btn-sm" type="button" onclick="movePoolMember(${r.id},-1)" ${r.i === 0 ? "disabled" : ""}>↑</button>
+        <button class="btn-ghost btn-sm" type="button" onclick="movePoolMember(${r.id},1)" ${r.i === poolDraft.members.length - 1 ? "disabled" : ""}>↓</button>
+        <label class="pool-enable"><input type="checkbox" ${r.enabled ? "checked" : ""} onchange="togglePoolEnabled(${r.id},this.checked)">启用</label>` : ""}
+    </div>`;
+  }).join("") + `</div>` : `<div class="empty">还没有模型，请先在「供应商」页添加</div>`;
+}
+window.togglePoolMember = (id, on) => {
+  if (on) {
+    if (!poolDraft.members.some(m => m.model_id === id)) poolDraft.members.push({ model_id: id, enabled: true });
+  } else {
+    poolDraft.members = poolDraft.members.filter(m => m.model_id !== id);
+  }
+  renderPoolMembers();
+};
+window.movePoolMember = (id, delta) => {
+  const i = poolDraft.members.findIndex(m => m.model_id === id), j = i + delta;
+  if (i < 0 || j < 0 || j >= poolDraft.members.length) return;
+  const tmp = poolDraft.members[i]; poolDraft.members[i] = poolDraft.members[j]; poolDraft.members[j] = tmp;
+  renderPoolMembers();
+};
+window.togglePoolEnabled = (id, on) => {
+  const m = poolDraft.members.find(x => x.model_id === id);
+  if (m) m.enabled = on;
+};
+function openPoolEditor(pool) {
+  poolDraft = pool
+    ? { id: pool.ID, name: pool.Name, enabled: pool.Enabled, members: (pool.Members || []).map(m => ({ model_id: m.ModelID, enabled: m.Enabled })) }
+    : { id: 0, name: "", enabled: true, members: [] };
+  openEdit(pool ? "编辑故障转移供应商" : "新建故障转移供应商", `
+    <div class="field"><label>对外模型名（单一模型类别，客户端就填这个）</label><input id="pool-name" required value="${esc(poolDraft.name)}" placeholder="例如 claude-sonnet-4-5"></div>
+    <p class="pm-hint">按优先级勾选已有供应商下的模型，<b>靠上的优先</b>；它故障时自动切到下一个可用成员。用 ↑↓ 调整顺序，「启用」可临时摘掉某个成员而不改变顺序。</p>
+    <div id="pool-members"></div>
+    <p class="pm-hint">成员仍须满足原有授权链：模型已定价并启用、所属渠道在客户端分组内。只有满足条件的成员会被真正调用，池名也只对这些客户端可见。</p>
+  `, async () => {
+    const name = $("pool-name").value.trim();
+    if (!name) throw new Error("请填写对外模型名");
+    const payload = { name, members: poolDraft.members.map(m => ({ model_id: m.model_id, enabled: m.enabled })) };
+    if (poolDraft.id) {
+      payload.enabled = poolDraft.enabled;
+      await apiJSON("/admin/api/pools/" + poolDraft.id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    } else {
+      await apiJSON("/admin/api/pools", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    }
+    await loadPools();
+  });
+  renderPoolMembers();
+}
+async function loadPools() {
+  const [pools, providers] = await Promise.all([apiJSON("/admin/api/pools"), apiJSON("/admin/api/providers")]);
+  cache.pools = pools.data || [];
+  cache.providers = providers.data || [];
+  try { await ensureModels(); } catch {}
+  if (!cache.pools.length) { $("pool-data").innerHTML = `<div class="empty">还没有故障转移供应商，点击上方按钮新建</div>`; return; }
+  $("pool-data").innerHTML = `<table><thead><tr><th>ID</th><th>对外模型名</th><th>成员（按优先级）</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+    cache.pools.map(p => {
+      const members = (p.Members || []).map((m, i) => `<div class="pool-member-line"><span class="mono">${i + 1}.</span> ${esc(m.PublicName || ("#" + m.ModelID))} <span class="sub">${esc(m.ProviderName || "")}</span> ${m.Enabled ? "" : `<span class="tag off">停用</span>`}</div>`).join("") || `<span class="sub">无成员（客户端看不到此池）</span>`;
+      return `<tr><td class="mono">${p.ID}</td><td><b>${esc(p.Name)}</b></td><td>${members}</td>
+        <td><label class="switch"><input type="checkbox" ${p.Enabled ? "checked" : ""} onchange="togglePool(${p.ID},this)"><span class="track"></span></label></td>
+        <td><button class="btn-ghost btn-sm" onclick="editPool(${p.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delPool(${p.ID})">删除</button></td></tr>`;
+    }).join("") + `</tbody></table>`;
+}
+window.togglePool = async (id, el) => {
+  try { await apiJSON("/admin/api/pools/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: el.checked }) }); toast(el.checked ? "已启用" : "已停用", "ok"); }
+  catch (e) { el.checked = !el.checked; toast(e.message, "err"); }
+};
+window.editPool = id => { const p = cache.pools.find(x => x.ID === id); if (p) openPoolEditor(p); };
+window.delPool = id => {
+  const p = cache.pools.find(x => x.ID === id);
+  if (!p) return;
+  removeResource(`/admin/api/pools/${id}`, `删除故障转移供应商「${p.Name}」？客户端将无法再用这个模型名调用；成员模型本身与历史账目不受影响。`, async () => { await loadPools(); });
+};
+$("pool-add-btn").onclick = () => openPoolEditor(null);
 
 /* ── 模型组（管理渠道：组内挂供应商，授权模型 = 组内渠道下已定价启用模型） ── */
 function renderGroupChecks() {

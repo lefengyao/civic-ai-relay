@@ -1,6 +1,6 @@
 # Civic Relay API 参考
 
-> 与 `internal/httpapi/admin.go`、`public.go`、`server.go` 保持同步（2026-11-01 核对）。
+> 与 `internal/httpapi/admin.go`、`public.go`、`server.go` 保持同步（2026-11-09 核对）。
 
 所有管理接口挂在 `/admin/api/` 下，**没有任何匿名路径**：要么用管理员密钥（请求头 `X-Admin-Key: <管理员密钥>`，能读写一切），要么用分发出去的客户端密钥（`Authorization: Bearer crk_...`，只读且只能看到自己所属分组）。公共转发接口挂在 `/v1/` 下，同样用 `Authorization: Bearer crk_...`。
 
@@ -14,7 +14,7 @@
 | `me` | 400 `not_applicable` | 自己这把密钥的用量、限额、有效期、可用模型数 |
 | `providers` / `models` | 全部 | 仅组内渠道（**不含 `base_url`**）与该组授权模型 |
 | `groups` / `groups/{id}` / `groups/{id}/overview` / `groups/health` | 全部 | 只有自己那一个组 |
-| `keys`、`keys/hints`、`config`、`plugins`、`providers/{id}/remote-models`、一切写操作 | 允许 | 404 |
+| `pools`（故障转移供应商）、`keys`、`keys/hints`、`config`、`plugins`、`providers/{id}/remote-models`、一切写操作 | 允许 | 404 |
 
 认证失败一律 401，码分四种：`authentication_required`（没带凭据或管理员密钥不对）、`invalid_api_key`（客户端密钥不存在或已停用）、`token_expired`（短时令牌已过期 —— 凭据没错，只是该换新令牌了，客户端不应把它当服务故障重试）、`console_login_not_supported`（用应用型 `app_...` 标识登录控制台；它的密钥创建时即丢弃，无可验证物）。
 
@@ -32,6 +32,7 @@
 | `/admin/api/...` | 管理端 REST API |
 | `/v1/models` | 公共：列出当前 Key 授权的模型 |
 | `/v1/chat/completions` | 公共：对话补全（JSON / SSE 流式） |
+| `/v1/responses` | 公共：OpenAI Responses API 兼容层（转成 chat/completions 转发，计费同口径，暂不支持工具调用） |
 
 ---
 
@@ -174,6 +175,37 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 - `0`：缓存命中免费；
 - 其他值：缓存命中部分按该单价计费。
 计费时解析上游 `usage.prompt_tokens_details.cached_tokens`（`prompt_tokens` 的子集），金额 = 未命中输入 × 输入价 + 命中 × 缓存价 + 输出 × 输出价（分组倍率对三项同样生效）。请求日志的 `cached_input_tokens` 列记录每次请求的命中量。
+
+### 故障转移供应商（模型池，v0.7.0 起）
+
+与「供应商」并列的第二类供应商形式：**一条记录只对应一个对外模型名**（单一模型类别，例如 `claude-sonnet-4-5`），下面挂的是**已有供应商下的模型**（可跨供应商），数组顺序就是优先级。客户端在 `/v1/chat/completions` 等接口照常把 `model` 填成池名；成员故障时网关按优先级自动切到下一个可用成员，客户端无需改配置。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/api/pools` | 列出全部池（含成员与顺序），返回 `{data:[{ID,Name,Enabled,Members:[...]}]}`；字段为 PascalCase（与 `providers`/`models` 列表一致） |
+| POST | `/admin/api/pools` | 创建；body `{name, members:[{model_id, enabled?}]}`。`members` 数组顺序 = 优先级，`enabled` 缺省为 true；允许空池（之后编辑补成员），创建即启用 |
+| GET | `/admin/api/pools/{id}` | 单个池；不存在返回 404 |
+| PUT | `/admin/api/pools/{id}` | 更新；body `{name?, enabled?, members?}`。`members` **不传 = 不动成员**，传空数组 = 清空；其余字段缺省保持原值 |
+| DELETE | `/admin/api/pools/{id}` | 删除；重复删除返回 404。只删池与成员关系，**不动成员模型本身，也不动历史账目** |
+
+成员对象字段：`ModelID / PublicName / UpstreamName / ProviderID / ProviderName / SortOrder / Enabled`。
+
+**名称不能撞车**：池名与任何模型的 `public_name`、其它池名重复都会被拒（400 `pool_invalid`），反向（新建/改名模型时占用池名）同样被拒——两者都会出现在 `/v1/models`，同名会让请求无法判定目标。
+
+**路由与故障判定**：
+
+- 可切换故障：连接失败 / 连接或响应头超时、5xx、429、401/403（上游凭据失效）、404（模型下架）、上游响应体无效。
+- 不切换：400/422（请求体本身有问题）、客户端取消、请求整体时长超限（换成员也救不回来）。
+- 连续失败的成员在进程内冷却 **60 秒**（排到候选末尾，不是禁用；全部都在冷却时仍按配置顺序试，重启清零）。容器日志会打 `pool_failover`，带 request_id、池 ID、切换前后成员 ID 与错误码。
+- **流式只在响应头 / 首帧之前切换**：一旦已经开始向下游输出内容，切换会造成重复文本，此后按既有流结算路径处理。
+- 一次请求只做一次预留与一次结算；候选共用 `MAX_STREAM_DURATION` 这道总闸门，切换不会把请求无限拉长。
+
+**授权与计费口径**：
+
+- 池名出现在 `/v1/models`（与管理端「接入信息」）的前提是：池启用，且**至少一个成员在该客户端的授权模型集合内**。授权集合就是原有口径（组内渠道 → 渠道启用 → 模型启用且已定价）。
+- 实际候选 = 池成员 ∩ 该 Key 的授权模型：池里挂了不在客户端分组内的渠道模型也不会被调用，池不会绕过分组授权。
+- 预留按**首选成员**的单价与倍率估算；实扣按**实际成功成员**的单价与倍率计算（`relay.PriceUsage`）。请求日志的 `model_id` / `provider_id` 记录实际成功（或最后尝试）的成员，不是首选成员。
+- 池删除、成员停用都不影响历史账目；删除成员模型会级联清掉它在各池里的成员资格。
 
 ### 模型组
 
@@ -359,5 +391,11 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v11 | `client_keys.expires_at_utc`（短时令牌有效期；`NULL` = 永久有效，历史 Key 不受影响） |
 | v12 | `client_keys.public_id`（应用型凭据的公开标识；`NULL` = 只能凭密钥认证，历史 Key 不受影响） |
 | v13 | 请求诊断、客户端关联 ID、协议/usage 来源/不完整原因、耗时快照、报价快照及请求筛选索引 |
+| v14 | `civic_plugins`（外部 WASM 插件清单、状态与运行计数） |
+| v15 | `providers.protocol`（上游协议：openai / anthropic / gemini） |
+| v16 | `client_keys.group_id`（密钥与分组一对一），账目表冗余 `group_id` 并按旧 `key_groups` 回填 |
+| v17 | 删 `key_groups`，补分组维度的额度窗口索引 |
+| v18 | `model_groups` 加 10 列分组额度（4 窗口 × Token/金额 + 周期设置） |
+| v19 | **故障转移供应商**：`model_pools`（单模型类别）+ `model_pool_members`（成员与优先级）。纯新增表，不改动任何既有表 |
 
 迁移在启动时自动应用，记录在 `schema_migrations` 表。

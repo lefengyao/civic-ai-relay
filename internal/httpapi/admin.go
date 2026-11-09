@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"civic-ai-relay/internal/config"
+	"civic-ai-relay/internal/logging"
 	"civic-ai-relay/internal/plugin"
 	"civic-ai-relay/internal/relay"
 	"civic-ai-relay/internal/store"
@@ -121,6 +122,12 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.modelCreate(w, r)
 	case strings.HasPrefix(path, "models/"):
 		h.modelItem(w, r, strings.TrimPrefix(path, "models/"))
+	case path == "pools" && r.Method == http.MethodGet:
+		h.poolsList(w, r)
+	case path == "pools" && r.Method == http.MethodPost:
+		h.poolCreate(w, r)
+	case strings.HasPrefix(path, "pools/"):
+		h.poolItem(w, r, strings.TrimPrefix(path, "pools/"))
 	case path == "groups" && r.Method == http.MethodGet:
 		h.groupsList(w, r)
 	case path == "groups" && r.Method == http.MethodPost:
@@ -869,6 +876,104 @@ func (h *AdminHandler) modelItem(w http.ResponseWriter, r *http.Request, rawID s
 		return
 	}
 	writeJSON(w, 200, map[string]any{"data": value})
+}
+
+// ── 故障转移供应商（模型池）─────────────────────────────────────────────
+// 与「供应商」并列的第二类资源：一条记录 = 一个对外模型名 + 若干已有供应商模型，
+// 成员数组顺序就是优先级。只有管理员能读写（authorizeSubject 未放行该前缀）。
+
+type poolMemberPayload struct {
+	ModelID int64 `json:"model_id"`
+	Enabled *bool `json:"enabled"`
+}
+
+type poolPayload struct {
+	Name    string               `json:"name"`
+	Enabled *bool                `json:"enabled"`
+	Members *[]poolMemberPayload `json:"members"`
+}
+
+// decodePoolMembers 返回 nil 表示「不动成员」；非 nil（含空数组）表示全量替换。
+func decodePoolMembers(raw *[]poolMemberPayload) *[]store.PoolMemberInput {
+	if raw == nil {
+		return nil
+	}
+	out := make([]store.PoolMemberInput, 0, len(*raw))
+	for _, item := range *raw {
+		out = append(out, store.PoolMemberInput{ModelID: item.ModelID, Enabled: item.Enabled == nil || *item.Enabled})
+	}
+	return &out
+}
+
+func writePoolError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeAdminError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	logging.Warnf("pool_admin_error code=%s", err.Error())
+	writeAdminErrorDetail(w, http.StatusBadRequest, "pool_invalid", "名称已被占用，或成员模型不存在 / 重复")
+}
+
+func (h *AdminHandler) poolsList(w http.ResponseWriter, r *http.Request) {
+	data, err := h.repo.ListModelPools(r.Context())
+	if err != nil {
+		writeAdminError(w, http.StatusInternalServerError, "store_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+}
+
+func (h *AdminHandler) poolCreate(w http.ResponseWriter, r *http.Request) {
+	var p poolPayload
+	if json.NewDecoder(r.Body).Decode(&p) != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	in := store.NewModelPool{Name: p.Name, Members: []store.PoolMemberInput{}}
+	if members := decodePoolMembers(p.Members); members != nil {
+		in.Members = *members
+	}
+	value, err := h.repo.CreateModelPool(r.Context(), in)
+	if err != nil {
+		writePoolError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"data": value})
+}
+
+func (h *AdminHandler) poolItem(w http.ResponseWriter, r *http.Request, raw string) {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_id")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		value, err := h.repo.GetModelPool(r.Context(), id)
+		if err != nil {
+			writePoolError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": value})
+	case http.MethodDelete:
+		writeDeleteResult(w, h.repo.DeleteModelPool(r.Context(), id))
+	case http.MethodPut:
+		var p poolPayload
+		if json.NewDecoder(r.Body).Decode(&p) != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+		value, err := h.repo.UpdateModelPool(r.Context(), id, store.UpdateModelPool{
+			Name: p.Name, Enabled: p.Enabled, Members: decodePoolMembers(p.Members),
+		})
+		if err != nil {
+			writePoolError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": value})
+	default:
+		writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+	}
 }
 
 func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
