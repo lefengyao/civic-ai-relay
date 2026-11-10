@@ -82,10 +82,8 @@ main{flex:1;overflow-y:auto;padding:26px 32px 48px}
 .stat-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.quota-refresh{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:2px 7px;font-size:14px;line-height:1.2}.quota-refresh:hover{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}.quota-refresh:disabled{opacity:.55;cursor:wait}
 .stat .hint{font-size:12px;color:var(--muted);margin-top:4px}
 .quota-wide{grid-column:1/-1}
-/* 概览页一张卡片里要同时放 4 个窗口，全通栏会让页面拉得很长；改成两列。
-   分组弹窗（560px）里仍然按 .quota-wide 通栏，那里一列更好读。 */
-#stat-cards .quota-wide{grid-column:span 2}
-@media (max-width:1000px){#stat-cards .quota-wide{grid-column:1/-1}}
+/* 概览页每张卡片独占一行，不做多列拼排（老板定的口径）。 */
+#stat-cards{grid-template-columns:minmax(0,1fr)}
 .quota-metrics{display:flex;flex-wrap:wrap;gap:6px 40px;margin-top:6px}
 .quota-metric{display:flex;align-items:baseline;gap:8px;flex:1 1 260px;font-variant-numeric:tabular-nums;min-width:0}
 .quota-metric .qname{color:var(--muted);font-size:12px}
