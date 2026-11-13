@@ -613,11 +613,25 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 }
 
 // authorizedModelsSelect 是「客户端实际能用哪些模型」的唯一口径：
-// Key 的唯一所属分组（client_keys.group_id，NULL = 未绑）→ 组内渠道 →
+// Key 的唯一所属分组（client_keys.group_id，NULL = 未绑）→ 该分组可用的渠道 →
 // 渠道下已启用且已定价的模型 → 渠道本身启用。
+//
+// 渠道来源按分组类型区分（v22）：
+//   - normal：只有 group_providers 里自己挂的渠道；
+//   - aggregate：自己的渠道 **加上** 它包含的、处于启用状态的成员组的渠道
+//     （group_compositions）。只允许一层，成员关系在写入时已校验必须是 normal，
+//     所以这里不需要递归 CTE。
+//
 // 公共 /v1/models 与管理端「接入信息」共用这一份 SQL，避免两处判断漂移出
 // 「客户端报 404、管理台却显示已授权」这类最难查的问题。
-const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
+const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN (
+	SELECT gp.group_id AS group_id, gp.provider_id AS provider_id FROM group_providers gp
+	UNION
+	SELECT gc.parent_group_id AS group_id, gp.provider_id AS provider_id
+		FROM group_compositions gc
+		JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1
+		JOIN group_providers gp ON gp.group_id=gc.child_group_id
+) eff ON eff.group_id=g.id JOIN models m ON m.provider_id=eff.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
 
 func (s *Store) authorizedModels(ctx context.Context, where string, args ...any) ([]Model, error) {
 	rows, err := s.db.QueryContext(ctx, authorizedModelsSelect+where+" ORDER BY m.id", args...)

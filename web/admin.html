@@ -297,6 +297,7 @@ details .card{margin-bottom:0}
       <button data-view="providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><circle cx="6" cy="7.5" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="16.5" r="1" fill="currentColor" stroke="none"/></svg>供应商</button>
       <button data-view="pools" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h9a4 4 0 0 1 4 4v1"/><path d="M4 17h9a4 4 0 0 0 4-4v-1"/><path d="m17 4 3 3-3 3"/><path d="m17 14 3 3-3 3"/></svg>故障转移供应商</button>
       <button data-view="groups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 8.5L10.5 15.5M16.5 8.5L13.5 15.5M9 6h6"/></svg>模型组</button>
+      <button data-view="aggregates" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>聚合模型组</button>
       <button data-view="keys" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M11 12L21 2M17 6l3 3M14 9l2 2"/></svg>客户端 Key</button>
       <button data-view="requests"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>请求日志</button>
       <button data-view="plugins" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3v3a3 3 0 0 1-3 3H3v6h3a3 3 0 0 1 3 3v3h6v-3a3 3 0 0 1 3-3h3V9h-3a3 3 0 0 1-3-3V3H9Z"/></svg>WASM 插件</button>
@@ -402,6 +403,26 @@ details .card{margin-bottom:0}
           </div>
         </div>
         <div id="group-data"></div>
+      </div>
+    </section>
+
+    <!-- 聚合模型组：把若干普通模型组合并成一个可被 Key 绑定的组 -->
+    <section id="view-aggregates" class="view">
+      <details class="add-box admin-only"><summary>＋ 创建聚合模型组</summary>
+        <div class="card"><form id="agg-form">
+          <div class="form-grid">
+            <div class="field" style="margin-bottom:12px"><label>组名</label><input name="name" required placeholder="例如 全量聚合" style="max-width:280px"></div>
+            <div class="field" style="margin-bottom:12px"><label>计费倍率（1.00 = 原价）</label><input name="rate" type="number" step="0.01" min="0.01" value="1.00" required style="max-width:140px"></div>
+          </div>
+          <div class="field"><label>包含的模型组 —— 成员组的渠道与模型会一并授权给绑定本组的 Key</label><div id="agg-group-checks"></div></div>
+          <div class="field" style="margin-top:12px"><label>自有渠道（可选）—— 聚合组也可以直接挂渠道</label><div id="agg-provider-checks"></div></div>
+          <p style="color:var(--muted);font-size:12.5px;margin:8px 0 0">一笔请求会<b>同时消耗本组与真正提供模型的成员组的额度</b>：任一组的窗口用满都会拒绝新请求。聚合组只允许包含普通模型组（不支持多层嵌套），但它自己拥有独立的倍率与额度。</p>
+          <div class="form-actions"><button class="btn">创建聚合模型组</button></div>
+        </form></div>
+      </details>
+      <div class="card">
+        <div class="card-head"><h3>聚合模型组列表</h3></div>
+        <div id="agg-data"></div>
       </div>
     </section>
 
@@ -639,6 +660,7 @@ const titles = {
   providers: ["供应商", "管理上游 OpenAI 兼容服务（点「模型管理」查看渠道模型与计价）"],
   pools: ["故障转移供应商", "一个对外模型名挂多个已有供应商模型，失败自动切下一个"],
   groups: ["模型组", "将渠道打包授权给客户端"],
+  aggregates: ["聚合模型组", "把多个模型组合并成一个组；本组与成员组同时计费"],
   keys: ["客户端 Key", "向局域网客户端发放的访问凭据"],
   requests: ["请求日志", "最近的请求元数据"],
   plugins: ["WASM 插件", "安装、启停和审计外部插件包"],
@@ -646,7 +668,7 @@ const titles = {
 };
 const loaders = {
   overview: loadOverview, analytics: loadAnalytics, providers: loadProviders, pools: loadPools,
-  groups: loadGroups, keys: loadKeys, requests: loadRequests, plugins: loadPlugins, settings: loadConfig,
+  groups: loadGroups, aggregates: loadAggregates, keys: loadKeys, requests: loadRequests, plugins: loadPlugins, settings: loadConfig,
 };
 async function refreshView(v) {
   if (!scope) return; // 未登录：停在登录页，不去打接口
@@ -1566,7 +1588,7 @@ window.monitorGroup = async (id, btn) => {
   try {
     await apiJSON(`/admin/api/groups/${id}/monitor`, { method: "POST" });
     toast("检测完成", "ok");
-    await loadGroups();
+    if (currentView === "aggregates") await loadAggregates(); else await loadGroups();
   } catch (e) { toast(e.message, "err"); }
   finally { if (btn) { btn.disabled = false; btn.textContent = original; } }
 };
@@ -1598,9 +1620,12 @@ async function loadGroups() {
     finally { btn.disabled = false; btn.textContent = original; }
   };
   renderGroupChecks();
-  if (!cache.groups.length) { $("group-data").innerHTML = `<div class="empty">还没有模型组，点击上方按钮创建</div>`; return; }
+  // 聚合组在「聚合模型组」页单独管理：这里只列普通组，避免在错误的页面上
+  // 编辑它（普通组编辑弹窗只会改自有渠道，聚合组的成员关系会被误解为丢失）。
+  const plainGroups = cache.groups.filter(g => g.Kind !== "aggregate");
+  if (!plainGroups.length) { $("group-data").innerHTML = `<div class="empty">还没有模型组，点击上方按钮创建</div>`; return; }
   $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
-    cache.groups.map(g => {
+    plainGroups.map(g => {
       const ops = isAdmin
         ? `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="monitorGroup(${g.ID},this)">检测</button> <button class="btn-ghost btn-sm" onclick="editGroup(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delGroup(${g.ID})">删除</button>`
         : `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="viewGroup(${g.ID})">查看信息</button>`;
@@ -1759,6 +1784,150 @@ $("group-form").onsubmit = async e => {
   } catch (err) { toast(err.message, "err"); }
 };
 
+/* ── 聚合模型组（v22）────────────────────────────────────────────────────
+   聚合组是「组的集合」：Key 绑聚合组后能用到成员组里的全部模型。它有自己的
+   倍率与额度，并且一笔请求会同时扣聚合组与成员组两边的额度（老板明确要求）。
+   只允许包含普通模型组（一层），所以这里的候选列表要排掉聚合组自己。 */
+function renderAggregateChecks() {
+  const candidates = (cache.groups || []).filter(g => g.Kind !== "aggregate");
+  $("agg-group-checks").innerHTML = checkListHTML(
+    candidates.map(g => ({ id: g.ID, label: `${g.Name}（${g.Providers || 0} 个渠道${g.Enabled ? "" : "，已停用"}）` })),
+    [], "还没有可包含的普通模型组");
+  const providers = (cache.providers || []).filter(p => p.Enabled);
+  $("agg-provider-checks").innerHTML = checkListHTML(
+    providers.map(p => {
+      const n = cache.models.filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
+      return { id: p.ID, label: `${p.Name}（${n} 个可用模型）` };
+    }), [], "暂无启用中的渠道");
+}
+/* 聚合组的额度紧张标记与模型组同口径：三个主窗口里最紧的那个。 */
+function aggregateQuotaCell(g) {
+  const tension = g.TensionPct != null ? Number(g.TensionPct) : 0;
+  const limited = [g.TokenLimit5H, g.TokenLimitDaily, g.TokenLimitWeekly].some(v => v != null && v > 0);
+  if (g.Overdrawn) return `<span class="tag err" title="至少一个窗口已用满：下一个请求会被拒">已欠费 ${tension.toFixed(0)}%</span>`;
+  if (!limited) return `<span style="color:var(--muted)" title="三个主窗口都没有设置限额">不限</span>`;
+  return tension >= 80
+    ? `<span class="tag warn" title="三个主窗口中最高用量占比（按 Token）">${tension.toFixed(0)}%</span>`
+    : `<span class="tag ok" title="三个主窗口中最高用量占比（按 Token）">${tension.toFixed(0)}%</span>`;
+}
+async function loadAggregates() {
+  const d = await apiJSON("/admin/api/groups");
+  cache.groups = d.data || [];
+  try { if (!cache.models.length) await ensureModels(); } catch {}
+  try { if (!cache.providers.length) cache.providers = (await apiJSON("/admin/api/providers")).data || []; } catch {}
+  try { cache.groupHealth = (await apiJSON("/admin/api/groups/health")).data || {}; } catch {}
+  renderAggregateChecks();
+  const list = cache.groups.filter(g => g.Kind === "aggregate");
+  if (!list.length) {
+    $("agg-data").innerHTML = `<div class="empty">还没有聚合模型组：它把多个模型组合并成一个组，绑定本组的 Key 能用上成员组的全部模型</div>`;
+    return;
+  }
+  $("agg-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>成员组</th><th>渠道</th><th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
+    list.map(g => {
+      const members = g.Members || [];
+      const memberCell = members.length
+        ? members.map(m => `<span class="tag ${m.Enabled ? "ok" : "off"}" title="成员组，自带 ${m.Providers || 0} 个渠道">${esc(m.Name)}</span>`).join(" ")
+        : `<span style="color:var(--muted)">未包含任何组</span>`;
+      // 渠道数：自有 + 各成员组的。同一个渠道被多个成员组引用时会重复计数，
+      // 这里只作规模参考，精确清单在「查看 / 编辑」里。
+      const providerCount = (g.Providers || 0) + members.reduce((sum, m) => sum + (m.Providers || 0), 0);
+      const ops = isAdmin
+        ? `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="monitorGroup(${g.ID},this)">检测</button> <button class="btn-ghost btn-sm" onclick="editAggregate(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delAggregate(${g.ID})">删除</button>`
+        : `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button>`;
+      return `<tr><td class="mono">${g.ID}</td><td class="provider-name"><b>${esc(g.Name)}</b></td><td class="mono">×${((g.RateMilli || 1000) / 1000).toFixed(2)}</td><td style="min-width:140px">${memberCell}</td><td class="mono">${providerCount}</td><td style="white-space:nowrap">${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td style="white-space:nowrap">${aggregateQuotaCell(g)}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td class="sched-cell" style="white-space:nowrap">${ops}</td></tr>`;
+    }).join("") + `</tbody></table>`;
+}
+$("agg-form").onsubmit = async e => {
+  e.preventDefault();
+  const form = new FormData(e.target);
+  const groupIds = [...$("agg-group-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
+  if (!groupIds.length) { toast("至少要包含一个模型组；只挂渠道请用「模型组」", "err"); return; }
+  try {
+    await apiJSON("/admin/api/groups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      name: form.get("name"), kind: "aggregate", rate: parseFloat(form.get("rate")) || 1,
+      group_ids: groupIds,
+      provider_ids: [...$("agg-provider-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id)),
+    }) });
+    toast("聚合模型组已创建", "ok");
+    e.target.reset();
+    loadAggregates();
+  } catch (err) { toast(err.message, "err"); }
+};
+window.editAggregate = async id => {
+  const g = cache.groups.find(x => x.ID === id);
+  if (!g) return;
+  try { await ensureModels(); } catch {}
+  let ownProviderIds = [];
+  try { ownProviderIds = (await apiJSON("/admin/api/groups/" + id + "/providers")).data || []; } catch {}
+  const memberIds = (g.MemberIDs || []).slice();
+  const candidates = cache.groups.filter(x => x.Kind !== "aggregate");
+  const memberItems = candidates.map(x => ({ id: x.ID, label: `${x.Name}（${x.Providers || 0} 个渠道${x.Enabled ? "" : "，已停用"}）` }));
+  const providerItems = (cache.providers || []).filter(p => p.Enabled).map(p => {
+    const n = cache.models.filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
+    return { id: p.ID, label: `${p.Name}（${n} 个可用模型）` };
+  });
+  const plainVal = v => (v == null ? "" : v);
+  const moneyVal = v => (v == null ? "" : v / 1e6);
+  const quotaField = (key, label, value, money) =>
+    `<div class="field"><label>${label}</label><input id="ag-${key}" type="number" min="0" ${money ? `step="0.01"` : `step="1"`} placeholder="留空 = 保持原值" value="${value}"></div>`;
+  openEdit(`聚合模型组「${esc(g.Name)}」信息`, `
+    <div class="form-grid">
+      <div class="field"><label>组名</label><input id="ag-name" value="${esc(g.Name)}" style="max-width:280px"></div>
+      <div class="field"><label>计费倍率（单价 × 倍率）</label><input id="ag-rate" type="number" step="0.01" min="0.01" value="${((g.RateMilli || 1000) / 1000).toFixed(2)}" style="max-width:140px"></div>
+    </div>
+    <div style="margin-top:14px"><h4 style="margin:0 0 4px">本组额度（与成员组各扣一份）</h4>
+      <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">一笔请求同时占用本组与真正提供模型的成员组额度，任一窗口用满即拒绝。<b>0 = 不限；留空 = 保持原值</b>。</p>
+      <div class="form-grid">
+        ${quotaField("t5h", "5 小时 Token 限额", plainVal(g.TokenLimit5H))}
+        ${quotaField("a5h", "5 小时金额限额（元）", moneyVal(g.AmountLimit5H), true)}
+        ${quotaField("td", "当日 Token 限额（北京时间）", plainVal(g.TokenLimitDaily))}
+        ${quotaField("ad", "当日金额限额（元）", moneyVal(g.AmountLimitDaily), true)}
+        ${quotaField("tw", "本周 Token 限额（周一起）", plainVal(g.TokenLimitWeekly))}
+        ${quotaField("aw", "本周金额限额（元）", moneyVal(g.AmountLimitWeekly), true)}
+        ${quotaField("pd", "自定义周期长度（天；0 = 关闭）", plainVal(g.PeriodLimitDays))}
+        ${quotaField("tp", "自定义周期 Token 限额", plainVal(g.TokenLimitPeriod))}
+        ${quotaField("ap", "自定义周期金额限额（元）", moneyVal(g.AmountLimitPeriod), true)}
+      </div>
+      ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}</p>` : ""}
+    </div>
+    <div class="field" style="margin-top:14px"><label>包含的模型组（只允许普通组，一层）</label><div id="ag-member-checks">${checkListHTML(memberItems, memberIds, "还没有可包含的普通模型组")}</div></div>
+    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${checkListHTML(providerItems, ownProviderIds, "暂无启用中的渠道")}</div></div>
+    <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="ag-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该聚合模型组</label>
+  `, async () => {
+    const numOrNull = (key, micro) => {
+      const raw = $("ag-" + key).value.trim();
+      if (raw === "") return null;
+      const v = Number(raw);
+      if (!Number.isFinite(v) || v < 0) throw new Error("额度不能为负数");
+      return micro ? Math.round(v * 1e6) : Math.round(v);
+    };
+    const picked = [...$("ag-member-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
+    if (!picked.length) throw new Error("至少要包含一个模型组");
+    // 先写成员与渠道：它们失败时不应该留下「改了一半」的名称/额度。
+    await apiJSON("/admin/api/groups/" + id + "/members", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_ids: picked }) });
+    await apiJSON("/admin/api/groups/" + id + "/providers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider_ids: [...$("ag-provider-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id)) }) });
+    await apiJSON("/admin/api/groups/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      name: $("ag-name").value.trim(), rate: parseFloat($("ag-rate").value) || 1, enabled: $("ag-enabled").checked,
+      token_limit_5h: numOrNull("t5h", false), amount_limit_5h: numOrNull("a5h", true),
+      token_limit_daily: numOrNull("td", false), amount_limit_daily: numOrNull("ad", true),
+      token_limit_weekly: numOrNull("tw", false), amount_limit_weekly: numOrNull("aw", true),
+      period_limit_days: numOrNull("pd", false), token_limit_period: numOrNull("tp", false),
+      amount_limit_period: numOrNull("ap", true),
+    }) });
+    loadAggregates();
+  });
+};
+window.delAggregate = id => {
+  const g = cache.groups.find(x => x.ID === id);
+  if (!g) return;
+  const n = g.BoundKeys || 0;
+  removeResource(`/admin/api/groups/${id}`,
+    n > 0
+      ? `删除聚合模型组「${g.Name}」？将解绑 ${n} 个客户端密钥，它们会立即无法调用任何模型。成员组本身不会被删除。`
+      : `删除聚合模型组「${g.Name}」？成员组本身不会被删除。`,
+    loadAggregates);
+};
+
 /* ── 客户端 Key ── */
 /* 短时令牌的剩余寿命。放在状态列里，运维一眼能看到哪些快到期 —— 到期后客户端会收到
    401 token_expired，提前续期就不会中断业务（而"密钥失效"和"服务坏了"是两回事）。 */
@@ -1776,7 +1945,7 @@ function expiryTag(k) {
 }
 function renderKeyGroupChecks() {
   $("key-group-checks").innerHTML = cache.groups.filter(g => g.Enabled).map(g =>
-    `<label class="check-item"><input type="radio" name="key-group" value="${g.ID}" onchange="this.closest('.check-list').querySelectorAll('.check-item').forEach(i=>i.classList.remove('on'));this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(g.Name)}</span></label>`).join("")
+    `<label class="check-item"><input type="radio" name="key-group" value="${g.ID}" onchange="this.closest('.check-list').querySelectorAll('.check-item').forEach(i=>i.classList.remove('on'));this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(g.Name)}${g.Kind === "aggregate" ? "（聚合）" : ""}</span></label>`).join("")
     || `<span style="color:var(--muted);font-size:13px">暂无模型组，请先创建</span>`;
 }
 async function loadKeys() {

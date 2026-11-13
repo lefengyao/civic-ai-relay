@@ -43,9 +43,31 @@ type UpdateModel struct {
 	Enabled                   *bool
 }
 
+// 分组类型（v22）。normal = 自己直接挂渠道；aggregate = 聚合组，除自有渠道外
+// 还可以包含若干普通模型组，合并它们的渠道与模型。聚合组只允许包含 normal 组，
+// 不支持多层嵌套（避免环与额度归属的递归歧义）。
+const (
+	GroupKindNormal    = "normal"
+	GroupKindAggregate = "aggregate"
+)
+
+// NormalizeGroupKind 把外部输入收敛成合法值；空串按 normal 处理，保持旧调用点
+// （不传 kind 的 API 调用方）行为不变。
+func NormalizeGroupKind(kind string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(kind)) {
+	case "", GroupKindNormal:
+		return GroupKindNormal, nil
+	case GroupKindAggregate:
+		return GroupKindAggregate, nil
+	default:
+		return "", fmt.Errorf("未知的分组类型 %q（只支持 normal / aggregate）", kind)
+	}
+}
+
 type ModelGroup struct {
 	ID        int64
 	Name      string
+	Kind      string // normal | aggregate
 	Enabled   bool
 	RateMilli int64 // 计费倍率，千分比表示：1000 = 1.0x
 	// 分组额度（取代旧全局额度，v18）：nil = 未设 = 不限。判定在预留事务内
@@ -64,12 +86,31 @@ type ModelGroup struct {
 	PeriodLimitStart *string
 	// BoundKeys 绑定到本组的客户端密钥数。删组前要让运维看到影响面。
 	BoundKeys int64
+	// Members / MemberIDs 仅在聚合组上非空：它包含的普通模型组。
+	MemberIDs []int64
+	Members   []ModelGroupBrief
+	// Providers 是组「自己能直接用的渠道数」：普通组 = 自己挂的渠道，聚合组
+	// 只算自有渠道，不含成员组带来的（成员组各自有计数）。
+	Providers int
+}
+
+// ModelGroupBrief 是嵌在聚合组里的成员组摘要，供列表与编辑弹窗回显，
+// 避免前端为了显示成员名再去拉一遍全部分组。
+type ModelGroupBrief struct {
+	ID        int64  `json:"ID"`
+	Name      string `json:"Name"`
+	Enabled   bool   `json:"Enabled"`
+	RateMilli int64  `json:"RateMilli"`
+	Providers int    `json:"Providers"`
 }
 
 type NewModelGroup struct {
 	Name      string
 	Enabled   bool
 	RateMilli int64 // 0 视为默认 1000
+	// Kind 为空按 normal；aggregate 时 GroupIDs 是成员组。
+	Kind     string
+	GroupIDs []int64
 }
 
 type UpdateModelGroup struct {
@@ -306,7 +347,19 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 	if err != nil {
 		return ModelGroup{}, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO model_groups(name,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?)`, name, 1, rate, nowUTC(), nowUTC())
+	kind, err := NormalizeGroupKind(in.Kind)
+	if err != nil {
+		return ModelGroup{}, err
+	}
+	if kind == GroupKindNormal && len(in.GroupIDs) > 0 {
+		return ModelGroup{}, errors.New("普通模型组不能包含其他模型组，请选择「聚合模型组」类型")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ModelGroup{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO model_groups(name,kind,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?)`, name, kind, 1, rate, nowUTC(), nowUTC())
 	if err != nil {
 		return ModelGroup{}, err
 	}
@@ -314,7 +367,77 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 	if err != nil {
 		return ModelGroup{}, err
 	}
-	return ModelGroup{ID: id, Name: name, Enabled: true, RateMilli: rate}, nil
+	if kind == GroupKindAggregate {
+		if err := replaceGroupCompositionsTx(ctx, tx, id, in.GroupIDs); err != nil {
+			return ModelGroup{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ModelGroup{}, err
+	}
+	return ModelGroup{ID: id, Name: name, Kind: kind, Enabled: true, RateMilli: rate}, nil
+}
+
+// replaceGroupCompositionsTx 重建聚合组的成员关系。校验全部在事务内完成：
+// 成员必须存在、必须是 normal 组、不能是聚合组自己（防环的第一道墙；因为
+// 聚合组不允许作为成员，环在结构上就不可能形成）。
+func replaceGroupCompositionsTx(ctx context.Context, tx *sql.Tx, parentID int64, childIDs []int64) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM group_compositions WHERE parent_group_id=?`, parentID); err != nil {
+		return err
+	}
+	seen := make(map[int64]bool, len(childIDs))
+	for _, childID := range childIDs {
+		if childID <= 0 {
+			return errors.New("成员组 ID 无效")
+		}
+		if childID == parentID {
+			return errors.New("聚合组不能包含自己")
+		}
+		if seen[childID] {
+			continue
+		}
+		seen[childID] = true
+		var kind string
+		if err := tx.QueryRowContext(ctx, `SELECT kind FROM model_groups WHERE id=?`, childID).Scan(&kind); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("成员组 #%d 不存在", childID)
+			}
+			return err
+		}
+		if kind != GroupKindNormal {
+			return fmt.Errorf("聚合组只能包含普通模型组（#%d 是聚合组）", childID)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO group_compositions(parent_group_id,child_group_id) VALUES (?,?)`, parentID, childID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReplaceGroupCompositions 是给管理端用的成员关系覆盖写。
+func (s *Store) ReplaceGroupCompositions(ctx context.Context, parentID int64, childIDs []int64) error {
+	if parentID <= 0 {
+		return errors.New("group ID is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var kind string
+	if err := tx.QueryRowContext(ctx, `SELECT kind FROM model_groups WHERE id=?`, parentID).Scan(&kind); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		return err
+	}
+	if kind != GroupKindAggregate {
+		return errors.New("只有聚合模型组可以包含其他模型组")
+	}
+	if err := replaceGroupCompositionsTx(ctx, tx, parentID, childIDs); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGroup) (ModelGroup, error) {
@@ -322,7 +445,7 @@ func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGr
 	var enabled int
 	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
 	var ps sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT name,enabled,rate_milli,token_limit_5h,amount_limit_5h,token_limit_daily,amount_limit_daily,token_limit_weekly,amount_limit_weekly,period_limit_days,token_limit_period,amount_limit_period,period_limit_start FROM model_groups WHERE id=?`, id).Scan(&g.Name, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT name,kind,enabled,rate_milli,token_limit_5h,amount_limit_5h,token_limit_daily,amount_limit_daily,token_limit_weekly,amount_limit_weekly,period_limit_days,token_limit_period,amount_limit_period,period_limit_start FROM model_groups WHERE id=?`, id).Scan(&g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps); err != nil {
 		return ModelGroup{}, err
 	}
 	g.ID, g.Enabled = id, enabled == 1
@@ -398,24 +521,99 @@ func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGr
 	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,rate_milli=?,token_limit_5h=?,amount_limit_5h=?,token_limit_daily=?,amount_limit_daily=?,token_limit_weekly=?,amount_limit_weekly=?,period_limit_days=?,token_limit_period=?,amount_limit_period=?,period_limit_start=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), g.RateMilli, g.TokenLimit5H, g.AmountLimit5H, g.TokenLimitDaily, g.AmountLimitDaily, g.TokenLimitWeekly, g.AmountLimitWeekly, g.PeriodLimitDays, g.TokenLimitPeriod, g.AmountLimitPeriod, g.PeriodLimitStart, nowUTC(), id); err != nil {
 		return ModelGroup{}, err
 	}
+	if g.Kind == GroupKindAggregate {
+		members, err := s.groupMembers(ctx, id)
+		if err != nil {
+			return ModelGroup{}, err
+		}
+		g.Members = members
+	}
 	return g, nil
 }
 
+// groupMembers 读聚合组包含的成员组摘要。普通组直接返回空切片。
+func (s *Store) groupMembers(ctx context.Context, groupID int64) ([]ModelGroupBrief, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,g.rate_milli,
+		(SELECT COUNT(*) FROM group_providers gp WHERE gp.group_id=g.id)
+		FROM group_compositions gc JOIN model_groups g ON g.id=gc.child_group_id
+		WHERE gc.parent_group_id=? ORDER BY g.id`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ModelGroupBrief, 0)
+	for rows.Next() {
+		var m ModelGroupBrief
+		var enabled int
+		if err := rows.Scan(&m.ID, &m.Name, &enabled, &m.RateMilli, &m.Providers); err != nil {
+			return nil, err
+		}
+		m.Enabled = enabled == 1
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// GroupCompositionIDs 返回聚合组的成员组 ID，供编辑弹窗回显与删除影响面计算。
+func (s *Store) GroupCompositionIDs(ctx context.Context, groupID int64) ([]int64, error) {
+	if groupID <= 0 {
+		return nil, errors.New("group ID is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT child_group_id FROM group_compositions WHERE parent_group_id=? ORDER BY child_group_id`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// AggregatesContaining 返回把 groupID 当作成员包含的聚合组，供删除普通组时
+// 提示影响面（删掉成员组会同时改变这些聚合组的可用模型）。
+func (s *Store) AggregatesContaining(ctx context.Context, groupID int64) ([]ModelGroupBrief, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,g.rate_milli,0
+		FROM group_compositions gc JOIN model_groups g ON g.id=gc.parent_group_id
+		WHERE gc.child_group_id=? ORDER BY g.id`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ModelGroupBrief, 0)
+	for rows.Next() {
+		var m ModelGroupBrief
+		var enabled int
+		if err := rows.Scan(&m.ID, &m.Name, &enabled, &m.RateMilli, &m.Providers); err != nil {
+			return nil, err
+		}
+		m.Enabled = enabled == 1
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id) FROM model_groups g ORDER BY g.id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id) FROM model_groups g ORDER BY g.id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
 	out := make([]ModelGroup, 0)
+	briefs := make(map[int64]ModelGroupBrief)
 	for rows.Next() {
 		var g ModelGroup
 		var enabled int
 		var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
 		var ps sql.NullString
-		var bound int64
-		if err := rows.Scan(&g.ID, &g.Name, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound); err != nil {
+		var bound, providers int64
+		if err := rows.Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers); err != nil {
 			return nil, err
 		}
 		g.Enabled = enabled == 1
@@ -432,9 +630,43 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 			g.PeriodLimitStart = &start
 		}
 		g.BoundKeys = bound
+		g.Providers = int(providers)
+		g.MemberIDs = make([]int64, 0)
+		g.Members = make([]ModelGroupBrief, 0)
+		briefs[g.ID] = ModelGroupBrief{ID: g.ID, Name: g.Name, Enabled: g.Enabled, RateMilli: g.RateMilli, Providers: int(providers)}
 		out = append(out, g)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 一次取全部成员关系，按父组归类——避免每个聚合组各查一次（组多时是 N+1）。
+	members := make(map[int64][]ModelGroupBrief)
+	rows2, err := s.db.QueryContext(ctx, `SELECT parent_group_id,child_group_id FROM group_compositions ORDER BY parent_group_id,child_group_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows2.Close()
+	for rows2.Next() {
+		var parent, child int64
+		if err := rows2.Scan(&parent, &child); err != nil {
+			return nil, err
+		}
+		if brief, ok := briefs[child]; ok {
+			members[parent] = append(members[parent], brief)
+		}
+	}
+	if err := rows2.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if list, ok := members[out[i].ID]; ok {
+			out[i].Members = list
+			for _, m := range list {
+				out[i].MemberIDs = append(out[i].MemberIDs, m.ID)
+			}
+		}
+	}
+	return out, nil
 }
 
 // GetModelGroup 读单个分组。控制台按密钥主体登录时要拿组名做展示，
@@ -447,9 +679,9 @@ func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error)
 	var enabled int
 	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
 	var ps sql.NullString
-	var bound int64
-	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
-		Scan(&g.ID, &g.Name, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound)
+	var bound, providers int64
+	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
+		Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers)
 	if err != nil {
 		return ModelGroup{}, err
 	}
@@ -467,6 +699,19 @@ func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error)
 		g.PeriodLimitStart = &start
 	}
 	g.BoundKeys = bound
+	g.Providers = int(providers)
+	g.MemberIDs = make([]int64, 0)
+	g.Members = make([]ModelGroupBrief, 0)
+	if g.Kind == GroupKindAggregate {
+		members, err := s.groupMembers(ctx, id)
+		if err != nil {
+			return ModelGroup{}, err
+		}
+		g.Members = members
+		for _, m := range members {
+			g.MemberIDs = append(g.MemberIDs, m.ID)
+		}
+	}
 	return g, nil
 }
 

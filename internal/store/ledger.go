@@ -270,10 +270,106 @@ func periodWindowUsage(ctx context.Context, conn *sql.Conn, limits QuotaLimits, 
 	periodStart := limits.PeriodStart.Format(time.RFC3339Nano)
 	periodEnd := limits.PeriodStart.AddDate(0, 0, limits.PeriodDays).Format(time.RFC3339Nano)
 	var usedTokens, usedAmount int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND group_id=? AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<julianday(?) AND julianday(created_at_utc)<=julianday(?)`, groupID, periodStart, periodEnd, started).Scan(&usedTokens, &usedAmount); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND `+groupUsageScope+` AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<julianday(?) AND julianday(created_at_utc)<=julianday(?)`, groupID, groupID, periodStart, periodEnd, started).Scan(&usedTokens, &usedAmount); err != nil {
 		return 0, 0, err
 	}
 	return usedTokens, usedAmount, nil
+}
+
+// groupUsageScope 是「一个组用了多少」的唯一定义（v22）：
+// 既包括 Key 绑定该组的请求（group_id），也包括该组作为成员组被聚合组带出去
+// 的请求（source_group_id）。额度判定、概览、分组列表必须同口径，否则会出现
+// 「概览说还没满、请求却被拒」这种最难解释的错位。
+const groupUsageScope = `(group_id=? OR source_group_id=?)`
+
+// groupQuotaLimits 读某个组的限额与周期参数。聚合组请求要在成员组上再扣一份，
+// 所以成员组的限额必须与 Key 的组一样从事务内读，不能复用 Key 组的快照。
+func groupQuotaLimits(ctx context.Context, conn *sql.Conn, groupID int64) (QuotaLimits, string, error) {
+	var limits QuotaLimits
+	var name string
+	var periodDays int64
+	var periodStartRaw sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(name,''),COALESCE(token_limit_5h,0),COALESCE(amount_limit_5h,0),COALESCE(token_limit_daily,0),COALESCE(amount_limit_daily,0),COALESCE(token_limit_weekly,0),COALESCE(amount_limit_weekly,0),COALESCE(period_limit_days,0),COALESCE(token_limit_period,0),COALESCE(amount_limit_period,0),COALESCE(period_limit_start,'') FROM model_groups WHERE id=?`, groupID).
+		Scan(&name, &limits.Token5H, &limits.Amount5H, &limits.TokenDaily, &limits.AmountDaily,
+			&limits.TokenWeekly, &limits.AmountWeekly, &periodDays, &limits.TokenPeriod,
+			&limits.AmountPeriod, &periodStartRaw); err != nil {
+		return QuotaLimits{}, "", err
+	}
+	limits.PeriodDays = int(periodDays)
+	if periodStartRaw.Valid && periodStartRaw.String != "" {
+		if parsed, err := time.Parse(time.RFC3339, periodStartRaw.String); err == nil {
+			limits.PeriodStart = parsed
+		}
+	}
+	return limits, name, nil
+}
+
+// checkGroupQuota 判定一个组在四个窗口上是否已欠费。窗口口径与 GroupOverview
+// 完全一致（5h / 北京时间自然日 / 自定义周期 / 北京时间自然周），周期生效时
+// 周窗口让位给周期——这与旧实现相同，只是从「一个组」变成「每个相关的组各判」。
+func checkGroupQuota(ctx context.Context, conn *sql.Conn, groupID int64, groupName string, limits QuotaLimits, startedAt time.Time, started, date string) error {
+	verdict := func(code, scope, metric string, used, limit int64) error {
+		if limit > 0 && used >= limit {
+			return &QuotaError{Code: code, Scope: scope, Metric: metric, Used: used, Limit: limit, Group: groupName, GroupID: groupID}
+		}
+		return nil
+	}
+	usage := func(extra string, args ...any) (int64, int64, error) {
+		query := `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND ` + groupUsageScope + ` AND ` + extra
+		args = append([]any{groupID, groupID}, args...)
+		var tokens, amount int64
+		err := conn.QueryRowContext(ctx, query, args...).Scan(&tokens, &amount)
+		return tokens, amount, err
+	}
+	// 5 小时滚动窗口
+	tokens, amount, err := usage(`julianday(created_at_utc)>=julianday(?,'-5 hours') AND julianday(created_at_utc)<=?`, started, started)
+	if err != nil {
+		return err
+	}
+	if err := verdict("token_quota_exceeded", "5h", "tokens", tokens, limits.Token5H); err != nil {
+		return err
+	}
+	if err := verdict("amount_quota_exceeded", "5h", "amount", amount, limits.Amount5H); err != nil {
+		return err
+	}
+	// 北京时间自然日
+	tokens, amount, err = usage(`billing_date_bj=? AND created_at_utc<=?`, date, started)
+	if err != nil {
+		return err
+	}
+	if err := verdict("token_quota_exceeded", "daily", "tokens", tokens, limits.TokenDaily); err != nil {
+		return err
+	}
+	if err := verdict("amount_quota_exceeded", "daily", "amount", amount, limits.AmountDaily); err != nil {
+		return err
+	}
+	weekStart, activePeriod := weeklyWindowStart(startedAt, limits)
+	if activePeriod {
+		// 周期额度是硬闸：用满即拒（429），不把窗口起点挪到「用满那一刻」重新计。
+		periodTokens, periodAmount, err := periodWindowUsage(ctx, conn, limits, groupID, started)
+		if err != nil {
+			return err
+		}
+		if err := verdict("token_quota_exceeded", "period", "tokens", periodTokens, limits.TokenPeriod); err != nil {
+			return err
+		}
+		if err := verdict("amount_quota_exceeded", "period", "amount", periodAmount, limits.AmountPeriod); err != nil {
+			return err
+		}
+	}
+	tokens, amount, err = usage(`created_at_utc>=? AND created_at_utc<=?`, weekStart.Format(time.RFC3339Nano), started)
+	if err != nil {
+		return err
+	}
+	if !activePeriod {
+		if err := verdict("token_quota_exceeded", "weekly", "tokens", tokens, limits.TokenWeekly); err != nil {
+			return err
+		}
+		if err := verdict("amount_quota_exceeded", "weekly", "amount", amount, limits.AmountWeekly); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestReservation, error) {
@@ -326,10 +422,11 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	limits.RPMLimit = in.Limits.RPMLimit
 	var groupID int64
 	var groupName string
+	var groupKind string
 	var periodDays int64
 	var periodStartRaw sql.NullString
-	if err := conn.QueryRowContext(ctx, `SELECT k.enabled,k.concurrency_limit,k.token_limit,k.amount_limit_microyuan,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.token_limit_5h,0),COALESCE(g.amount_limit_5h,0),COALESCE(g.token_limit_daily,0),COALESCE(g.amount_limit_daily,0),COALESCE(g.token_limit_weekly,0),COALESCE(g.amount_limit_weekly,0),COALESCE(g.period_limit_days,0),COALESCE(g.token_limit_period,0),COALESCE(g.amount_limit_period,0),COALESCE(g.period_limit_start,'') FROM client_keys k LEFT JOIN model_groups g ON g.id=k.group_id WHERE k.id=?`, in.KeyID).
-		Scan(&enabled, &concurrency, &tokenLimit, &amountLimit, &groupID, &groupName,
+	if err := conn.QueryRowContext(ctx, `SELECT k.enabled,k.concurrency_limit,k.token_limit,k.amount_limit_microyuan,COALESCE(k.group_id,0),COALESCE(g.name,''),COALESCE(g.kind,'normal'),COALESCE(g.token_limit_5h,0),COALESCE(g.amount_limit_5h,0),COALESCE(g.token_limit_daily,0),COALESCE(g.amount_limit_daily,0),COALESCE(g.token_limit_weekly,0),COALESCE(g.amount_limit_weekly,0),COALESCE(g.period_limit_days,0),COALESCE(g.token_limit_period,0),COALESCE(g.amount_limit_period,0),COALESCE(g.period_limit_start,'') FROM client_keys k LEFT JOIN model_groups g ON g.id=k.group_id WHERE k.id=?`, in.KeyID).
+		Scan(&enabled, &concurrency, &tokenLimit, &amountLimit, &groupID, &groupName, &groupKind,
 			&limits.Token5H, &limits.Amount5H, &limits.TokenDaily, &limits.AmountDaily,
 			&limits.TokenWeekly, &limits.AmountWeekly, &periodDays, &limits.TokenPeriod,
 			&limits.AmountPeriod, &periodStartRaw); err != nil {
@@ -342,9 +439,8 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 		}
 	}
 	// 本周窗口的起点取决于分组自己的周期状态（周期在用则窗口退化为「本周期」），
-	// 所以必须等分组额度读出来之后才算。
-	weekStartTime, activePeriod := weeklyWindowStart(in.StartedAt, limits)
-	weekStart := weekStartTime.Format(time.RFC3339Nano)
+	// 由 checkGroupQuota 在读到该组限额后再算——聚合组与成员组的周期可能不同，
+	// 不能共用同一个 weekStart。
 	if enabled != 1 {
 		return rollback(errors.New("client key is disabled"))
 	}
@@ -360,11 +456,25 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if groupID == 0 {
 		return rollback(errors.New("model is not authorized for key"))
 	}
+	// 解析「这个模型由谁提供」并取出计价依据。普通组只有自己的渠道；
+	// 聚合组先看自有渠道，没有再看成员组（取 id 最小的成员，确定性优先）。
+	// source_group_id 是「真正提供该模型的组」，额度要在它身上也扣一份——这是
+	// 老板明确要求的「两个组都扣」。它同时落库到 requests / key_reservations，
+	// 让成员组的概览与额度判定用同一口径。
 	var inputPrice, outputPrice, cachedPrice, rate sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli FROM model_groups g JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE g.id=? AND g.enabled=1`, in.ModelID, groupID).Scan(&inputPrice, &outputPrice, &cachedPrice, &rate); err != nil {
+	var sourceGroupID int64
+	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli,
+		CASE WHEN EXISTS(SELECT 1 FROM group_providers gp WHERE gp.group_id=g.id AND gp.provider_id=m.provider_id) THEN g.id
+			ELSE COALESCE((SELECT MIN(gc.child_group_id) FROM group_compositions gc
+				JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
+				JOIN group_providers gp2 ON gp2.group_id=gc.child_group_id AND gp2.provider_id=m.provider_id
+				WHERE gc.parent_group_id=g.id),0) END
+		FROM models m JOIN providers p ON p.id=m.provider_id AND p.enabled=1 JOIN model_groups g ON g.id=? AND g.enabled=1
+		WHERE m.id=? AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL`, groupID, in.ModelID).
+		Scan(&inputPrice, &outputPrice, &cachedPrice, &rate, &sourceGroupID); err != nil {
 		return rollback(err)
 	}
-	if !inputPrice.Valid || !outputPrice.Valid || !cachedPrice.Valid || !rate.Valid {
+	if !inputPrice.Valid || !outputPrice.Valid || !cachedPrice.Valid || !rate.Valid || sourceGroupID == 0 {
 		return rollback(errors.New("model is not authorized for key"))
 	}
 	effectiveInput, err := priceWithRate(inputPrice.Int64, rate.Int64)
@@ -412,49 +522,18 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 		}
 		return nil
 	}
-	var usedTokens, usedAmount int64
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND julianday(created_at_utc)>=julianday(?,'-5 hours') AND julianday(created_at_utc)<=? AND group_id=?`, started, started, groupID).Scan(&usedTokens, &usedAmount); err != nil {
+	// 双组判定：Key 绑定组一组，真正提供该模型的成员组再一组（v22）。
+	// 老板明确要求「两个组都扣」，所以任何一组任一窗口用满都必须拒绝——只判定
+	// 一组等于另一组的额度永远不会被真正咬住。
+	if err := checkGroupQuota(ctx, conn, groupID, groupName, limits, in.StartedAt, started, date); err != nil {
 		return rollback(err)
 	}
-	if err := overdrawn("5h", "token_quota_exceeded", usedTokens, limits.Token5H); err != nil {
-		return rollback(err)
-	}
-	if err := overdrawnAmount("5h", "amount_quota_exceeded", usedAmount, limits.Amount5H); err != nil {
-		return rollback(err)
-	}
-	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND billing_date_bj=? AND created_at_utc<=? AND group_id=?`, date, started, groupID).Scan(&usedTokens, &usedAmount); err != nil {
-		return rollback(err)
-	}
-	if err := overdrawn("daily", "token_quota_exceeded", usedTokens, limits.TokenDaily); err != nil {
-		return rollback(err)
-	}
-	if err := overdrawnAmount("daily", "amount_quota_exceeded", usedAmount, limits.AmountDaily); err != nil {
-		return rollback(err)
-	}
-	if activePeriod {
-		// 周期额度是硬闸：用满即拒（429），不把窗口起点挪到「用满那一刻」重新计。
-		// 旧版会在用满时把周窗口起点改成交接点，用量显示归零、后续请求继续放行，
-		// 运维看到的是「额度明明用满了却没关闭服务」。
-		periodTokens, periodAmount, err := periodWindowUsage(ctx, conn, limits, groupID, started)
+	if sourceGroupID != groupID {
+		srcLimits, srcName, err := groupQuotaLimits(ctx, conn, sourceGroupID)
 		if err != nil {
 			return rollback(err)
 		}
-		if err := overdrawn("period", "token_quota_exceeded", periodTokens, limits.TokenPeriod); err != nil {
-			return rollback(err)
-		}
-		if err := overdrawnAmount("period", "amount_quota_exceeded", periodAmount, limits.AmountPeriod); err != nil {
-			return rollback(err)
-		}
-	}
-	weeklyQuery := `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND created_at_utc>=? AND created_at_utc<=? AND group_id=?`
-	if err := conn.QueryRowContext(ctx, weeklyQuery, weekStart, started, groupID).Scan(&usedTokens, &usedAmount); err != nil {
-		return rollback(err)
-	}
-	if !activePeriod {
-		if err := overdrawn("weekly", "token_quota_exceeded", usedTokens, limits.TokenWeekly); err != nil {
-			return rollback(err)
-		}
-		if err := overdrawnAmount("weekly", "amount_quota_exceeded", usedAmount, limits.AmountWeekly); err != nil {
+		if err := checkGroupQuota(ctx, conn, sourceGroupID, srcName, srcLimits, in.StartedAt, started, date); err != nil {
 			return rollback(err)
 		}
 	}
@@ -474,7 +553,9 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 			return rollback(err)
 		}
 	}
-	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,group_id,status,input_tokens,reserved_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc,quote_input_microyuan,quote_output_microyuan,quote_cached_microyuan,quote_rate_milli) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, groupID, "reserved", inputTokens, reservedTokens, amount, boolInt(in.Stream), date, started, inputPrice.Int64, outputPrice.Int64, cachedPrice.Int64, rate.Int64)
+	// source_group_id 记录「真正提供这个模型的组」：普通组等于 group_id，聚合组
+	// 则是被选中的成员组。成员组的额度与概览都靠它统计（见 groupUsageScope）。
+	result, err := conn.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,group_id,source_group_id,status,input_tokens,reserved_tokens,amount_microyuan,streamed,billing_date_bj,created_at_utc,quote_input_microyuan,quote_output_microyuan,quote_cached_microyuan,quote_rate_milli) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, in.RequestID, in.KeyID, in.ModelID, in.ProviderID, groupID, sourceGroupID, "reserved", inputTokens, reservedTokens, amount, boolInt(in.Stream), date, started, inputPrice.Int64, outputPrice.Int64, cachedPrice.Int64, rate.Int64)
 	if err != nil {
 		return rollback(err)
 	}
@@ -482,7 +563,7 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if err != nil {
 		return rollback(err)
 	}
-	result, err = conn.ExecContext(ctx, `INSERT INTO key_reservations(request_id,billing_date_bj,key_id,model_id,group_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (?,?,?,?,?,?,?,?,?)`, in.RequestID, date, in.KeyID, in.ModelID, groupID, reservedTokens, amount, "reserved", started)
+	result, err = conn.ExecContext(ctx, `INSERT INTO key_reservations(request_id,billing_date_bj,key_id,model_id,group_id,source_group_id,reserved_tokens,reserved_amount_microyuan,status,created_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?)`, in.RequestID, date, in.KeyID, in.ModelID, groupID, sourceGroupID, reservedTokens, amount, "reserved", started)
 	if err != nil {
 		return rollback(err)
 	}
@@ -649,21 +730,23 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 		}
 	}
 	var rpm int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE group_id=? AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<=julianday(?)`, groupID, minuteStart, nowText).Scan(&rpm); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE (group_id=? OR source_group_id=?) AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<=julianday(?)`, groupID, groupID, minuteStart, nowText).Scan(&rpm); err != nil {
 		return nil, err
 	}
-	fiveHour, fiveHourAmount, err := s.windowUsage(ctx, `group_id=? AND created_at_utc>=? AND created_at_utc<=?`, groupID, fiveHourStart, nowText)
+	// 聚合组与成员组的概览都必须包含「同一笔请求」：聚合组按 group_id 命中，
+	// 成员组按 source_group_id 命中。这与额度判定（groupUsageScope）同口径。
+	fiveHour, fiveHourAmount, err := s.windowUsage(ctx, `(group_id=? OR source_group_id=?) AND created_at_utc>=? AND created_at_utc<=?`, groupID, groupID, fiveHourStart, nowText)
 	if err != nil {
 		return nil, err
 	}
-	daily, dailyAmount, err := s.windowUsage(ctx, `group_id=? AND billing_date_bj=? AND created_at_utc<=?`, groupID, date, nowText)
+	daily, dailyAmount, err := s.windowUsage(ctx, `(group_id=? OR source_group_id=?) AND billing_date_bj=? AND created_at_utc<=?`, groupID, groupID, date, nowText)
 	if err != nil {
 		return nil, err
 	}
 	// 周期用满不再交接：周期卡片始终显示当前周期的真实用量（不会归零），
 	// 周窗口只在周期到期（periodActive=false）后按既有规则接管。
 	weekStart, periodActiveNow := weeklyWindowStart(now, limits)
-	weekly, weeklyAmount, err := s.windowUsage(ctx, `group_id=? AND created_at_utc>=? AND created_at_utc<=?`, groupID, weekStart.Format(time.RFC3339Nano), nowText)
+	weekly, weeklyAmount, err := s.windowUsage(ctx, `(group_id=? OR source_group_id=?) AND created_at_utc>=? AND created_at_utc<=?`, groupID, groupID, weekStart.Format(time.RFC3339Nano), nowText)
 	if err != nil {
 		return nil, err
 	}
@@ -672,12 +755,12 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 	if limits.PeriodDays > 0 && !limits.PeriodStart.IsZero() {
 		periodStartText = limits.PeriodStart.Format(time.RFC3339Nano)
 		periodEndText = limits.PeriodStart.AddDate(0, 0, limits.PeriodDays).Format(time.RFC3339Nano)
-		periodTokens, periodAmount, err = s.windowUsage(ctx, `group_id=? AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<julianday(?)`, groupID, periodStartText, periodEndText)
+		periodTokens, periodAmount, err = s.windowUsage(ctx, `(group_id=? OR source_group_id=?) AND julianday(created_at_utc)>=julianday(?) AND julianday(created_at_utc)<julianday(?)`, groupID, groupID, periodStartText, periodEndText)
 		if err != nil {
 			return nil, err
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE group_id=? AND created_at_utc>=? AND created_at_utc<=? GROUP BY status`, groupID, hourStart, nowText)
+	rows, err := s.db.QueryContext(ctx, `SELECT status,count(*) FROM requests WHERE (group_id=? OR source_group_id=?) AND created_at_utc>=? AND created_at_utc<=? GROUP BY status`, groupID, groupID, hourStart, nowText)
 	if err != nil {
 		return nil, err
 	}
@@ -697,7 +780,7 @@ func (s *Store) GroupOverview(ctx context.Context, groupID int64, now time.Time)
 		return nil, err
 	}
 	var active int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE group_id=? AND status='reserved'`, groupID).Scan(&active); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM requests WHERE (group_id=? OR source_group_id=?) AND status='reserved'`, groupID, groupID).Scan(&active); err != nil {
 		return nil, err
 	}
 	denominator := outcomes["completed"] + outcomes["failed"]
@@ -734,7 +817,20 @@ func (s *Store) GroupUsageBuckets(ctx context.Context, now time.Time) (five, dai
 	weekStart := billingWeekStart(now).Format(time.RFC3339Nano)
 	five, daily, weekly = make(map[int64][2]int64), make(map[int64][2]int64), make(map[int64][2]int64)
 	load := func(into map[int64][2]int64, filter string, args ...any) error {
-		rows, err := s.db.QueryContext(ctx, `SELECT group_id,COALESCE(SUM(reserved_tokens+charged_tokens),0),COALESCE(SUM(charged_amount_microyuan+reserved_amount_microyuan),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND group_id>0 AND `+filter+` GROUP BY group_id`, args...)
+		// 每个组要统计两份：自己的请求（group_id）＋ 作为成员组被聚合组带出去的
+		// 请求（source_group_id）。第二个分支必须排除 source_group_id=group_id，
+		// 否则普通组的每一行都会被算两次，列表上的额度紧张度直接翻倍。
+		query := `SELECT gid,COALESCE(SUM(tok),0),COALESCE(SUM(amt),0) FROM (
+			SELECT group_id AS gid, reserved_tokens+charged_tokens AS tok, charged_amount_microyuan+reserved_amount_microyuan AS amt
+				FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND group_id>0 AND ` + filter + `
+			UNION ALL
+			SELECT source_group_id AS gid, reserved_tokens+charged_tokens AS tok, charged_amount_microyuan+reserved_amount_microyuan AS amt
+				FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND source_group_id>0 AND source_group_id<>group_id AND ` + filter + `
+		) GROUP BY gid`
+		both := make([]any, 0, len(args)*2)
+		both = append(both, args...)
+		both = append(both, args...)
+		rows, err := s.db.QueryContext(ctx, query, both...)
 		if err != nil {
 			return err
 		}

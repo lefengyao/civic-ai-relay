@@ -998,19 +998,27 @@ func (h *AdminHandler) poolItem(w http.ResponseWriter, r *http.Request, raw stri
 func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 	var p struct {
 		Name        string   `json:"name"`
+		Kind        string   `json:"kind"`
 		Rate        *float64 `json:"rate"`
 		RateMilli   *int64   `json:"rate_milli"`
 		ProviderIDs []int64  `json:"provider_ids"`
+		// GroupIDs 只在聚合组上有意义：它包含的普通模型组。
+		GroupIDs []int64 `json:"group_ids"`
 	}
 	if json.NewDecoder(r.Body).Decode(&p) != nil {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
-	g, err := h.repo.CreateModelGroup(r.Context(), store.NewModelGroup{Name: p.Name, RateMilli: rateMilli(p.Rate, p.RateMilli)})
+	g, err := h.repo.CreateModelGroup(r.Context(), store.NewModelGroup{Name: p.Name, Kind: p.Kind, RateMilli: rateMilli(p.Rate, p.RateMilli), GroupIDs: p.GroupIDs})
 	if err == nil {
 		err = h.repo.ReplaceGroupProviders(r.Context(), g.ID, p.ProviderIDs)
 	}
 	if err != nil {
+		// 失败就把已经建出来的组删掉，避免留下一个「创建时报错、列表里却多出来」
+		// 的半成品（成员校验失败是最常见的失败原因）。
+		if g.ID > 0 {
+			_ = h.repo.DeleteModelGroup(r.Context(), g.ID)
+		}
 		writeAdminError(w, 400, "group_invalid")
 		return
 	}
@@ -1080,9 +1088,20 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 				pct = p
 			}
 		}
+		// 成员组的名字/倍率属于管理员视角的拓扑信息：密钥主体登录时只保留
+		// 「这个组是聚合组、有几个成员」，不回传别组的名字与倍率。
+		members := any(g.Members)
+		memberIDs := any(g.MemberIDs)
+		if !subjectOf(r).Admin {
+			members = []any{}
+			memberIDs = []int64{}
+		}
 		items = append(items, map[string]any{
-			"ID": g.ID, "Name": g.Name, "Enabled": g.Enabled, "RateMilli": g.RateMilli,
+			"ID": g.ID, "Name": g.Name, "Kind": g.Kind, "Enabled": g.Enabled, "RateMilli": g.RateMilli,
 			"BoundKeys":       g.BoundKeys,
+			"Providers":       g.Providers,
+			"Members":         members,
+			"MemberIDs":       memberIDs,
 			"TokenLimit5H":    g.TokenLimit5H,
 			"AmountLimit5H":   g.AmountLimit5H,
 			"TokenLimitDaily": g.TokenLimitDaily, "AmountLimitDaily": g.AmountLimitDaily,
@@ -1194,11 +1213,17 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			writeAdminError(w, 500, "store_error")
 			return
 		}
+		// 删普通组还会同时改变包含它的聚合组的可用模型，一并告知。
+		aggregates, err := h.repo.AggregatesContaining(r.Context(), id)
+		if err != nil {
+			writeAdminError(w, 500, "store_error")
+			return
+		}
 		if err := h.repo.DeleteModelGroup(r.Context(), id); err != nil {
 			writeDeleteResult(w, err)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true, "unbound_keys": bound})
+		writeJSON(w, 200, map[string]any{"ok": true, "unbound_keys": bound, "aggregates": aggregates})
 		return
 	}
 	if len(parts) == 1 && r.Method == http.MethodPut {
@@ -1262,6 +1287,46 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 		}
 		writeJSON(w, 200, data)
 		return
+	}
+	if len(parts) == 2 && parts[1] == "members" {
+		// 聚合组的成员（普通模型组）。只允许一层：成员本身必须是 normal，
+		// 校验在 store 层完成，这里只做协议转换。
+		if r.Method == http.MethodGet {
+			g, err := h.repo.GetModelGroup(r.Context(), id)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeAdminError(w, 404, "not_found")
+				return
+			}
+			if err != nil {
+				writeAdminError(w, 400, "group_invalid")
+				return
+			}
+			members := g.Members
+			if members == nil {
+				members = make([]store.ModelGroupBrief, 0)
+			}
+			writeJSON(w, 200, map[string]any{"data": members, "kind": g.Kind})
+			return
+		}
+		if r.Method == http.MethodPut {
+			var p struct {
+				GroupIDs []int64 `json:"group_ids"`
+			}
+			if json.NewDecoder(r.Body).Decode(&p) != nil {
+				writeAdminError(w, 400, "invalid_request")
+				return
+			}
+			if err := h.repo.ReplaceGroupCompositions(r.Context(), id, p.GroupIDs); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					writeAdminError(w, 404, "not_found")
+					return
+				}
+				writeAdminError(w, 400, "group_invalid")
+				return
+			}
+			writeJSON(w, 200, map[string]any{"ok": true})
+			return
+		}
 	}
 	if len(parts) == 2 && parts[1] == "providers" {
 		if r.Method == http.MethodGet {

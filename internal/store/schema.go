@@ -372,6 +372,35 @@ var migrations = []migration{
 		`ALTER TABLE providers ADD COLUMN schedule_end_minute INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE providers ADD COLUMN schedule_weekdays INTEGER NOT NULL DEFAULT 0`,
 	}},
+	// v22: 聚合模型组。一个组可以是 normal（自己挂渠道）或 aggregate（除自己的
+	// 渠道外，还包含若干普通模型组，从而合并它们的渠道与模型）。
+	//
+	// 为什么复用 model_groups 而不是另建一张表：额度、倍率、Key 绑定、概览、
+	// 账目归属全都以 model_groups.id 为主键，另建表等于把这些逻辑复制一份，
+	// 两份实现早晚漂移。聚合组按自己的 rate_milli 与额度列计费，天然满足
+	// 「聚合组拥有单独的计费」。
+	//
+	// 计费口径（老板明确要求「两个组都扣」）：一笔请求同时占用 Key 绑定组
+	// （group_id）与真正提供该模型的成员组（source_group_id）的额度。账本仍
+	// 只写一行 —— 两行会让所有 SUM 翻倍、结算要改多行，是计费系统最容易埋
+	// 雷的地方。成员组的用量视图按 (group_id=? OR source_group_id=?) 统计，
+	// 与额度判定同口径。
+	//
+	// 只允许一层：aggregate → normal。成员关系在应用层校验，避免环与递归。
+	{version: 22, statements: []string{
+		`ALTER TABLE model_groups ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'`,
+		`CREATE TABLE group_compositions (
+			parent_group_id INTEGER NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+			child_group_id INTEGER NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+			PRIMARY KEY (parent_group_id, child_group_id),
+			CHECK (parent_group_id <> child_group_id)
+		)`,
+		`CREATE INDEX idx_group_compositions_child ON group_compositions(child_group_id, parent_group_id)`,
+		`ALTER TABLE requests ADD COLUMN source_group_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE key_reservations ADD COLUMN source_group_id INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX idx_requests_source_group_time ON requests(source_group_id, created_at_utc)`,
+		`CREATE INDEX idx_key_reservations_source_group_time ON key_reservations(source_group_id, created_at_utc)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

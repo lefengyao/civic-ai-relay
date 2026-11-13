@@ -235,14 +235,25 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 
 ### 模型组
 
+分组有两种 `Kind`：`normal`（自己挂渠道）与 `aggregate`（聚合组，除自有渠道外还包含若干普通组）。**聚合组只允许一层**，不支持包含聚合组。
+
+**计费口径（与额度判定、概览统计同口径）**
+
+- 一笔请求同时占两个组的额度：`group_id` = Key 绑定的组（可能是聚合组），`source_group_id` = 真正提供该模型的组（普通组两者相同；聚合组取「自有渠道命中则为自己，否则为 id 最小的成员组」）。
+- 任一组任一窗口用满都会 429，`error.message` 里写明是哪个组咬住的（`分组「xxx」#N`）。
+- 计价倍率取 **Key 绑定组**的 `rate_milli`，两边的金额是同一个数；成员组自己的倍率只对绑定它自己的 Key 生效。
+- 组概览的「已用」= `group_id=? OR source_group_id=?` 的行，所以聚合组与成员组看到的是同一笔流量。**账本只有一行**（不会翻倍），全局概览与 Key 总额度因此不受影响。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/groups` | 列表。每项含 `ID/Name/Enabled/RateMilli`、`BoundKeys`（绑定到该组的密钥数）、10 个额度字段（`TokenLimit5H` … `PeriodLimitStart`）以及 `TensionPct` / `Overdrawn`（三个主窗口中最高用量占比按 Token 计；`Overdrawn=true` 表示至少一个窗口已用满）。 |
-| POST | `/admin/api/groups` | 创建；body `{name, rate?, rate_milli?, provider_ids?}`。**创建不带额度字段**，额度创建后在 PUT 里设 |
-| PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` + 9 个额度字段（`token_limit_5h`/`amount_limit_5h`/`token_limit_daily`/`amount_limit_daily`/`token_limit_weekly`/`amount_limit_weekly`/`period_limit_days`/`token_limit_period`/`amount_limit_period`）与 `period_limit_start`。**缺省 = 保持原值**，`0` = 不限，负数 400（`group_invalid`）。`period_limit_days > 0` 且起点为空时自动填 `now`；天数归零会清掉起点 |
-| DELETE | `/admin/api/groups/{id}` | 删除；返回 `{"ok": true, "unbound_keys": N}`（N = 刚才被解绑的密钥数，解绑后它们立即无法调用任何模型）；重复删除返回 404 |
-| GET | `/admin/api/groups/{id}/providers` | 组内渠道 ID 列表 |
-| PUT | `/admin/api/groups/{id}/providers` | **整体替换**组内渠道；body `{"provider_ids": [...]}`；拒绝停用渠道 |
+| GET | `/admin/api/groups` | 列表。每项含 `ID/Name/Kind/Enabled/RateMilli`、`BoundKeys`（绑定到该组的密钥数）、`Providers`（**自有**渠道数）、`Members`/`MemberIDs`（聚合组的成员组摘要 `{ID,Name,Enabled,RateMilli,Providers}`，普通组为空数组）、10 个额度字段（`TokenLimit5H` … `PeriodLimitStart`）以及 `TensionPct` / `Overdrawn`（三个主窗口中最高用量占比按 Token 计；`Overdrawn=true` 表示至少一个窗口已用满）。密钥主体登录时 `Members`/`MemberIDs` 恒为空 —— 成员组名属于管理员视角的拓扑 |
+| POST | `/admin/api/groups` | 创建；body `{name, kind?, rate?, rate_milli?, provider_ids?, group_ids?}`。`kind` 缺省 `normal`；`aggregate` 时 `group_ids` 是成员组（必须存在且为 `normal`，不接受聚合组与自身，违反返回 400 且**不留下半成品**）。普通组带 `group_ids` 一律 400。**创建不带额度字段**，额度创建后在 PUT 里设 |
+| PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` + 9 个额度字段（`token_limit_5h`/`amount_limit_5h`/`token_limit_daily`/`amount_limit_daily`/`token_limit_weekly`/`amount_limit_weekly`/`period_limit_days`/`token_limit_period`/`amount_limit_period`）与 `period_limit_start`。**缺省 = 保持原值**，`0` = 不限，负数 400（`group_invalid`）。`period_limit_days > 0` 且起点为空时自动填 `now`；天数归零会清掉起点。**`kind` 不可改**（建组时定） |
+| DELETE | `/admin/api/groups/{id}` | 删除；返回 `{"ok": true, "unbound_keys": N, "aggregates": [...]}`（N = 刚才被解绑的密钥数，解绑后它们立即无法调用任何模型；`aggregates` = 把该组当成员的聚合组，删成员组会改变它们的可用模型）；重复删除返回 404 |
+| GET | `/admin/api/groups/{id}/providers` | 组内**自有**渠道 ID 列表（聚合组不含成员组带来的渠道） |
+| PUT | `/admin/api/groups/{id}/providers` | **整体替换**自有渠道；body `{"provider_ids": [...]}`；拒绝停用渠道。聚合组同样可用 |
+| GET | `/admin/api/groups/{id}/members` | 聚合组的成员组摘要，返回 `{"data": [...], "kind": "aggregate|normal"}`；普通组 `data` 为空 |
+| PUT | `/admin/api/groups/{id}/members` | **整体替换**成员组；body `{"group_ids": [...]}`；只有聚合组可调用（普通组 400），成员必须是 `normal` 组，写入失败不改变已有关系 |
 | GET | `/admin/api/groups/{id}/overview` | **分组概览**：仅统计**归属本组**的请求（按账目行上的 `group_id`，与额度扣减同口径；切换分组不搬历史）。返回 `{group_id, group_name, rpm{used,limit}, five_hour/daily/weekly/period{used_tokens,used_microyuan,limit,amount_limit}, weekly{active,from_utc}, period{active,start_utc,end_utc,transition_utc}, last_hour{...}, active, generated_at_utc}`；令牌/金额含未结算预留，`limit`/`amount_limit` 取自本组额度行（0 = 不限） |
 | GET | `/admin/api/groups/health` | **分组可用性**：每个分组最近一轮监测结果（键为分组 ID 字符串）+ `{monitor_enabled, monitor_interval, monitor_interval_ms}`。⚠️ 该路径必须排在 `groups/{id}` 之前匹配，其第一段不是数字 ID |
 | POST | `/admin/api/groups/monitor` | **立即检测全部分组**，不等定时轮询。返回 `{"monitored": N}` |
@@ -426,5 +437,6 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v19 | **故障转移供应商**：`model_pools`（单模型类别）+ `model_pool_members`（成员与优先级）。纯新增表，不改动任何既有表 |
 | v20 | `key_reservations` 重建为独立账本（去掉 `key_id` / `model_id` 外键），并按 `requests` 补回历史账目：删 Key / 模型 / 渠道不再清零组额度，保留期也不再裁剪账目 |
 | v21 | `providers` 加 6 列生效时段（`schedule_mode` 等），默认 `always` —— 既有渠道升级后行为不变 |
+| v22 | 聚合模型组：`model_groups.kind`（默认 `normal`）、`group_compositions`（聚合组 → 成员组，只允许一层）、`requests.source_group_id` 与 `key_reservations.source_group_id`（真正提供该模型的组）。纯新增，既有组与账目行为不变 |
 
 迁移在启动时自动应用，记录在 `schema_migrations` 表。
