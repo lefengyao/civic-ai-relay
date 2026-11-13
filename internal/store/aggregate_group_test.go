@@ -219,11 +219,13 @@ func TestAggregateGroupUsageVisibleOnMember(t *testing.T) {
 	}
 }
 
-// 聚合组自己的渠道优先于成员组：同一模型两处都可达时，来源组记为聚合组
-// 自己，避免「明明自己挂着却去扣成员组的额度」这种反直觉行为。
-func TestAggregateGroupPrefersOwnProvider(t *testing.T) {
+// v24：一个渠道只能属于一个组，所以「聚合组自己也挂这条渠道、同时成员组也挂它」
+// 这种双归属在保存时就会被拒——它正是过去「这笔请求到底扣谁额度」说不清的来源。
+// 记账侧仍保留「自有渠道优先」的分支（同一模型可能同时被自有渠道与成员组渠道提供），
+// 那是防御性写法，不再有数据能构造出冲突输入。
+func TestAggregateCannotAlsoOwnMemberProvider(t *testing.T) {
 	ctx := context.Background()
-	repo, providerID, modelID := setupGroupScope(t)
+	repo, providerID, _ := setupGroupScope(t)
 	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
 	if err != nil {
 		t.Fatal(err)
@@ -235,25 +237,29 @@ func TestAggregateGroupPrefersOwnProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceGroupProviders(ctx, agg.ID, []int64{providerID}); err != nil {
-		t.Fatal(err)
+	err = repo.ReplaceGroupProviders(ctx, agg.ID, []int64{providerID})
+	var conflict *ProviderGroupConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err = %v, want *ProviderGroupConflict", err)
 	}
-	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 4})
+	if conflict.GroupID != member.ID || conflict.GroupName != "member" {
+		t.Fatalf("conflict = %#v, want 已属于 member(#%d)", conflict, member.ID)
+	}
+	// 冲突不能留下半成品：聚合组应当仍只有 0 个自有渠道。
+	own, err := repo.GroupProviderIDs(ctx, agg.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.SetKeyGroup(ctx, key.ID, agg.ID); err != nil {
+	if len(own) != 0 {
+		t.Fatalf("被拒之后聚合组仍有自有渠道 %v", own)
+	}
+	// 但成员关系照旧生效：渠道依然通过成员组为聚合组服务。
+	ids, err := repo.EffectiveProviderIDs(ctx, agg.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "own-1", 600)); err != nil {
-		t.Fatal(err)
-	}
-	var sourceGroup int64
-	if err := repo.db.QueryRowContext(ctx, `SELECT source_group_id FROM key_reservations WHERE request_id=?`, "own-1").Scan(&sourceGroup); err != nil {
-		t.Fatal(err)
-	}
-	if sourceGroup != agg.ID {
-		t.Fatalf("source_group_id = %d, want 聚合组自己 %d", sourceGroup, agg.ID)
+	if len(ids) != 1 || ids[0] != providerID {
+		t.Fatalf("聚合组有效渠道 = %v, want [%d]", ids, providerID)
 	}
 }
 

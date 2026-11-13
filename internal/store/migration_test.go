@@ -199,3 +199,63 @@ func TestMigrationV23PromotesStandaloneNormalGroups(t *testing.T) {
 		t.Fatalf("聚合组 kind = %q, want aggregate", got)
 	}
 }
+
+// v24 的去重：同一渠道历史上可能挂在多个组，升级时收敛成一条——保留**最早建立**
+// 的那条归属（rowid 最小），因为计费一直用的是「最小 ID 成员组」那句话；收敛之后
+// 建唯一索引，把「一个渠道只属于一个组」钉在库上。
+func TestMigrationV24DedupesProviderGroups(t *testing.T) {
+	db := openLegacyV15(t)
+	for v := 16; v <= 23; v++ {
+		applyMigration(db, t, v)
+	}
+	const ts = `'2026-01-01T00:00:00Z'`
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	mustExec(`INSERT INTO providers(id,name,base_url,api_key_ciphertext,enabled,created_at_utc,updated_at_utc) VALUES (1,'p1','http://up.example','x',1,` + ts + `,` + ts + `)`)
+	mustExec(`INSERT INTO providers(id,name,base_url,api_key_ciphertext,enabled,created_at_utc,updated_at_utc) VALUES (2,'p2','http://up2.example','x',1,` + ts + `,` + ts + `)`)
+	for _, g := range []struct {
+		id         int
+		name, kind string
+	}{{1, "old", "normal"}, {2, "new", "normal"}, {3, "agg", "aggregate"}} {
+		mustExec(`INSERT INTO model_groups(id,name,kind,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (?,?,?,1,1000,`+ts+`,`+ts+`)`, g.id, g.name, g.kind)
+	}
+	// p1 先挂 old(#1)、又挂 new(#2)：保留先建立的那条。
+	mustExec(`INSERT INTO group_providers(group_id,provider_id) VALUES (1,1)`)
+	mustExec(`INSERT INTO group_providers(group_id,provider_id) VALUES (2,1)`)
+	// p2 只挂一处，不该被动到。
+	mustExec(`INSERT INTO group_providers(group_id,provider_id) VALUES (3,2)`)
+
+	applyMigration(db, t, 24)
+
+	owners := func(providerID int64) []int64 {
+		t.Helper()
+		rows, err := db.Query(`SELECT group_id FROM group_providers WHERE provider_id=? ORDER BY group_id`, providerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []int64
+		for rows.Next() {
+			var gid int64
+			if err := rows.Scan(&gid); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, gid)
+		}
+		return out
+	}
+	if got := owners(1); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("p1 归属 = %v, want [1]（保留最早建立的那条）", got)
+	}
+	if got := owners(2); len(got) != 1 || got[0] != 3 {
+		t.Fatalf("p2 归属 = %v, want [3]（单归属不应被改动）", got)
+	}
+	// 唯一索引生效：再插一条重复归属必须失败。
+	if _, err := db.Exec(`INSERT INTO group_providers(group_id,provider_id) VALUES (3,1)`); err == nil {
+		t.Fatal("v24 之后同一渠道仍能挂进第二个组")
+	}
+}

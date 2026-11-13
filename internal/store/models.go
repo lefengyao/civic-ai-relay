@@ -75,6 +75,37 @@ func NormalizeGroupKind(kind string) (string, error) {
 	}
 }
 
+// ErrProviderGrouped 表示「这条渠道已经属于另一个组」（v24）。
+//
+// 一个渠道只能属于一个组。渠道是「上游地址 + 凭据」这个实体的唯一标识，同时挂进
+// 两个组会让同一个上游账号受两份额度约束，而一笔请求的账目只能记到一个组上——
+// 用量、额度、概览三者必然对不上（其中最隐蔽的一种：某个组显示「从未使用」，实际
+// 每个请求都在跑它挂的渠道）。要接同一家供应商的第二个账号，应该新建一条渠道。
+var ErrProviderGrouped = errors.New("一个渠道只能属于一个组")
+
+// ProviderGroupConflict 说明冲突具体落在谁身上：哪条渠道、已经归哪个组。
+// 文案直接给运维看（管理端放进 message），所以带上名字而不只是 ID。
+type ProviderGroupConflict struct {
+	ProviderID   int64
+	ProviderName string
+	GroupID      int64
+	GroupName    string
+}
+
+func (e *ProviderGroupConflict) Error() string {
+	name := e.ProviderName
+	if strings.TrimSpace(name) == "" {
+		name = fmt.Sprintf("#%d", e.ProviderID)
+	}
+	group := e.GroupName
+	if strings.TrimSpace(group) == "" {
+		group = fmt.Sprintf("#%d", e.GroupID)
+	}
+	return fmt.Sprintf("渠道「%s」已属于分组「%s」，一个渠道只能属于一个组；请先从原分组移除，或为同一上游新建一条渠道", name, group)
+}
+
+func (e *ProviderGroupConflict) Unwrap() error { return ErrProviderGrouped }
+
 type ModelGroup struct {
 	ID        int64
 	Name      string
@@ -819,6 +850,7 @@ func (s *Store) ReplaceGroupProviders(ctx context.Context, groupID int64, provid
 		return errors.New("model group is disabled")
 	}
 	seen := make(map[int64]struct{}, len(providerIDs))
+	names := make(map[int64]string, len(providerIDs))
 	for _, id := range providerIDs {
 		if id <= 0 {
 			return errors.New("invalid provider ID")
@@ -828,20 +860,52 @@ func (s *Store) ReplaceGroupProviders(ctx context.Context, groupID int64, provid
 		}
 		seen[id] = struct{}{}
 		var enabled int
-		if err := tx.QueryRowContext(ctx, `SELECT enabled FROM providers WHERE id=?`, id).Scan(&enabled); err != nil {
+		var name string
+		if err := tx.QueryRowContext(ctx, `SELECT name,enabled FROM providers WHERE id=?`, id).Scan(&name, &enabled); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("渠道 #%d 不存在", id)
+			}
 			return err
 		}
 		if enabled != 1 {
-			return fmt.Errorf("provider %d is disabled", id)
+			return fmt.Errorf("渠道「%s」已停用，停用渠道不能入组", name)
 		}
+		// v24：一个渠道只能属于一个组。校验放在事务里，和随后的先删后插保持同一
+		// 视图；同组重复保存是幂等的，所以只排除 groupID 自己。
+		if err := checkProviderUnowned(ctx, tx, groupID, id, name); err != nil {
+			return err
+		}
+		names[id] = name
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM group_providers WHERE group_id=?`, groupID); err != nil {
 		return err
 	}
 	for _, id := range providerIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO group_providers(group_id,provider_id) VALUES (?,?)`, groupID, id); err != nil {
+			// 预检与插入之间被别的请求抢走了同一条渠道：唯一索引会在这里挡住。
+			// 把约束错误翻译成同一句可读的冲突说明，别让运维看到 SQLite 原文。
+			if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+				if conflict := checkProviderUnowned(ctx, tx, groupID, id, names[id]); conflict != nil {
+					return conflict
+				}
+			}
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// checkProviderUnowned 断言这条渠道还没有被别的组占用（v24）。
+func checkProviderUnowned(ctx context.Context, q rowQuerier, groupID, providerID int64, providerName string) error {
+	var ownerID int64
+	var ownerName string
+	err := q.QueryRowContext(ctx, `SELECT g.id,g.name FROM group_providers gp JOIN model_groups g ON g.id=gp.group_id
+		WHERE gp.provider_id=? AND gp.group_id<>? ORDER BY g.id LIMIT 1`, providerID, groupID).Scan(&ownerID, &ownerName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return &ProviderGroupConflict{ProviderID: providerID, ProviderName: providerName, GroupID: ownerID, GroupName: ownerName}
 }

@@ -28,6 +28,11 @@ type Provider struct {
 	ScheduleWeekdays    int
 	// ScheduleActive 是按当前时刻算出的「是否在时段内」，只用于展示，不落库。
 	ScheduleActive bool
+	// GroupID / GroupName 是这条渠道归哪个组（v24 起一个渠道最多属于一个组）。
+	// 由 ListProviders / GetProvider 填充：管理台列表要显示归属，组编辑的渠道
+	// 勾选列表也要靠它把已经在别组的渠道灰掉。
+	GroupID   int64
+	GroupName string
 }
 
 type NewProvider struct {
@@ -322,11 +327,61 @@ func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
 		}
 		out = append(out, p)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 归属分组：一次查全再回填，避免每条渠道各查一次（N+1）。
+	owner, err := s.providerGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if ref, ok := owner[out[i].ID]; ok {
+			out[i].GroupID, out[i].GroupName = ref.GroupID, ref.GroupName
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) GetProvider(ctx context.Context, id int64) (Provider, error) {
-	return s.scanProvider(s.db.QueryRowContext(ctx, providerSelect+` WHERE id=?`, id))
+	p, err := s.scanProvider(s.db.QueryRowContext(ctx, providerSelect+` WHERE id=?`, id))
+	if err != nil {
+		return Provider{}, err
+	}
+	var groupID int64
+	var groupName string
+	if err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name FROM group_providers gp JOIN model_groups g ON g.id=gp.group_id WHERE gp.provider_id=?`, id).Scan(&groupID, &groupName); err == nil {
+		p.GroupID, p.GroupName = groupID, groupName
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Provider{}, err
+	}
+	return p, nil
+}
+
+// ProviderGroupRef 是「渠道归属」的最小描述。
+type ProviderGroupRef struct {
+	GroupID   int64
+	GroupName string
+}
+
+// providerGroups 返回 provider_id → 所属分组。v24 起一条渠道最多属于一个组，
+// 所以这里天然是 1:1；用 map 只是为了让调用方一次拿全。
+func (s *Store) providerGroups(ctx context.Context) (map[int64]ProviderGroupRef, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT gp.provider_id,g.id,g.name FROM group_providers gp JOIN model_groups g ON g.id=gp.group_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]ProviderGroupRef)
+	for rows.Next() {
+		var providerID int64
+		var ref ProviderGroupRef
+		if err := rows.Scan(&providerID, &ref.GroupID, &ref.GroupName); err != nil {
+			return nil, err
+		}
+		out[providerID] = ref
+	}
+	return out, rows.Err()
 }
 
 // ProviderAPIKey decrypts a provider credential for the upstream registry.

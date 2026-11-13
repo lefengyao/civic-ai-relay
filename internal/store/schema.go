@@ -419,6 +419,21 @@ var migrations = []migration{
 			WHERE kind='normal'
 			  AND id NOT IN (SELECT child_group_id FROM group_compositions)`,
 	}},
+	// v24：一个渠道只能属于一个组。
+	//
+	// 之前的模型允许同一渠道挂进多个组，于是计费必须替它挑一个「真正提供者」：
+	// 聚合组优先自有渠道，否则取成员组里 ID 最小的那个。结果是最小 ID 的组承担
+	// 全部用量、其余组永远显示 0，而请求实际上跑的是它们的渠道；只有最小 ID 组
+	// 的额度用满时才会拒绝请求，哪怕别的组还有大量余额。
+	//
+	// 这里把历史重复关系收敛成一条：**保留最早建立的那条归属**（rowid 最小），
+	// 因为它是「谁先要的这个渠道」，也是计费一直在用的那句话。收敛之后建唯一
+	// 索引，把规则钉在库上——应用层校验可能被绕过（脚本、手工 SQL），索引不会。
+	{version: 24, statements: []string{
+		`DELETE FROM group_providers WHERE rowid NOT IN (SELECT MIN(rowid) FROM group_providers GROUP BY provider_id)`,
+		`DROP INDEX IF EXISTS idx_group_providers_provider`,
+		`CREATE UNIQUE INDEX idx_group_providers_provider ON group_providers(provider_id)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

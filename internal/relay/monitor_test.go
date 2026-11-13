@@ -398,8 +398,10 @@ func TestMonitorKeepsOnlyFirstLineOfMultiLineErrors(t *testing.T) {
 func TestMonitorRunOnceWritesOneRowPerGroup(t *testing.T) {
 	repo, probe := monitorFixture(t)
 	p := addProvider(t, repo, "p1", true)
+	// v24 起一个渠道只能属于一个组，两个组要各自有一条渠道（同一上游的两个账号）。
+	p2 := addProvider(t, repo, "p2", true)
 	addGroup(t, repo, "g1", []int64{p.ID}, true)
-	addGroup(t, repo, "g2", []int64{p.ID}, true)
+	addGroup(t, repo, "g2", []int64{p2.ID}, true)
 	// 一个渠道都没有的组也必须被记录，否则界面上它永远是「尚未检测」
 	if _, err := repo.CreateModelGroup(context.Background(), store.NewModelGroup{Name: "g3-empty"}); err != nil {
 		t.Fatal(err)

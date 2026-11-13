@@ -24,6 +24,26 @@ func setupGroupScope(t *testing.T) (*Store, int64, int64) {
 	return repo, provider.ID, model.ID
 }
 
+// addChannel 新建一条独立渠道（供应商 + 一个已定价模型），返回 provider/model ID。
+//
+// v24 起一个渠道只能属于一个组，所以「两个组各自跑同样的负载」这类用例必须给
+// 每组各建一条渠道——现实里也是如此（同一家上游的两个账号），而不是同一条渠道
+// 挂到两个组上。
+func addChannel(t *testing.T, repo *Store, name string) (int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+	provider, err := repo.CreateProvider(ctx, NewProvider{Name: name, BaseURL: "http://localhost:1", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	price := int64(100)
+	model, err := repo.CreateModel(ctx, NewModel{ProviderID: provider.ID, PublicName: name, UpstreamName: name, InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return provider.ID, model.ID
+}
+
 // 未绑分组的密钥没有可授权的模型，预留必须被拒——沿用计价查询的
 // not-authorized 出口，但给出可诊断的错误消息而不是裸的 ErrNoRows。
 func TestReserveRejectsUnboundKey(t *testing.T) {
@@ -41,7 +61,8 @@ func TestReserveRejectsUnboundKey(t *testing.T) {
 // 切换分组不能搬历史：账目行的 group_id 记录请求发生时的归属。
 func TestSwitchingGroupDoesNotMoveHistory(t *testing.T) {
 	ctx := context.Background()
-	repo, providerID, modelID := setupGroupScope(t)
+	repo, providerA, modelA := setupGroupScope(t)
+	providerB, modelB := addChannel(t, repo, "p-b")
 	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
 	if err != nil {
 		t.Fatal(err)
@@ -50,10 +71,12 @@ func TestSwitchingGroupDoesNotMoveHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, g := range []ModelGroup{groupA, groupB} {
-		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
-			t.Fatal(err)
-		}
+	// v24：一个渠道只能属于一个组 —— 两个组各用一条独立渠道。
+	if err := repo.ReplaceGroupProviders(ctx, groupA.ID, []int64{providerA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, groupB.ID, []int64{providerB}); err != nil {
+		t.Fatal(err)
 	}
 	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 4})
 	if err != nil {
@@ -62,7 +85,7 @@ func TestSwitchingGroupDoesNotMoveHistory(t *testing.T) {
 	if err := repo.SetKeyGroup(ctx, key.ID, groupA.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "in-a", 600)); err != nil {
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelA, "in-a", 600)); err != nil {
 		t.Fatal(err)
 	}
 	var inA int
@@ -93,7 +116,7 @@ func TestSwitchingGroupDoesNotMoveHistory(t *testing.T) {
 		t.Fatalf("requests.group_id = %d, want %d", reqGroupA, groupA.ID)
 	}
 	// 新请求记到新组
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "in-b", 600)); err != nil {
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelB, "in-b", 600)); err != nil {
 		t.Fatal(err)
 	}
 	var inB int
@@ -142,7 +165,8 @@ func TestReserveQuotesRateFromSingleGroup(t *testing.T) {
 // 分组额度取代全局额度后，窗口判定的数据来源是分组行：A 组用满不影响 B 组。
 func TestGroupQuotasAreIndependentAcrossGroups(t *testing.T) {
 	ctx := context.Background()
-	repo, providerID, modelID := setupGroupScope(t)
+	repo, providerA, modelA := setupGroupScope(t)
+	providerB, modelB := addChannel(t, repo, "p-b")
 	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
 	if err != nil {
 		t.Fatal(err)
@@ -151,10 +175,12 @@ func TestGroupQuotasAreIndependentAcrossGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, g := range []ModelGroup{groupA, groupB} {
-		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
-			t.Fatal(err)
-		}
+	// v24：一个渠道只能属于一个组 —— 两个组各用一条独立渠道。
+	if err := repo.ReplaceGroupProviders(ctx, groupA.ID, []int64{providerA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, groupB.ID, []int64{providerB}); err != nil {
+		t.Fatal(err)
 	}
 	keyA, err := repo.CreateClientKey(ctx, NewClientKey{Name: "ka", ConcurrencyLimit: 8})
 	if err != nil {
@@ -174,16 +200,16 @@ func TestGroupQuotasAreIndependentAcrossGroups(t *testing.T) {
 	if _, err := repo.UpdateModelGroup(ctx, groupA.ID, UpdateModelGroup{TokenLimitDaily: intPtr(50)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "a-first", 600)); err != nil {
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelA, "a-first", 600)); err != nil {
 		t.Fatalf("A 组首笔应按先欠费后停服放行：%v", err)
 	}
-	_, err = repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "a-second", 600))
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelA, "a-second", 600))
 	var quota *QuotaError
 	if !errors.As(err, &quota) || quota.Scope != "daily" || quota.Code != "token_quota_exceeded" {
 		t.Fatalf("err = %v, want daily token_quota_exceeded", err)
 	}
 	// B 组没有限额：同样的负载完全不受 A 组影响
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelID, "b-first", 600)); err != nil {
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelB, "b-first", 600)); err != nil {
 		t.Fatalf("B 组不应被 A 组的额度咬住：%v", err)
 	}
 	// 错误 detail 带分组信息（spec 第七节：运维要知道是哪个组咬住的）
@@ -195,7 +221,8 @@ func TestGroupQuotasAreIndependentAcrossGroups(t *testing.T) {
 // 每组各自独立周期：A 组周期用满即关闭，B 组不受影响。
 func TestGroupPeriodsAreIndependent(t *testing.T) {
 	ctx := context.Background()
-	repo, providerID, modelID := setupGroupScope(t)
+	repo, providerA, modelA := setupGroupScope(t)
+	providerB, modelB := addChannel(t, repo, "p-b")
 	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
 	if err != nil {
 		t.Fatal(err)
@@ -204,10 +231,12 @@ func TestGroupPeriodsAreIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, g := range []ModelGroup{groupA, groupB} {
-		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
-			t.Fatal(err)
-		}
+	// v24：一个渠道只能属于一个组 —— 两个组各用一条独立渠道。
+	if err := repo.ReplaceGroupProviders(ctx, groupA.ID, []int64{providerA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, groupB.ID, []int64{providerB}); err != nil {
+		t.Fatal(err)
 	}
 	keyA, err := repo.CreateClientKey(ctx, NewClientKey{Name: "ka", ConcurrencyLimit: 8})
 	if err != nil {
@@ -225,10 +254,10 @@ func TestGroupPeriodsAreIndependent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "period-a-1", 600)); err != nil {
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelA, "period-a-1", 600)); err != nil {
 		t.Fatalf("A 组周期首笔应放行：%v", err)
 	}
-	_, err = repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "period-a-2", 600))
+	_, err = repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelA, "period-a-2", 600))
 	var quota *QuotaError
 	if !errors.As(err, &quota) || quota.Scope != "period" || quota.Code != "token_quota_exceeded" {
 		t.Fatalf("err = %v, want period token_quota_exceeded", err)
@@ -244,7 +273,7 @@ func TestGroupPeriodsAreIndependent(t *testing.T) {
 	if err := repo.SetKeyGroup(ctx, keyB.ID, groupB.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelID, "period-b-1", 600)); err != nil {
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelB, "period-b-1", 600)); err != nil {
 		t.Fatalf("B 组不应感知 A 组的周期：%v", err)
 	}
 }
@@ -383,7 +412,8 @@ func TestAutoFilledPeriodStartTakesEffect(t *testing.T) {
 // 不再是「走组内渠道的请求」——共享渠道不再被重复计入多个组。
 func TestGroupOverviewCarriesGroupLimits(t *testing.T) {
 	ctx := context.Background()
-	repo, providerID, modelID := setupGroupScope(t)
+	repo, providerA, modelA := setupGroupScope(t)
+	providerB, modelB := addChannel(t, repo, "p-b")
 	groupA, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "a"})
 	if err != nil {
 		t.Fatal(err)
@@ -392,10 +422,12 @@ func TestGroupOverviewCarriesGroupLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, g := range []ModelGroup{groupA, groupB} {
-		if err := repo.ReplaceGroupProviders(ctx, g.ID, []int64{providerID}); err != nil {
-			t.Fatal(err)
-		}
+	// v24：一个渠道只能属于一个组 —— 两个组各用一条独立渠道。
+	if err := repo.ReplaceGroupProviders(ctx, groupA.ID, []int64{providerA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, groupB.ID, []int64{providerB}); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := repo.UpdateModelGroup(ctx, groupA.ID, UpdateModelGroup{TokenLimitDaily: intPtr(5000)}); err != nil {
 		t.Fatal(err)
@@ -407,7 +439,7 @@ func TestGroupOverviewCarriesGroupLimits(t *testing.T) {
 	if err := repo.SetKeyGroup(ctx, keyA.ID, groupA.ID); err != nil {
 		t.Fatal(err)
 	}
-	res, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelID, "ov-a", 100))
+	res, err := repo.ReserveRequest(ctx, newReservationArgs(keyA.ID, modelA, "ov-a", 100))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +453,8 @@ func TestGroupOverviewCarriesGroupLimits(t *testing.T) {
 	if got := ov["daily"].(map[string]any)["limit"]; got != int64(5000) {
 		t.Fatalf("daily limit = %v, want 5000（来自分组行）", got)
 	}
-	// keyB 的请求不属于 A 组，即使渠道共享：B 组的组概览看得到，A 组看不到
+	// keyB 的请求不属于 A 组（v24 起两边是各自独立的渠道，不再有共享渠道）：
+	// B 组的组概览看得到，A 组看不到
 	keyB, err := repo.CreateClientKey(ctx, NewClientKey{Name: "kb", ConcurrencyLimit: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -429,7 +462,7 @@ func TestGroupOverviewCarriesGroupLimits(t *testing.T) {
 	if err := repo.SetKeyGroup(ctx, keyB.ID, groupB.ID); err != nil {
 		t.Fatal(err)
 	}
-	resB, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelID, "ov-b", 100))
+	resB, err := repo.ReserveRequest(ctx, newReservationArgs(keyB.ID, modelB, "ov-b", 100))
 	if err != nil {
 		t.Fatal(err)
 	}

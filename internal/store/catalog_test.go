@@ -125,9 +125,8 @@ func TestAuthorizedModelsFollowSingleGroup(t *testing.T) {
 	if err := repo.ReplaceGroupProviders(ctx, groupA.ID, []int64{provider.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.ReplaceGroupProviders(ctx, groupB.ID, []int64{provider.ID}); err != nil {
-		t.Fatal(err)
-	}
+	// groupB 先留空，稍后换成独有渠道 only-b（v24 起一个渠道只属于一个组，
+	// 不能把主渠道同时挂到两个组上）。
 	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "alice", ConcurrencyLimit: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -222,10 +221,21 @@ func TestGroupRateMultiplierPersistenceAndKeyModelRate(t *testing.T) {
 	if _, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "bad", RateMilli: -1}); err == nil {
 		t.Fatal("negative rate accepted")
 	}
-	for _, gid := range []int64{cheap.ID, premium.ID} {
-		if err := repo.ReplaceGroupProviders(ctx, gid, []int64{provider.ID}); err != nil {
-			t.Fatal(err)
-		}
+	// v24：一个渠道只能属于一个组 —— premium 用主渠道，cheap 用另一条独立渠道。
+	// 「改绑到 cheap 后倍率变 800」必须拿 cheap 自己的模型来问，因为跨组不可见。
+	if err := repo.ReplaceGroupProviders(ctx, premium.ID, []int64{provider.ID}); err != nil {
+		t.Fatal(err)
+	}
+	cheapProvider, err := repo.CreateProvider(ctx, NewProvider{Name: "p-cheap", BaseURL: "http://localhost:3", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cheapModel, err := repo.CreateModel(ctx, NewModel{ProviderID: cheapProvider.ID, PublicName: "m-cheap", UpstreamName: "m", InputPriceMicroyuan: &price, OutputPriceMicroyuan: &price, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, cheap.ID, []int64{cheapProvider.ID}); err != nil {
+		t.Fatal(err)
 	}
 	updated, err := repo.UpdateModelGroup(ctx, premium.ID, UpdateModelGroup{RateMilli: intPtr(1500)})
 	if err != nil {
@@ -264,7 +274,7 @@ func TestGroupRateMultiplierPersistenceAndKeyModelRate(t *testing.T) {
 	if err := repo.SetKeyGroup(ctx, key.ID, cheap.ID); err != nil {
 		t.Fatal(err)
 	}
-	rate, err = repo.KeyModelRateMilli(ctx, key.ID, m.ID)
+	rate, err = repo.KeyModelRateMilli(ctx, key.ID, cheapModel.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

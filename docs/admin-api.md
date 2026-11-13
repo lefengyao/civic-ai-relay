@@ -136,7 +136,7 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」）。**组作用域主体**（非管理员）只看到自己分组实际能用的渠道：聚合组 = 自有 ∪ 启用成员组的渠道（与授权口径一致），且 `BaseURL` 为空 |
+| GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」）。每项另含 `GroupID`/`GroupName`（**归属分组**，0/空串 = 未加入任何组）。**组作用域主体**（非管理员）只看到自己分组实际能用的渠道：聚合组 = 自有 ∪ 启用成员组的渠道（与授权口径一致），且 `BaseURL` 与归属字段都为空 |
 | POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}`，可选带时段：`schedule_mode`（`always`/`range`/`daily`）、`schedule_start`、`schedule_end`（北京时间或 RFC3339）、`schedule_daily_start`、`schedule_daily_end`（`HH:MM`）、`schedule_weekdays`（`[1..7]`，1=周一） |
 | PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled, ScheduleMode, ScheduleStart, ScheduleEnd, ScheduleDailyStart, ScheduleDailyEnd, ScheduleWeekdays}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。`ScheduleMode` 缺省 = 保持原时段；给了就按同一请求里的 `Schedule*` 整段替换。**发 snake_case 会静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 与 `provider_schedule_test.go` 钉住 |
 | DELETE | `/admin/api/providers/{id}` | 删除，**级联删除该渠道下的所有模型**；重复删除返回 404 |
@@ -239,7 +239,7 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 
 **计费口径（与额度判定、概览统计同口径）**
 
-- 一笔请求同时占两个组的额度：`group_id` = Key 绑定的组（可能是聚合组），`source_group_id` = 真正提供该模型的组（普通组两者相同；聚合组取「自有渠道命中则为自己，否则为 id 最小的成员组」）。
+- 一笔请求同时占两个组的额度：`group_id` = Key 绑定的组（聚合组），`source_group_id` = 真正提供该模型的组（v24 起渠道归属唯一，所以它恒为「提供该模型的渠道所属的那个成员组」；聚合组自有渠道命中时两者相同）。
 - 任一组任一窗口用满都会 429，`error.message` 里写明是哪个组咬住的（`分组「xxx」#N`）。
 - 计价倍率只取 **Key 绑定的聚合组**的 `rate_milli`，两边金额是同一个数；**成员组自己的 `rate_milli` 不参与计费**（v0.10.0 起成员组无法被 Key 绑定，这个字段只在库里保留、不提供修改入口）。
 - 组概览的「已用」= `group_id=? OR source_group_id=?` 的行，所以聚合组与成员组看到的是同一笔流量。**账本只有一行**（不会翻倍），全局概览与 Key 总额度因此不受影响。
@@ -247,11 +247,11 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/api/groups` | 列表。每项含 `ID/Name/Kind/Enabled/RateMilli`、`BoundKeys`（绑定到该组的密钥数；**成员组恒为 0**，v23 起 Key 只能绑聚合组）、`ParentCount`（被几个聚合组包含；聚合组恒为 0）、`Providers`（**自有**渠道数）、`Members`/`MemberIDs`（聚合组的成员组摘要 `{ID,Name,Enabled,RateMilli,Providers}`，普通组为空数组）、10 个额度字段（`TokenLimit5H` … `PeriodLimitStart`）以及 `TensionPct` / `Overdrawn`（三个主窗口中最高用量占比按 Token 计；`Overdrawn=true` 表示至少一个窗口已用满）。密钥主体登录时 `Members`/`MemberIDs` 恒为空 —— 成员组名属于管理员视角的拓扑 |
-| POST | `/admin/api/groups` | 创建；body `{name, kind?, rate?, rate_milli?, provider_ids?, group_ids?}`。`kind` 缺省 `aggregate`（v23：可对外是默认，成员组要显式声明）；`aggregate` 时 `group_ids` 是成员组（必须存在且为 `normal`，不接受聚合组与自身，违反返回 400 且**不留下半成品**）。成员组（`normal`）带 `group_ids` 一律 400。**创建不带额度字段**，额度创建后在 PUT 里设 |
+| POST | `/admin/api/groups` | 创建；body `{name, kind?, rate?, rate_milli?, provider_ids?, group_ids?}`。`kind` 缺省 `aggregate`（v23：可对外是默认，成员组要显式声明）；`aggregate` 时 `group_ids` 是成员组（必须存在且为 `normal`，不接受聚合组与自身，违反返回 400 且**不留下半成品**）。成员组（`normal`）带 `group_ids` 一律 400。`provider_ids` 里的渠道必须**尚未属于其他组**（v24），否则 400 `provider_in_use` 并带「已属于哪个组」，同时**不会留下这个组**。**创建不带额度字段**，额度创建后在 PUT 里设 |
 | PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` + 9 个额度字段（`token_limit_5h`/`amount_limit_5h`/`token_limit_daily`/`amount_limit_daily`/`token_limit_weekly`/`amount_limit_weekly`/`period_limit_days`/`token_limit_period`/`amount_limit_period`）与 `period_limit_start`。**缺省 = 保持原值**，`0` = 不限，负数 400（`group_invalid`）。`period_limit_days > 0` 且起点为空时自动填 `now`；天数归零会清掉起点。**`kind` 不可改**（建组时定） |
 | DELETE | `/admin/api/groups/{id}` | 删除；返回 `{"ok": true, "unbound_keys": N, "aggregates": [...]}`（N = 刚才被解绑的密钥数，解绑后它们立即无法调用任何模型；`aggregates` = 把该组当成员的聚合组，删成员组会改变它们的可用模型）；重复删除返回 404 |
 | GET | `/admin/api/groups/{id}/providers` | 组内**自有**渠道 ID 列表（聚合组不含成员组带来的渠道） |
-| PUT | `/admin/api/groups/{id}/providers` | **整体替换**自有渠道；body `{"provider_ids": [...]}`；拒绝停用渠道。聚合组同样可用 |
+| PUT | `/admin/api/groups/{id}/providers` | **整体替换**自有渠道；body `{"provider_ids": [...]}`；拒绝停用渠道；渠道已被**别的组**占用时 400 `provider_in_use`（同一组重复保存是幂等的）。聚合组同样可用 |
 | GET | `/admin/api/groups/{id}/members` | 聚合组的成员组摘要，返回 `{"data": [...], "kind": "aggregate|normal"}`；普通组 `data` 为空 |
 | PUT | `/admin/api/groups/{id}/members` | **整体替换**成员组；body `{"group_ids": [...]}`；只有聚合组可调用（普通组 400），成员必须是 `normal` 组，写入失败不改变已有关系 |
 | GET | `/admin/api/groups/{id}/overview` | **分组概览**：仅统计**归属本组**的请求（按账目行上的 `group_id`，与额度扣减同口径；切换分组不搬历史）。返回 `{group_id, group_name, rpm{used,limit}, five_hour/daily/weekly/period{used_tokens,used_microyuan,limit,amount_limit}, weekly{active,from_utc}, period{active,start_utc,end_utc,transition_utc}, last_hour{...}, active, generated_at_utc}`；令牌/金额含未结算预留，`limit`/`amount_limit` 取自本组额度行（0 = 不限） |
@@ -439,5 +439,6 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v21 | `providers` 加 6 列生效时段（`schedule_mode` 等），默认 `always` —— 既有渠道升级后行为不变 |
 | v22 | 聚合模型组：`model_groups.kind`（默认 `normal`）、`group_compositions`（聚合组 → 成员组，只允许一层）、`requests.source_group_id` 与 `key_reservations.source_group_id`（真正提供该模型的组）。纯新增，既有组与账目行为不变 |
 | v23 | **只有聚合组对外**：把「没有被任何聚合组包含」的 `normal` 组改成 `aggregate`（升级前它们本来就是独立对外的组，不改会让既有 Key 全部失效）；成员关系里的 `normal` 组保留成员身份。无结构变更 |
+| v24 | **一个渠道只能属于一个组**：把历史上重复挂到多个组的渠道收敛成一条（保留**最早建立**的归属，rowid 最小），再建唯一索引 `group_providers(provider_id)`。重复的那条关系过去从未被计费（用量恒为 0），删掉不影响账目；若某个组因此变成 0 个渠道，管理台会直接显示「0 渠道」 |
 
 迁移在启动时自动应用，记录在 `schema_migrations` 表。

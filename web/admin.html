@@ -1072,9 +1072,16 @@ async function loadProviders() {
   const urlCell = p => isAdmin ? `<td><span class="mono provider-url" title="${esc(p.BaseURL)}">${esc(p.BaseURL)}</span></td>` : "";
   // 模型数量并进「模型（n）」按钮，不再单独占一列：加了「启用时段」后列太多，
   // 9 列会把操作按钮挤出可视区（实测 1440 宽仍需横向滚动）。
+  // 所属分组（v24）：一个渠道只能属于一个组。放在名称下方而不是新开一列——
+  // 加了「启用时段」后已经是 9 列，再宽下去操作按钮会被挤出可视区。
+  // 「未加入分组」单独标记：这种渠道的模型不会被任何 Key 授权，最常见的
+  // 「我明明配好了却调不通」就是它。
+  const groupChip = p => p.GroupName
+    ? `<div style="color:var(--muted);font-size:12px;margin-top:2px">${esc(p.GroupName)}</div>`
+    : `<div style="margin-top:2px"><span class="tag warn" title="这条渠道不属于任何分组：它的模型不会被任何 Key 授权">未加入分组</span></div>`;
   $("provider-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>协议</th>${urlHead}<th>Key</th><th>状态</th><th>启用时段</th><th>操作</th></tr></thead><tbody>` +
     cache.providers.map(p => `<tr>
-      <td class="mono">${p.ID}</td><td class="provider-name"><b>${esc(p.Name)}</b></td><td><span class="tag">${esc(p.Protocol || "openai")}</span></td>${urlCell(p)}
+      <td class="mono">${p.ID}</td><td class="provider-name"><b>${esc(p.Name)}</b>${groupChip(p)}</td><td><span class="tag">${esc(p.Protocol || "openai")}</span></td>${urlCell(p)}
       <td>${p.APIKeyConfigured ? `<span class="tag ok">已配置</span>` : `<span class="tag err">未配置</span>`}</td>
       <td>${statusCell(p)}</td>
       <td class="sched-cell">${esc(scheduleText(p))}</td>
@@ -1220,6 +1227,21 @@ function radioListHTML(items, selected, name) {
   return items.length ? `<div class="check-list">` + items.map(x =>
     `<label class="check-item ${selected === x.id ? "on" : ""}"><input type="radio" name="${esc(name)}" value="${x.id}" ${selected === x.id ? "checked" : ""} onchange="this.closest('.check-list').querySelectorAll('.check-item').forEach(i=>i.classList.remove('on'));this.closest('.check-item').classList.toggle('on',this.checked)"><span class="mono">${esc(x.label)}</span></label>`).join("") + `</div>`
     : `<span style="color:var(--muted);font-size:13px">${esc(name)}</span>`;
+}
+/* 渠道勾选（v24）：一个渠道只能属于一个组。归在**别的组**的渠道在这里直接灰掉并
+   写清归属——比让运维先勾上、保存后再弹「已属于另一个分组」好得多，当场就知道该
+   去哪个组腾地方。ownGroupId 传 null 表示正在新建组，此时任何已归属的渠道都不可选。
+   勾选状态仍由 input:checked 表达，灰掉的是 disabled，不会被 checkedIds 收进去。 */
+function providerChecksHTML(list, selected, ownGroupId, emptyText) {
+  if (!list.length) return `<span style="color:var(--muted);font-size:13px">${esc(emptyText)}</span>`;
+  return `<div class="check-list">` + list.map(p => {
+    const n = (cache.models || []).filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
+    const taken = !!p.GroupID && p.GroupID !== ownGroupId;
+    const on = !taken && selected.includes(p.ID);
+    const owner = esc(p.GroupName || ("#" + p.GroupID));
+    const note = taken ? `<span style="color:var(--amber)">（已属于「${owner}」）</span>` : "";
+    return `<label class="check-item ${on ? "on" : ""}"${taken ? ` style="opacity:.55;cursor:not-allowed" title="已属于「${owner}」，先从那个组移除才能加到这里"` : ""}><input type="checkbox" data-id="${p.ID}" value="${p.ID}" ${on ? "checked" : ""}${taken ? " disabled" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(p.Name)}<span style="color:var(--muted)">（${n} 个可用模型）</span>${note}</span></label>`;
+  }).join("") + `</div>`;
 }
 const checkedIds = container => [...container.querySelectorAll(".check-list input:checked")].map(i => Number(i.dataset.id));
 function closeEditModal() {
@@ -1532,11 +1554,8 @@ $("pool-add-btn").onclick = () => openPoolEditor(null);
 /* ── 成员组（渠道池：组内挂供应商，不在本组对外；被聚合组包含后才授权模型） ── */
 function renderGroupChecks() {
   const okProviders = cache.providers.filter(p => p.Enabled);
-  $("group-model-checks").innerHTML = okProviders.length ? okProviders.map(p => {
-    const n = cache.models.filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
-    return `<label class="check-item"><input type="checkbox" value="${p.ID}" onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(p.Name)}<span style="color:var(--muted)">（${n} 个可用模型）</span></span></label>`;
-  }).join("")
-    : `<span style="color:var(--muted);font-size:13px">暂无启用中的供应商（渠道），请先在「供应商」页创建</span>`;
+  $("group-model-checks").innerHTML = providerChecksHTML(okProviders, [], null,
+    "暂无启用中的供应商（渠道），请先在「供应商」页创建");
 }
 /* ── 分组可用性监测 ──────────────────────────────────────────
    状态由后端判定，这里只负责呈现。区分「配置不可用」和「上游不可达」是刻意的：
@@ -1601,7 +1620,9 @@ async function loadGroups() {
   const d = await apiJSON("/admin/api/groups");
   cache.groups = d.data || [];
   try { if (!cache.models.length) await ensureModels(); } catch {}
-  try { if (!cache.providers.length) cache.providers = (await apiJSON("/admin/api/providers")).data || []; } catch {}
+  // 归属要新鲜：组内渠道勾选靠 p.GroupID 判断「是否已在别组」，过期缓存会把
+  // 别组的渠道显示成可选，保存时才失败。
+  try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
   // 监测结果取不到不该挡住分组列表本身，失败就退化成「尚未检测」
   let health = { data: {}, monitor_enabled: false, monitor_interval_ms: 0 };
   try { health = await apiJSON("/admin/api/groups/health"); } catch {}
@@ -1713,13 +1734,11 @@ window.editGroup = async id => {
   const g = cache.groups.find(x => x.ID === id);
   if (!g) return;
   try { await ensureModels(); } catch {}
+  // 归属缓存要新鲜：一个渠道只属于一个组，过期缓存会把别组的渠道显示成可选。
+  try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
   let memberIds = [];
   try { memberIds = (await apiJSON("/admin/api/groups/" + id + "/providers")).data || []; } catch {}
   const okProviders = cache.providers.filter(p => p.Enabled);
-  const items = okProviders.map(p => {
-    const n = cache.models.filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
-    return { id: p.ID, label: `${esc(p.Name)}（${n} 个可用模型）` };
-  });
   const offMembers = memberIds.filter(pid => !okProviders.some(p => p.ID === pid));
   const rate = g.RateMilli != null ? g.RateMilli / 1000 : 1;
   // 成员组不对外，它自己的倍率不参与任何扣费：这里只显示、不给改，避免运维
@@ -1752,7 +1771,7 @@ window.editGroup = async id => {
       </div>
       ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}（填天数时若起点为空会自动从现在开始；周期用满后拒绝新请求，调大限额即恢复）</p>` : ""}
     </div>
-    <div class="field" style="margin-top:14px"><label>包含的供应商（渠道）——组管理渠道，渠道下所有已定价启用模型随组授权</label>${checkListHTML(items, memberIds, "暂无启用中的渠道")}</div>
+    <div class="field" style="margin-top:14px"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label>${providerChecksHTML(okProviders, memberIds, id, "暂无启用中的渠道")}</div>
     ${offMembers.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${offMembers.length} 个已停用的成员渠道保存后将被移除</p>` : ""}
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${detail}</div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="eg-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该成员组</label>
@@ -1816,11 +1835,7 @@ function renderAggregateChecks() {
     candidates.map(g => ({ id: g.ID, label: `${g.Name}（${g.Providers || 0} 个渠道${g.Enabled ? "" : "，已停用"}）` })),
     [], "还没有成员组（可到「成员组」页创建）");
   const providers = (cache.providers || []).filter(p => p.Enabled);
-  $("agg-provider-checks").innerHTML = checkListHTML(
-    providers.map(p => {
-      const n = cache.models.filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
-      return { id: p.ID, label: `${p.Name}（${n} 个可用模型）` };
-    }), [], "暂无启用中的渠道");
+  $("agg-provider-checks").innerHTML = providerChecksHTML(providers, [], null, "暂无启用中的渠道");
 }
 /* 聚合组的额度紧张标记与模型组同口径：三个主窗口里最紧的那个。 */
 function aggregateQuotaCell(g) {
@@ -1836,7 +1851,8 @@ async function loadAggregates() {
   const d = await apiJSON("/admin/api/groups");
   cache.groups = d.data || [];
   try { if (!cache.models.length) await ensureModels(); } catch {}
-  try { if (!cache.providers.length) cache.providers = (await apiJSON("/admin/api/providers")).data || []; } catch {}
+  // 同 loadGroups：渠道归属必须是最新的，否则勾选列表会把别组的渠道当成可选。
+  try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
   try { cache.groupHealth = (await apiJSON("/admin/api/groups/health")).data || {}; } catch {}
   renderAggregateChecks();
   const list = cache.groups.filter(g => g.Kind === "aggregate");
@@ -1881,15 +1897,14 @@ window.editAggregate = async id => {
   const g = cache.groups.find(x => x.ID === id);
   if (!g) return;
   try { await ensureModels(); } catch {}
+  // 归属是「一个渠道只属于一个组」，缓存一旦过期就会把已归别的组的渠道显示成可选，
+  // 保存时才失败。这里多一次 GET 换一份准确的归属，值。
+  try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
   let ownProviderIds = [];
   try { ownProviderIds = (await apiJSON("/admin/api/groups/" + id + "/providers")).data || []; } catch {}
   const memberIds = (g.MemberIDs || []).slice();
   const candidates = cache.groups.filter(x => x.Kind !== "aggregate");
   const memberItems = candidates.map(x => ({ id: x.ID, label: `${x.Name}（${x.Providers || 0} 个渠道${x.Enabled ? "" : "，已停用"}）` }));
-  const providerItems = (cache.providers || []).filter(p => p.Enabled).map(p => {
-    const n = cache.models.filter(m => m.ProviderID === p.ID && m.Enabled && m.InputPriceMicroyuan != null && m.OutputPriceMicroyuan != null).length;
-    return { id: p.ID, label: `${p.Name}（${n} 个可用模型）` };
-  });
   const plainVal = v => (v == null ? "" : v);
   const moneyVal = v => (v == null ? "" : v / 1e6);
   const quotaField = (key, label, value, money) =>
@@ -1915,7 +1930,7 @@ window.editAggregate = async id => {
       ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}</p>` : ""}
     </div>
     <div class="field" style="margin-top:14px"><label>包含的成员组（可选，只允许一层）</label><div id="ag-member-checks">${checkListHTML(memberItems, memberIds, "还没有成员组（可到「成员组」页创建）")}</div></div>
-    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${checkListHTML(providerItems, ownProviderIds, "暂无启用中的渠道")}</div></div>
+    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${providerChecksHTML((cache.providers || []).filter(p => p.Enabled), ownProviderIds, id, "暂无启用中的渠道")}</div></div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="ag-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该聚合模型组</label>
   `, async () => {
     const numOrNull = (key, micro) => {

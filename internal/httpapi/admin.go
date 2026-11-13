@@ -389,6 +389,18 @@ func writeProviderError(w http.ResponseWriter, err error) {
 	writeAdminErrorDetail(w, 400, "provider_invalid", err.Error())
 }
 
+// writeGroupProviderError 是「保存组内渠道」失败时的统一出口。归属冲突单独给
+// provider_in_use：它要让运维知道该去另一个组里腾地方（或新建一条渠道），
+// 而不是笼统的 group_invalid ——那会被理解成名称/额度没填对。
+func writeGroupProviderError(w http.ResponseWriter, err error) {
+	var conflict *store.ProviderGroupConflict
+	if errors.As(err, &conflict) {
+		writeAdminErrorDetail(w, 400, "provider_in_use", err.Error())
+		return
+	}
+	writeAdminErrorDetail(w, 400, "group_invalid", err.Error())
+}
+
 // writeDeleteResult reports the outcome of a delete, mapping "row missing" to
 // 404 so operators can tell an unknown ID apart from a failed delete.
 func writeDeleteResult(w http.ResponseWriter, err error) {
@@ -640,6 +652,8 @@ func (h *AdminHandler) providersList(w http.ResponseWriter, r *http.Request) {
 		for _, p := range data {
 			if allowed[p.ID] {
 				p.BaseURL = ""
+				// 归属分组是内部拓扑（成员组的命名也算），密钥主体不需要知道。
+				p.GroupID, p.GroupName = 0, ""
 				filtered = append(filtered, p)
 			}
 		}
@@ -1028,11 +1042,11 @@ func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		// 失败就把已经建出来的组删掉，避免留下一个「创建时报错、列表里却多出来」
-		// 的半成品（成员校验失败是最常见的失败原因）。
+		// 的半成品（成员校验失败、渠道已归别组都是常见的失败原因）。
 		if g.ID > 0 {
 			_ = h.repo.DeleteModelGroup(r.Context(), g.ID)
 		}
-		writeAdminError(w, 400, "group_invalid")
+		writeGroupProviderError(w, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"data": g})
@@ -1361,7 +1375,7 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 				return
 			}
 			if err := h.repo.ReplaceGroupProviders(r.Context(), id, p.ProviderIDs); err != nil {
-				writeAdminError(w, 400, "group_invalid")
+				writeGroupProviderError(w, err)
 				return
 			}
 			writeJSON(w, 200, map[string]any{"ok": true})
