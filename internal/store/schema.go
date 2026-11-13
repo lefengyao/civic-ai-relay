@@ -358,6 +358,20 @@ var migrations = []migration{
 				AND r.status IN ('completed','failed','aborted')
 				AND NOT EXISTS (SELECT 1 FROM key_reservations k WHERE k.request_id=r.request_id)`,
 	}},
+	// v21: 供应商生效时段。渠道可以只在选定时间段启用：固定日期区间（临时按天采购）
+	// 或每天重复时段（夜间便宜/夜间才可用），其余时间该渠道下的模型自动不可用。
+	//
+	// 纯新增列，默认 'always' = 全天不限，升级后所有既有渠道行为完全不变。
+	// 时段判定在 Go 侧做（schedule_mode 决定看哪些列），SQL 只负责存原值：
+	// 跨零点、星期选择这类规则用 SQL 表达又长又容易和时区打架。
+	{version: 21, statements: []string{
+		`ALTER TABLE providers ADD COLUMN schedule_mode TEXT NOT NULL DEFAULT 'always'`,
+		`ALTER TABLE providers ADD COLUMN schedule_start_utc TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE providers ADD COLUMN schedule_end_utc TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE providers ADD COLUMN schedule_start_minute INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE providers ADD COLUMN schedule_end_minute INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE providers ADD COLUMN schedule_weekdays INTEGER NOT NULL DEFAULT 0`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

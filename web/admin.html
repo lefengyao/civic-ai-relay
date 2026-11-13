@@ -101,6 +101,11 @@ main{flex:1;overflow-y:auto;padding:26px 32px 48px}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
 th{color:var(--muted);font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
 td{padding:10px;border-bottom:1px solid #f0f3f8;vertical-align:middle}
+/* 供应商表加了「启用时段」后列变多，窄屏容易把状态标签和操作按钮挤成两行 */
+#provider-data{overflow-x:auto}
+#provider-data .sched-cell,#provider-data .ops-cell{white-space:nowrap}
+#provider-data .provider-name{white-space:nowrap}
+#provider-data .provider-url{display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 tr:last-child td{border-bottom:none}
 tbody tr{transition:background .15s}
 tbody tr:hover{background:#f8faff}
@@ -122,7 +127,7 @@ tbody tr:hover{background:#f8faff}
 .mon-detail{font-size:11.5px;color:var(--muted);margin-top:3px;max-width:460px;line-height:1.5}
 .empty{color:var(--muted);text-align:center;padding:26px 0}
 .list-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid var(--border)}.list-row:last-child{border-bottom:0}.list-row .sub{display:block;margin-top:4px}.list-row .form-actions{flex-wrap:wrap;justify-content:flex-end}
-.tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500}
+.tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500;white-space:nowrap}
 .tag.ok{background:var(--green-soft);color:var(--green)}
 .tag.off{background:#eef0f4;color:var(--muted)}
 .tag.warn{background:var(--amber-soft);color:var(--amber)}
@@ -221,6 +226,8 @@ details .card{margin-bottom:0}
 .analytics-model-trigger span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .analytics-model-menu{position:absolute;z-index:20;top:calc(100% + 5px);left:0;right:0;max-height:260px;overflow-y:auto;padding:5px;border:1px solid var(--border);border-radius:8px;background:var(--panel);box-shadow:var(--shadow)}
 .analytics-model-menu[hidden]{display:none}
+/* .form-grid 自带 display:grid，会盖掉 UA 的 [hidden]{display:none}，这里显式补一条 */
+#es-range[hidden],#es-daily[hidden]{display:none}
 .analytics-model-option{display:flex;align-items:center;gap:9px;min-height:36px;padding:7px 8px;border-radius:5px;color:var(--text);font-size:13px;cursor:pointer}
 .analytics-model-option:hover{background:var(--accent-soft)}
 .analytics-model-option input{width:15px;height:15px;flex:none;margin:0;accent-color:var(--accent)}
@@ -357,7 +364,7 @@ details .card{margin-bottom:0}
             <div class="field"><label>上游地址</label><input name="base_url" type="url" required placeholder="http://172.17.0.1:6000 或 https://api.example.com/v1"><span class="hint">必须带 http:// 或 https://。容器访问宿主机上的服务要用网桥网关 IP（如 172.17.0.1），填 127.0.0.1 只会指向容器自己</span></div>
             <div class="field"><label>上游 API Key</label><input name="api_key" type="password" required placeholder="sk-..."></div>
           </div>
-          <div class="form-actions"><button class="btn">添加供应商</button><span class="sub" style="color:var(--muted);font-size:12px">Key 将使用 AES-256-GCM 加密存储</span></div>
+          <div class="form-actions"><button class="btn">添加供应商</button><span class="sub" style="color:var(--muted);font-size:12px">Key 将使用 AES-256-GCM 加密存储；添加后可在列表点「设置时段」限定生效时间</span></div>
         </form></div>
       </details>
       <div class="card"><h3>供应商列表</h3><div id="provider-data"></div></div>
@@ -1013,26 +1020,134 @@ async function loadProviders() {
   try { await ensureModels(); } catch {}
   if (!cache.providers.length) { $("provider-data").innerHTML = `<div class="empty">还没有供应商，点击上方按钮添加</div>`; return; }
   const mcount = id => cache.models.filter(m => m.ProviderID === id).length;
-  const statusCell = p => isAdmin
-    ? `<label class="switch"><input type="checkbox" ${p.Enabled ? "checked" : ""} onchange="toggleProvider(${p.ID},this)"><span class="track"></span></label>`
-    : (p.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`);
+  const statusCell = p => {
+    // 时段外不是「停用」：供应商本身是启用的，只是还没到点。分开显示，
+    // 免得运维把「22:00 才开始」误判成配置被人关掉了。
+    const chips = (p.Enabled && p.ScheduleActive === false) ? ` <span class="tag warn">未到时段</span>` : "";
+    return (isAdmin
+      ? `<label class="switch"><input type="checkbox" ${p.Enabled ? "checked" : ""} onchange="toggleProvider(${p.ID},this)"><span class="track"></span></label>`
+      : (p.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`)) + chips;
+  };
   const opsCell = p => isAdmin
-    ? `<button class="btn-ghost btn-sm" onclick="manageProviderModels(${p.ID})">模型管理（${mcount(p.ID)}）</button> <button class="btn-ghost btn-sm" onclick="editProvider(${p.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delProvider(${p.ID})">删除</button>`
+    ? `<button class="btn-ghost btn-sm" onclick="manageProviderModels(${p.ID})" title="管理该供应商下已接入的模型">模型（${mcount(p.ID)}）</button> <button class="btn-ghost btn-sm" onclick="editProviderSchedule(${p.ID})" title="设置生效时段（不限 / 固定区间 / 每天重复）">时段</button> <button class="btn-ghost btn-sm" onclick="editProvider(${p.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delProvider(${p.ID})">删除</button>`
     : `<button class="btn-ghost btn-sm" onclick="manageProviderModels(${p.ID})">查看模型（${mcount(p.ID)}）</button>`;
   // 上游地址属于内部拓扑，只有管理员能看到；访客连表头一起隐藏。
   const urlHead = isAdmin ? `<th>上游地址</th>` : "";
-  const urlCell = p => isAdmin ? `<td class="mono">${esc(p.BaseURL)}</td>` : "";
-  $("provider-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>协议</th>${urlHead}<th>模型数</th><th>Key</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
+  // 地址可能很长（内网域名 + 端口），单元格里截断并保留 title，避免整张表被一条 URL 撑破
+  const urlCell = p => isAdmin ? `<td><span class="mono provider-url" title="${esc(p.BaseURL)}">${esc(p.BaseURL)}</span></td>` : "";
+  // 模型数量并进「模型（n）」按钮，不再单独占一列：加了「启用时段」后列太多，
+  // 9 列会把操作按钮挤出可视区（实测 1440 宽仍需横向滚动）。
+  $("provider-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>协议</th>${urlHead}<th>Key</th><th>状态</th><th>启用时段</th><th>操作</th></tr></thead><tbody>` +
     cache.providers.map(p => `<tr>
-      <td class="mono">${p.ID}</td><td><b>${esc(p.Name)}</b></td><td><span class="tag">${esc(p.Protocol || "openai")}</span></td>${urlCell(p)}<td class="mono">${mcount(p.ID)}</td>
+      <td class="mono">${p.ID}</td><td class="provider-name"><b>${esc(p.Name)}</b></td><td><span class="tag">${esc(p.Protocol || "openai")}</span></td>${urlCell(p)}
       <td>${p.APIKeyConfigured ? `<span class="tag ok">已配置</span>` : `<span class="tag err">未配置</span>`}</td>
       <td>${statusCell(p)}</td>
-      <td>${opsCell(p)}</td>
+      <td class="sched-cell">${esc(scheduleText(p))}</td>
+      <td class="ops-cell">${opsCell(p)}</td>
     </tr>`).join("") + `</tbody></table>`;
 }
 window.toggleProvider = async (id, el) => {
   try { await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Enabled: el.checked }) }); toast(el.checked ? "供应商已启用" : "供应商已停用", "ok"); }
   catch (e) { el.checked = !el.checked; toast(e.message, "err"); }
+};
+/* ── 供应商生效时段（v0.8.0） ──
+   range 用绝对时间区间（临时按天采购），daily 用每天重复时段（夜间才可用的上游）。
+   时区固定北京时间：服务端也按 +08:00 解释不带时区的输入，两边不会错开一小时。 */
+const SCHEDULE_BJ_OFFSET = 8 * 3600 * 1000;
+const schedulePad = n => String(n).padStart(2, "0");
+const scheduleClock = minute => { const m = Math.max(0, Number(minute) || 0); return schedulePad(Math.floor(m / 60)) + ":" + schedulePad(m % 60); };
+const scheduleWeekdayNames = ["一", "二", "三", "四", "五", "六", "日"];
+/* 星期文案：连续三天以上缩成「周一至周三」，避免把表格列撑到换行 */
+function scheduleWeekdayText(mask) {
+  const value = Number(mask) || 0;
+  if (!value || value === 127) return "每天";
+  const picked = [];
+  for (let i = 0; i < 7; i++) if (value & (1 << i)) picked.push(i);
+  if (picked.length === 5 && picked.join(",") === "0,1,2,3,4") return "周一至周五";
+  if (picked.length === 2 && picked.join(",") === "5,6") return "周末";
+  const parts = [];
+  for (let i = 0; i < picked.length; i++) {
+    let j = i;
+    while (j + 1 < picked.length && picked[j + 1] === picked[j] + 1) j++;
+    if (j - i >= 2) { parts.push(`周${scheduleWeekdayNames[picked[i]]}至周${scheduleWeekdayNames[picked[j]]}`); i = j; }
+    else parts.push(`周${scheduleWeekdayNames[picked[i]]}`);
+  }
+  return parts.join("、");
+}
+function scheduleText(p) {
+  const mode = p.ScheduleMode || "always";
+  if (mode === "range") {
+    const fmt = v => v ? new Date(Date.parse(v) + SCHEDULE_BJ_OFFSET).toISOString().slice(0, 16).replace("T", " ") : "不限";
+    return `${fmt(p.ScheduleStartUTC)} → ${fmt(p.ScheduleEndUTC)}`;
+  }
+  if (mode === "daily") {
+    const start = scheduleClock(p.ScheduleStartMinute), end = scheduleClock(p.ScheduleEndMinute);
+    if (start === end) {
+      const allDay = scheduleWeekdayText(p.ScheduleWeekdays);
+      return allDay === "每天" ? "每天 全天" : `全天 · ${allDay}`;
+    }
+    const parts = [`${start}-${end}`];
+    if (Number(p.ScheduleStartMinute) > Number(p.ScheduleEndMinute)) parts.push("跨零点");
+    const days = scheduleWeekdayText(p.ScheduleWeekdays);
+    if (days !== "每天") parts.push(days);
+    return parts.join(" · ");
+  }
+  return "不限";
+}
+// 服务端存 UTC，datetime-local 没有时区概念，这里显式按北京时间来回换算。
+const bjInputValue = iso => {
+  if (!iso) return "";
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? new Date(ms + SCHEDULE_BJ_OFFSET).toISOString().slice(0, 16) : "";
+};
+const bjInputToISO = value => value ? new Date(value + ":00+08:00").toISOString() : "";
+window.syncScheduleFields = () => {
+  const mode = $("es-mode").value;
+  $("es-range").hidden = mode !== "range";
+  $("es-daily").hidden = mode !== "daily";
+};
+window.editProviderSchedule = id => {
+  const p = cache.providers.find(x => x.ID === id);
+  if (!p) return;
+  const mode = p.ScheduleMode || "always";
+  const weekdays = Number(p.ScheduleWeekdays) || 127;
+  const dayChecks = scheduleWeekdayNames.map((name, i) => {
+    const bit = 1 << i, on = weekdays === 127 || (weekdays & bit) !== 0;
+    return `<label class="check-item ${on ? "on" : ""}"><input type="checkbox" value="${i + 1}" ${on ? "checked" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${name}</span></label>`;
+  }).join("");
+  openEdit(`设置生效时段 #${id} · ${p.Name}`, `
+    <div class="field"><label>生效方式</label><select id="es-mode" onchange="syncScheduleFields()">
+      <option value="always" ${mode === "always" ? "selected" : ""}>不限（供应商启用即全天可用）</option>
+      <option value="range" ${mode === "range" ? "selected" : ""}>固定时间区间（到点自动生效 / 失效）</option>
+      <option value="daily" ${mode === "daily" ? "selected" : ""}>每天重复时段（如只在夜间可用）</option>
+    </select><span class="hint">时段外该供应商下的模型对客户端不可见、不可路由；仍留在分组里，到点自动恢复</span></div>
+    <div id="es-range" class="form-grid" ${mode === "range" ? "" : "hidden"}>
+      <div class="field"><label>开始（北京时间）</label><input id="es-start" type="datetime-local" value="${bjInputValue(p.ScheduleStartUTC)}"><span class="hint">留空表示不限起点</span></div>
+      <div class="field"><label>结束（北京时间）</label><input id="es-end" type="datetime-local" value="${bjInputValue(p.ScheduleEndUTC)}"><span class="hint">留空表示不限终点；到点后自动不可用</span></div>
+    </div>
+    <div id="es-daily" ${mode === "daily" ? "" : "hidden"}>
+      <div class="form-grid">
+        <div class="field"><label>每天从</label><input id="es-daily-start" type="time" value="${scheduleClock(p.ScheduleStartMinute)}"></div>
+        <div class="field"><label>到</label><input id="es-daily-end" type="time" value="${scheduleClock(p.ScheduleEndMinute)}"></div>
+      </div>
+      <div class="field"><label>星期</label><div class="check-list" id="es-weekdays">${dayChecks}</div><span class="hint">跨零点时，凌晨那段算作时段开始那天（周一 22:00-08:00 包含周二凌晨）</span></div>
+    </div>
+  `, async () => {
+    const picked = $("es-mode").value;
+    const body = { ScheduleMode: picked };
+    if (picked === "range") {
+      body.ScheduleStart = bjInputToISO($("es-start").value);
+      body.ScheduleEnd = bjInputToISO($("es-end").value);
+      // 两头都空 = 等于不限，别留一个永远生效的 range 让人误会
+      if (!body.ScheduleStart && !body.ScheduleEnd) body.ScheduleMode = "always";
+    } else if (picked === "daily") {
+      body.ScheduleDailyStart = $("es-daily-start").value || "00:00";
+      body.ScheduleDailyEnd = $("es-daily-end").value || "00:00";
+      body.ScheduleWeekdays = [...$("es-weekdays").querySelectorAll("input:checked")].map(el => Number(el.value));
+    }
+    await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    loadProviders();
+  });
 };
 /* ── 通用编辑弹窗 ── */
 function openEdit(title, bodyHTML, onsave) {

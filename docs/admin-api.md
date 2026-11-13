@@ -136,14 +136,36 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置） |
-| POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}` |
+| GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」） |
+| POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}`，可选带时段：`schedule_mode`（`always`/`range`/`daily`）、`schedule_start`、`schedule_end`（北京时间或 RFC3339）、`schedule_daily_start`、`schedule_daily_end`（`HH:MM`）、`schedule_weekdays`（`[1..7]`，1=周一） |
 | PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。改成 snake_case 会**静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 钉住 |
 | DELETE | `/admin/api/providers/{id}` | 删除，**级联删除该渠道下的所有模型**；重复删除返回 404 |
 | GET | `/admin/api/providers/{id}/remote-models` | 拉取上游 `/v1/models` 预览，返回 `{upstream_name, public_name, exists}`，不导入 |
 | POST | `/admin/api/providers/{id}/models/import` | 批量导入；body `{"models": [{upstream_name, public_name?}]}`。public_name 缺省为 `渠道名/上游名`。**幂等**：已存在的 public_name 跳过；导入结果为停用 + 未定价，需到模型页定价并启用后才能加入分组 |
 
 供应商 `base_url` 存库时自动去掉 `/v1` 后缀，请求上游时自动补回。
+
+#### 生效时段（v0.8.0）
+
+渠道可以只在选定时间段启用。三种方式**互斥**，判定口径只有一处（`store.ProviderSchedule.ActiveAt`），时区固定**北京时间**：
+
+| `schedule_mode` | 生效条件 | 用到的字段 |
+|---|---|---|
+| `always`（默认） | 供应商 `enabled=1` 即全天可用，与升级前行为一致 | 无 |
+| `range` | 区间 `[start, end)`；任一侧留空表示该侧不限 | `schedule_start_utc` / `schedule_end_utc`（UTC RFC3339） |
+| `daily` | 每天在 `HH:MM` 之间，可叠加星期；**支持跨零点** | `schedule_start_minute` / `schedule_end_minute`（0..1439，北京时间）、`schedule_weekdays` |
+
+约定与坑：
+
+- `schedule_weekdays` 是位掩码：bit0=周一 … bit6=周日。`0` 与 `127` 都表示每天。
+- `daily` 起止相同 = 全天（只受星期约束）。
+- **跨零点归属开始那天**：`周一 22:00-08:00` 包含周二凌晨；周二 22:00 起的就不算周一了。
+- `range` 只填一侧时另一侧不限；两侧都空等价于 `always`（管理台保存时会自动回退成 `always`，不留一个永远生效的 `range`）。
+- 时段外的后果：该渠道下的模型**不会出现在 `/v1/models`**，请求也不会被路由过去（故障转移池会自动跳到时段的成员）。分组探活与定时模型同步同样跳过这些渠道。
+- 管理台「接入信息」里的模型清单**不按时段过滤** —— 那是「配置上授权了哪些模型」；想知道此刻能不能用，看供应商列表的「未到时段」标签。
+- 脏数据（`range` 的时间解析不出）按「该侧不限」处理：宁可放行，也不让一条坏记录把渠道永久停掉。
+
+`PUT` 更新时段时 `ScheduleMode` 缺省表示**保持原时段**（只改名字不会顺手清掉时段）；要清空请显式传 `{"ScheduleMode":"always"}`。
 
 `base_url` 的校验规则（不符则 400 `provider_invalid: <原因>`，原因会说明该改成什么）：
 
@@ -400,5 +422,6 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v18 | `model_groups` 加 10 列分组额度（4 窗口 × Token/金额 + 周期设置） |
 | v19 | **故障转移供应商**：`model_pools`（单模型类别）+ `model_pool_members`（成员与优先级）。纯新增表，不改动任何既有表 |
 | v20 | `key_reservations` 重建为独立账本（去掉 `key_id` / `model_id` 外键），并按 `requests` 补回历史账目：删 Key / 模型 / 渠道不再清零组额度，保留期也不再裁剪账目 |
+| v21 | `providers` 加 6 列生效时段（`schedule_mode` 等），默认 `always` —— 既有渠道升级后行为不变 |
 
 迁移在启动时自动应用，记录在 `schema_migrations` 表。

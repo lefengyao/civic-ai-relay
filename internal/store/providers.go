@@ -19,6 +19,15 @@ type Provider struct {
 	Protocol         string
 	Enabled          bool
 	APIKeyConfigured bool
+	// 生效时段（v21）：Mode 为 always 时下面几列没有意义。
+	ScheduleMode        string
+	ScheduleStartUTC    string
+	ScheduleEndUTC      string
+	ScheduleStartMinute int
+	ScheduleEndMinute   int
+	ScheduleWeekdays    int
+	// ScheduleActive 是按当前时刻算出的「是否在时段内」，只用于展示，不落库。
+	ScheduleActive bool
 }
 
 type NewProvider struct {
@@ -27,6 +36,7 @@ type NewProvider struct {
 	APIKey   string
 	Protocol string
 	Enabled  bool
+	Schedule ProviderSchedule
 }
 
 type UpdateProvider struct {
@@ -35,6 +45,21 @@ type UpdateProvider struct {
 	APIKey   string
 	Protocol string
 	Enabled  *bool
+	// 时段是整段替换：只要给了 ScheduleMode，就按这几项重建时段；
+	// 没给（nil）表示保持原时段不变 —— 只改名字的请求不会顺手清掉时段。
+	ScheduleMode       *string
+	ScheduleStart      *string
+	ScheduleEnd        *string
+	ScheduleDailyStart *string
+	ScheduleDailyEnd   *string
+	ScheduleWeekdays   *[]int
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func normalizeProviderProtocol(raw string) (string, error) {
@@ -139,8 +164,15 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	}
 	enabled := 1
 	// New providers are enabled by default; disabled state can be set using UpdateProvider.
+	schedule := in.Schedule
+	if strings.TrimSpace(schedule.Mode) == "" {
+		schedule = ProviderSchedule{Mode: ProviderScheduleAlways}
+	}
 	now := nowUTC()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO providers(name,base_url,protocol,api_key_ciphertext,enabled,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?)`, name, baseURL, protocol, []byte(ciphertext), enabled, now, now)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO providers(name,base_url,protocol,api_key_ciphertext,enabled,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		name, baseURL, protocol, []byte(ciphertext), enabled,
+		schedule.Mode, schedule.StartUTC, schedule.EndUTC, schedule.StartMinute, schedule.EndMinute, schedule.Weekdays,
+		now, now)
 	if err != nil {
 		return Provider{}, friendlyProviderWriteError(err, name)
 	}
@@ -148,7 +180,10 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	if err != nil {
 		return Provider{}, err
 	}
-	return Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: true, APIKeyConfigured: true}, nil
+	return Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: true, APIKeyConfigured: true,
+		ScheduleMode: schedule.Mode, ScheduleStartUTC: schedule.StartUTC, ScheduleEndUTC: schedule.EndUTC,
+		ScheduleStartMinute: schedule.StartMinute, ScheduleEndMinute: schedule.EndMinute, ScheduleWeekdays: schedule.Weekdays,
+		ScheduleActive: schedule.ActiveAt(time.Now())}, nil
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider) (Provider, error) {
@@ -157,7 +192,11 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 	}
 	var currentName, currentURL, currentProtocol, currentCipher string
 	var currentEnabled int
-	if err := s.db.QueryRowContext(ctx, `SELECT name,base_url,protocol,api_key_ciphertext,enabled FROM providers WHERE id=?`, id).Scan(&currentName, &currentURL, &currentProtocol, &currentCipher, &currentEnabled); err != nil {
+	var currentScheduleMode, currentStart, currentEnd string
+	var currentStartMinute, currentEndMinute, currentWeekdays int
+	if err := s.db.QueryRowContext(ctx, `SELECT name,base_url,protocol,api_key_ciphertext,enabled,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays FROM providers WHERE id=?`, id).Scan(
+		&currentName, &currentURL, &currentProtocol, &currentCipher, &currentEnabled,
+		&currentScheduleMode, &currentStart, &currentEnd, &currentStartMinute, &currentEndMinute, &currentWeekdays); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Provider{}, fmt.Errorf("供应商 #%d 不存在（可能已被删除，请刷新页面）", id)
 		}
@@ -201,7 +240,27 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 			enabled = 0
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,protocol=?,api_key_ciphertext=?,enabled=?,updated_at_utc=? WHERE id=?`, name, baseURL, protocol, []byte(ciphertext), enabled, nowUTC(), id); err != nil {
+	scheduleMode, scheduleStart, scheduleEnd := currentScheduleMode, currentStart, currentEnd
+	scheduleStartMinute, scheduleEndMinute, scheduleWeekdays := currentStartMinute, currentEndMinute, currentWeekdays
+	if in.ScheduleMode != nil {
+		normalized, scheduleErr := NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode:       *in.ScheduleMode,
+			Start:      derefString(in.ScheduleStart),
+			End:        derefString(in.ScheduleEnd),
+			DailyStart: derefString(in.ScheduleDailyStart),
+			DailyEnd:   derefString(in.ScheduleDailyEnd),
+			Weekdays:   derefWeekdays(in.ScheduleWeekdays),
+		})
+		if scheduleErr != nil {
+			return Provider{}, scheduleErr
+		}
+		scheduleMode, scheduleStart, scheduleEnd = normalized.Mode, normalized.StartUTC, normalized.EndUTC
+		scheduleStartMinute, scheduleEndMinute, scheduleWeekdays = normalized.StartMinute, normalized.EndMinute, normalized.Weekdays
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,protocol=?,api_key_ciphertext=?,enabled=?,schedule_mode=?,schedule_start_utc=?,schedule_end_utc=?,schedule_start_minute=?,schedule_end_minute=?,schedule_weekdays=?,updated_at_utc=? WHERE id=?`,
+		name, baseURL, protocol, []byte(ciphertext), enabled,
+		scheduleMode, scheduleStart, scheduleEnd, scheduleStartMinute, scheduleEndMinute, scheduleWeekdays,
+		nowUTC(), id); err != nil {
 		return Provider{}, friendlyProviderWriteError(err, name)
 	}
 	// 轮换密钥或修改地址后，缓存的 upstream client 已过期，必须驱逐重建；
@@ -209,11 +268,47 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 	if s.providerCacheEvict != nil && (rotated || baseURL != currentURL || protocol != currentProtocol) {
 		s.providerCacheEvict(id)
 	}
-	return Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: enabled == 1, APIKeyConfigured: s.providerConfigured(ciphertext)}, nil
+	updated := Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: enabled == 1, APIKeyConfigured: s.providerConfigured(ciphertext),
+		ScheduleMode: scheduleMode, ScheduleStartUTC: scheduleStart, ScheduleEndUTC: scheduleEnd,
+		ScheduleStartMinute: scheduleStartMinute, ScheduleEndMinute: scheduleEndMinute, ScheduleWeekdays: scheduleWeekdays}
+	updated.ScheduleActive = updated.ActiveAt(time.Now())
+	return updated, nil
+}
+
+func derefWeekdays(value *[]int) []int {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+// providerSelect 是读渠道的唯一列清单：时段列必须一起读，否则管理台会看到
+// 「时段已保存但状态永远是不限」这种自相矛盾的界面。
+const providerSelect = `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays FROM providers`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func (s *Store) scanProvider(row rowScanner) (Provider, error) {
+	var p Provider
+	var enabled int
+	var ciphertext string
+	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &p.Protocol, &enabled, &ciphertext,
+		&p.ScheduleMode, &p.ScheduleStartUTC, &p.ScheduleEndUTC,
+		&p.ScheduleStartMinute, &p.ScheduleEndMinute, &p.ScheduleWeekdays); err != nil {
+		return Provider{}, err
+	}
+	p.Enabled, p.APIKeyConfigured = enabled == 1, s.providerConfigured(ciphertext)
+	if strings.TrimSpace(p.ScheduleMode) == "" {
+		p.ScheduleMode = ProviderScheduleAlways
+	}
+	p.ScheduleActive = p.ActiveAt(time.Now())
+	return p, nil
 }
 
 func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext FROM providers ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, providerSelect+` ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -221,27 +316,17 @@ func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
 	// 非 nil 空切片：空集合序列化为 [] 而非 null，避免客户端额外判空
 	out := make([]Provider, 0)
 	for rows.Next() {
-		var p Provider
-		var enabled int
-		var ciphertext string
-		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.Protocol, &enabled, &ciphertext); err != nil {
+		p, err := s.scanProvider(rows)
+		if err != nil {
 			return nil, err
 		}
-		p.Enabled, p.APIKeyConfigured = enabled == 1, s.providerConfigured(ciphertext)
 		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) GetProvider(ctx context.Context, id int64) (Provider, error) {
-	var p Provider
-	var enabled int
-	var ciphertext string
-	if err := s.db.QueryRowContext(ctx, `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext FROM providers WHERE id=?`, id).Scan(&p.ID, &p.Name, &p.BaseURL, &p.Protocol, &enabled, &ciphertext); err != nil {
-		return Provider{}, err
-	}
-	p.Enabled, p.APIKeyConfigured = enabled == 1, s.providerConfigured(ciphertext)
-	return p, nil
+	return s.scanProvider(s.db.QueryRowContext(ctx, providerSelect+` WHERE id=?`, id))
 }
 
 // ProviderAPIKey decrypts a provider credential for the upstream registry.

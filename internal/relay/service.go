@@ -136,8 +136,10 @@ func (s *Service) Models(ctx context.Context, token, appID string) ([]store.Mode
 	if err != nil {
 		return nil, err
 	}
-	// 认证已确认启用，这里按 Key ID 取授权模型（与公共 /v1/models、管理台接入信息同一份口径）
-	return s.store.AuthorizedModelsForKey(ctx, key.ID)
+	// 认证已确认启用，这里按 Key ID 取「此刻可用」的模型：授权口径与公共
+	// /v1/models、管理台接入信息同源，额外按供应商生效时段过滤（渠道不在时段内
+	// 的模型此刻不可路由，不该出现在列表里让客户端白试一次）。
+	return s.store.UsableModelsForKey(ctx, key.ID, time.Now())
 }
 
 // PreviewProviderModels fetches the upstream model catalog for a provider via
@@ -320,7 +322,9 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	if err != nil {
 		return nil, store.Model{}, err
 	}
-	models, err := s.store.AuthorizedModelsForKey(ctx, key.ID)
+	// 这里取的是「此刻可用」而不是「永久授权」：渠道不在生效时段内时，它的模型
+	// 会先被滤掉，于是请求会自然落到故障转移池的下一个成员，或直接判定模型不可用。
+	models, err := s.store.UsableModelsForKey(ctx, key.ID, time.Now())
 	if err != nil {
 		return nil, store.Model{}, err
 	}

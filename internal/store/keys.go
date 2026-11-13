@@ -508,23 +508,93 @@ func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (in
 	return rate.Int64, nil
 }
 
+// AuthorizedModels 按明文 token 查「授权关系」本身，不按时段过滤。
+//
+// 注意：线上没有任何转发路径走这里（/v1/models 与 Begin 都走 UsableModelsForKey）。
+// 它保留下来是给测试与排查用的「配置口径」查询；如果你要在请求链路上判断
+// 「这个 Key 现在能用什么」，必须用 UsableModelsForKey，否则会把时段外的渠道
+// 也算成可用。
 func (s *Store) AuthorizedModels(ctx context.Context, token string) ([]Model, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("client token is required")
 	}
 	// 组管理渠道：授权模型 = Key 启用组内渠道下、已定价且启用的模型。
-	return s.queryAuthorizedModels(ctx, "k.token_digest=? AND k.enabled=1", s.box.DigestBytes(token))
+	models, err := s.authorizedModels(ctx, "k.token_digest=? AND k.enabled=1", s.box.DigestBytes(token))
+	if err != nil {
+		return nil, err
+	}
+	return s.withPoolEntries(ctx, models)
 }
 
 // AuthorizedModelsForKey 与 AuthorizedModels 同口径，但按 Key ID 查询：管理端
 // 拿不到明文 token，却需要把「其他软件该填哪些模型名」原样告诉运维。刻意不校验
 // k.enabled —— 停用的 Key 也要能看到它本来会拿到什么，否则运维无法判断客户端的
 // 401 是「Key 被停用」还是「模型没授权」。
+//
+// 刻意也不按时段过滤：管理台要展示「授权关系」本身，渠道临时不在时段内属于
+// 可用性问题，由供应商页的状态列说明；真实转发走 UsableModelsForKey。
 func (s *Store) AuthorizedModelsForKey(ctx context.Context, keyID int64) ([]Model, error) {
 	if keyID <= 0 {
 		return nil, errors.New("key ID is required")
 	}
-	return s.queryAuthorizedModels(ctx, "k.id=?", keyID)
+	models, err := s.authorizedModels(ctx, "k.id=?", keyID)
+	if err != nil {
+		return nil, err
+	}
+	return s.withPoolEntries(ctx, models)
+}
+
+// UsableModelsForKey 是「此刻真能用来发请求」的模型集合：授权模型再按供应商
+// 生效时段过滤掉「现在不在时段内」的渠道。转发入口（Begin / /v1/models）必须用
+// 这一份，否则会出现「客户端看到模型、调用却打到停用渠道」或反过来的漂移。
+func (s *Store) UsableModelsForKey(ctx context.Context, keyID int64, now time.Time) ([]Model, error) {
+	if keyID <= 0 {
+		return nil, errors.New("key ID is required")
+	}
+	models, err := s.authorizedModels(ctx, "k.id=?", keyID)
+	if err != nil {
+		return nil, err
+	}
+	models, err = s.filterByProviderSchedule(ctx, models, now)
+	if err != nil {
+		return nil, err
+	}
+	return s.withPoolEntries(ctx, models)
+}
+
+// filterByProviderSchedule 丢掉「所属渠道此刻不在生效时段」的模型。
+// 渠道只有几条，一次全表读进内存比把跨零点/星期规则塞进 SQL 更可靠。
+func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, now time.Time) ([]Model, error) {
+	if len(models) == 0 {
+		return models, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays FROM providers`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	active := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		var schedule ProviderSchedule
+		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays); err != nil {
+			return nil, err
+		}
+		active[id] = schedule.ActiveAt(now)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]Model, 0, len(models))
+	for _, model := range models {
+		// 查不到渠道行（已被删除）时保守放行：真正的授权校验在 SQL 里已经做过，
+		// 这里只负责时段，别把别的原因造成的缺行误判成「不在时段」。
+		if inWindow, known := active[model.ProviderID]; known && !inWindow {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out, nil
 }
 
 // authorizedModelsSelect 是「客户端实际能用哪些模型」的唯一口径：
@@ -534,7 +604,7 @@ func (s *Store) AuthorizedModelsForKey(ctx context.Context, keyID int64) ([]Mode
 // 「客户端报 404、管理台却显示已授权」这类最难查的问题。
 const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.provider_id=gp.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
 
-func (s *Store) queryAuthorizedModels(ctx context.Context, where string, args ...any) ([]Model, error) {
+func (s *Store) authorizedModels(ctx context.Context, where string, args ...any) ([]Model, error) {
 	rows, err := s.db.QueryContext(ctx, authorizedModelsSelect+where+" ORDER BY m.id", args...)
 	if err != nil {
 		return nil, err
@@ -549,18 +619,17 @@ func (s *Store) queryAuthorizedModels(ctx context.Context, where string, args ..
 		}
 		out = append(out, m)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	// 故障转移供应商（池）与真实模型共用 /v1/models 这一份口径：只在「至少一个
-	// 成员确实对该 Key 授权」时才把池名列出来。虚拟条目排在真实模型之后，
-	// Begin 里先匹配真实模型，即便历史数据里出现同名也不会产生歧义。
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	pools, err := s.AuthorizedPoolEntries(ctx, out)
+	return out, rows.Err()
+}
+
+// withPoolEntries 追加故障转移供应商（池）的虚拟条目：池与真实模型共用
+// /v1/models 这一份口径，只在「至少一个成员确实对该 Key 可用」时才列出来。
+// 虚拟条目排在真实模型之后，Begin 里先匹配真实模型，即便历史数据里出现同名
+// 也不会产生歧义。
+func (s *Store) withPoolEntries(ctx context.Context, models []Model) ([]Model, error) {
+	pools, err := s.AuthorizedPoolEntries(ctx, models)
 	if err != nil {
 		return nil, err
 	}
-	return append(out, pools...), nil
+	return append(models, pools...), nil
 }

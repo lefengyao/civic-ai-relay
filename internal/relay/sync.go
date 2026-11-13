@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"time"
 
 	"civic-ai-relay/internal/logging"
 	"civic-ai-relay/internal/store"
@@ -45,8 +46,13 @@ func (s *ModelSyncer) RunOnce(ctx context.Context) (SyncSummary, error) {
 	if err != nil {
 		return summary, err
 	}
+	now := time.Now()
 	for _, provider := range providers {
 		if !provider.Enabled {
+			continue
+		}
+		// 时段外渠道拉上游只会拿到连接失败/401，白刷一轮告警；等它进入时段再同步。
+		if !provider.ActiveAt(now) {
 			continue
 		}
 		summary.Providers++

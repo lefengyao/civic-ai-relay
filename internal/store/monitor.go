@@ -30,7 +30,12 @@ type MonitorProvider struct {
 	Name         string
 	Enabled      bool
 	PricedModels int // 该渠道下「已启用且已定价」的模型数量
+	Schedule     ProviderSchedule
 }
+
+// ActiveAt 判断该渠道此刻是否在生效时段内。探活要跳过时段外渠道，
+// 否则一个「本来就只在夜间开」的渠道会让分组整夜显示为不可达。
+func (p MonitorProvider) ActiveAt(now time.Time) bool { return p.Schedule.ActiveAt(now) }
 
 // GroupMonitorTarget 是一个待监测的分组及其构成，由一次联表查询取全，
 // 避免在探活循环里反复查库。
@@ -81,7 +86,9 @@ type GroupMonitorResult struct {
 // GroupMonitorTargets 一次查出所有分组及其渠道构成，供监测循环使用。
 func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,p.id,COALESCE(p.name,''),COALESCE(p.enabled,0),
-		(SELECT COUNT(*) FROM models m WHERE m.provider_id=p.id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL)
+		(SELECT COUNT(*) FROM models m WHERE m.provider_id=p.id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL),
+		COALESCE(p.schedule_mode,'always'),COALESCE(p.schedule_start_utc,''),COALESCE(p.schedule_end_utc,''),
+		COALESCE(p.schedule_start_minute,0),COALESCE(p.schedule_end_minute,0),COALESCE(p.schedule_weekdays,0)
 		FROM model_groups g
 		LEFT JOIN group_providers gp ON gp.group_id=g.id
 		LEFT JOIN providers p ON p.id=gp.provider_id
@@ -100,7 +107,9 @@ func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, 
 		var providerName string
 		var providerEnabled int
 		var priced int
-		if err := rows.Scan(&groupID, &groupName, &groupEnabled, &providerID, &providerName, &providerEnabled, &priced); err != nil {
+		var schedule ProviderSchedule
+		if err := rows.Scan(&groupID, &groupName, &groupEnabled, &providerID, &providerName, &providerEnabled, &priced,
+			&schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays); err != nil {
 			return nil, err
 		}
 		idx, ok := position[groupID]
@@ -113,7 +122,7 @@ func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, 
 		// 它的 ProviderCount 自然是 0。
 		if providerID.Valid {
 			out[idx].Providers = append(out[idx].Providers, MonitorProvider{
-				ID: providerID.Int64, Name: providerName, Enabled: providerEnabled == 1, PricedModels: priced,
+				ID: providerID.Int64, Name: providerName, Enabled: providerEnabled == 1, PricedModels: priced, Schedule: schedule,
 			})
 		}
 	}

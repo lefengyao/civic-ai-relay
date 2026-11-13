@@ -124,8 +124,28 @@ func (m *Monitor) evaluate(ctx context.Context, target store.GroupMonitorTarget,
 		return finish(store.GroupStatusConfigUnavailable, "组内渠道下没有「已启用且已定价」的模型，客户端拿不到任何可用模型")
 	}
 	result.TotalProviders = len(providers)
-	failures := make([]string, 0, len(providers))
+	// 时段外渠道本来就不该被调用，探活一定失败——照常探会让分组整夜显示「全部不可达」。
+	// 这类渠道直接跳过，并在明细里说清楚跳过了几个，避免运维把它当成故障。
+	now := m.now()
+	active := make([]store.MonitorProvider, 0, len(providers))
+	skipped := 0
 	for _, provider := range providers {
+		if !provider.ActiveAt(now) {
+			skipped++
+			continue
+		}
+		active = append(active, provider)
+	}
+	if len(active) == 0 {
+		return finish(store.GroupStatusOK, fmt.Sprintf("%d 个启用渠道均不在生效时段，跳过探活", len(providers)))
+	}
+	result.TotalProviders = len(active)
+	suffix := ""
+	if skipped > 0 {
+		suffix = fmt.Sprintf("（另有 %d 个渠道不在生效时段，已跳过）", skipped)
+	}
+	failures := make([]string, 0, len(active))
+	for _, provider := range active {
 		if err := m.probe(ctx, provider.ID); err != nil {
 			failures = append(failures, provider.Name+"："+probeReason(err))
 		}
@@ -133,13 +153,13 @@ func (m *Monitor) evaluate(ctx context.Context, target store.GroupMonitorTarget,
 	result.FailedProviders = len(failures)
 	switch len(failures) {
 	case 0:
-		return finish(store.GroupStatusOK, fmt.Sprintf("%d 个启用渠道全部可达", len(providers)))
-	case len(providers):
-		return finish(store.GroupStatusUpstreamUnreachable, "全部启用渠道探活失败 —— "+strings.Join(failures, "；"))
+		return finish(store.GroupStatusOK, fmt.Sprintf("%d 个启用渠道全部可达%s", len(active), suffix))
+	case len(active):
+		return finish(store.GroupStatusUpstreamUnreachable, "全部启用渠道探活失败 —— "+strings.Join(failures, "；")+suffix)
 	default:
 		return finish(store.GroupStatusDegraded, fmt.Sprintf(
-			"%d/%d 个渠道探活失败，走这些渠道的模型会请求失败 —— %s",
-			len(failures), len(providers), strings.Join(failures, "；")))
+			"%d/%d 个渠道探活失败，走这些渠道的模型会请求失败 —— %s%s",
+			len(failures), len(active), strings.Join(failures, "；"), suffix))
 	}
 }
 

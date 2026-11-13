@@ -640,12 +640,31 @@ func (h *AdminHandler) providerCreate(w http.ResponseWriter, r *http.Request) {
 		BaseURL  string `json:"base_url"`
 		APIKey   string `json:"api_key"`
 		Protocol string `json:"protocol"`
+		// 时段（v21）：创建时可选，缺省 = 不限。写法与 PUT 不同，见 docs/admin-api.md。
+		ScheduleMode       string `json:"schedule_mode"`
+		ScheduleStart      string `json:"schedule_start"`
+		ScheduleEnd        string `json:"schedule_end"`
+		ScheduleDailyStart string `json:"schedule_daily_start"`
+		ScheduleDailyEnd   string `json:"schedule_daily_end"`
+		ScheduleWeekdays   []int  `json:"schedule_weekdays"`
 	}
 	if json.NewDecoder(r.Body).Decode(&payload) != nil {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
-	in := store.NewProvider{Name: payload.Name, BaseURL: payload.BaseURL, APIKey: payload.APIKey, Protocol: payload.Protocol}
+	schedule, err := store.NormalizeProviderSchedule(store.ProviderScheduleInput{
+		Mode:       payload.ScheduleMode,
+		Start:      payload.ScheduleStart,
+		End:        payload.ScheduleEnd,
+		DailyStart: payload.ScheduleDailyStart,
+		DailyEnd:   payload.ScheduleDailyEnd,
+		Weekdays:   payload.ScheduleWeekdays,
+	})
+	if err != nil {
+		writeProviderError(w, err)
+		return
+	}
+	in := store.NewProvider{Name: payload.Name, BaseURL: payload.BaseURL, APIKey: payload.APIKey, Protocol: payload.Protocol, Schedule: schedule}
 	value, err := h.repo.CreateProvider(r.Context(), in)
 	if err != nil {
 		writeProviderError(w, err)
