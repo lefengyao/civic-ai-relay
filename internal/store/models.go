@@ -354,6 +354,39 @@ func boolInt(v bool) int {
 	return 0
 }
 
+// EffectiveProviderIDs 返回「这个组实际能用到的渠道」：自有渠道 ∪ 处于启用
+// 状态的成员组渠道，与授权口径（authorizedModelsSelect）一致。
+//
+// 与 GroupProviderIDs 的区别：后者是「本组自己挂的渠道」，只该用于编辑（把
+// 成员组渠道也当成自有渠道列进去，保存时会被写进 group_providers，等于把成员
+// 关系复制成一份，之后拆成员就会拆不干净）。而组作用域的管理视图必须用这一份，
+// 否则聚合组的使用者只看到聚合组自己挂的渠道，成员组带来的渠道像是凭空消失。
+func (s *Store) EffectiveProviderIDs(ctx context.Context, groupID int64) ([]int64, error) {
+	if groupID <= 0 {
+		return nil, errors.New("group ID is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT provider_id FROM group_providers WHERE group_id=?
+		UNION
+		SELECT gp.provider_id FROM group_compositions gc
+			JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1
+			JOIN group_providers gp ON gp.group_id=gc.child_group_id
+			WHERE gc.parent_group_id=?
+		ORDER BY 1`, groupID, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGroup, error) {
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
@@ -368,7 +401,7 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 		return ModelGroup{}, err
 	}
 	if kind == GroupKindNormal && len(in.GroupIDs) > 0 {
-		return ModelGroup{}, errors.New("普通模型组不能包含其他模型组，请选择「聚合模型组」类型")
+		return ModelGroup{}, errors.New("成员组不能包含其他模型组；需要包含成员组请改用「聚合模型组」类型")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -421,7 +454,7 @@ func replaceGroupCompositionsTx(ctx context.Context, tx *sql.Tx, parentID int64,
 			return err
 		}
 		if kind != GroupKindNormal {
-			return fmt.Errorf("聚合组只能包含普通模型组（#%d 是聚合组）", childID)
+			return fmt.Errorf("聚合组只能包含成员组（#%d 是聚合组）", childID)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO group_compositions(parent_group_id,child_group_id) VALUES (?,?)`, parentID, childID); err != nil {
 			return err

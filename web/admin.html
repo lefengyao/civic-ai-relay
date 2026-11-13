@@ -1693,15 +1693,20 @@ window.groupOverview = async id => {
   $("go-body").addEventListener("click", event => { if (event.target.closest("[data-quota-refresh]")) $("go-refresh").click(); });
   $("go-refresh").click();
 };
-/* 成员渠道的模型与计价一览：管理员编辑弹窗与访客只读弹窗共用。 */
+/* 成员渠道的模型与计价一览：管理员编辑弹窗与访客只读弹窗共用。
+   rate 传 null = 成员组自己看：成员组不对外，扣费只按「绑定它的聚合组」倍率算，
+   拿成员组自己的倍率去说「倍率后实际扣费」会给出一个永远不会发生的数字。 */
 function groupMemberDetail(memberIds, rate) {
+  const chargeHint = rate == null
+    ? "实际扣费 = 单价 × 聚合模型组倍率（成员组倍率不参与）"
+    : `倍率后实际扣费 = 单价 × ${rate.toFixed(2)}`;
   return memberIds.length ? memberIds.map(pid => {
     const p = cache.providers.find(x => x.ID === pid);
     const mine = cache.models.filter(m => m.ProviderID === pid);
     const rows = mine.length ? mine.map(m =>
       `<tr><td class="mono">${esc(m.PublicName)}</td><td class="mono">${esc(m.UpstreamName)}</td><td class="mono">入 ${fmtYuan(m.InputPriceMicroyuan)} / 出 ${fmtYuan(m.OutputPriceMicroyuan)} / 缓存 ${fmtYuan(m.CachedInputPriceMicroyuan)}</td><td>${m.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}${m.InputPriceMicroyuan == null || m.OutputPriceMicroyuan == null ? `<span class="tag off">未定价</span>` : ""}</td></tr>`).join("")
       : `<tr><td colspan="4" style="color:var(--muted)">该渠道还没有模型</td></tr>`;
-    return `<div style="margin:10px 0 4px"><b>${esc(p ? p.Name : "#" + pid)}</b>（倍率后实际扣费 = 单价 × ${rate.toFixed(2)}）</div><table><thead><tr><th>对外名称</th><th>上游名称</th><th>单价（元/百万）</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>`;
+    return `<div style="margin:10px 0 4px"><b>${esc(p ? p.Name : "#" + pid)}</b>（${chargeHint}）</div><table><thead><tr><th>对外名称</th><th>上游名称</th><th>单价（元/百万）</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>`;
   }).join("") : `<p style="color:var(--muted);font-size:13px">尚未包含任何渠道</p>`;
 }
 window.editGroup = async id => {
@@ -1717,7 +1722,9 @@ window.editGroup = async id => {
   });
   const offMembers = memberIds.filter(pid => !okProviders.some(p => p.ID === pid));
   const rate = g.RateMilli != null ? g.RateMilli / 1000 : 1;
-  const detail = groupMemberDetail(memberIds, rate);
+  // 成员组不对外，它自己的倍率不参与任何扣费：这里只显示、不给改，避免运维
+  // 以为调它能改变客户端账单（真正生效的是绑定它的聚合组倍率）。
+  const detail = groupMemberDetail(memberIds, null);
   // 额度留空的语义是「保持原值」（后端 nil = 不动），所以「改回不限」必须显式填 0。
   // 手机上 9 个并列输入框很难认，按窗口分行：每行 = Token + 金额（元）。
   const quotaField = (id, label, value, money) =>
@@ -1728,7 +1735,7 @@ window.editGroup = async id => {
     <p class="view-hint" style="margin:0 0 14px">这是<b>成员组</b>：它自己不对外，Key 绑不上它。把它加进聚合模型组之后，这里的渠道才会对外提供模型——届时一笔请求会同时扣本组与聚合组的额度。</p>
     <div class="form-grid">
       <div class="field"><label>组名</label><input id="eg-name" value="${esc(g.Name)}" style="max-width:280px"></div>
-      <div class="field"><label>计费倍率（该组内请求按模型单价 × 倍率计费）</label><input id="eg-rate" type="number" step="0.01" min="0.01" value="${g.RateMilli != null ? (g.RateMilli / 1000).toFixed(2) : "1.00"}" style="max-width:140px"></div>
+      <div class="field"><label>倍率（成员组不对外，此值不参与扣费）</label><div class="mono" style="padding-top:8px">×${rate.toFixed(2)}　<span style="color:var(--muted);font-size:12.5px">扣费按聚合模型组倍率</span></div></div>
     </div>
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">额度（只作用于本组）</h4>
       <p style="color:var(--muted);font-size:12.5px;margin:0 0 8px">任一窗口用满即拒绝该组的新请求（先欠费后停服：已用 ≥ 限额就拒）。<b>0 = 不限；留空 = 保持原值</b>——想把已设的限额改回不限，要填 0 而不是清空。自定义周期要<b>同时</b>填「周期长度」和至少一项「周期限额」才生效；<b>用满即关闭服务</b>（429 拒绝新请求），调大限额后自动恢复，不会从 0 重新计。</p>
@@ -1759,7 +1766,8 @@ window.editGroup = async id => {
       return micro ? Math.round(v * 1e6) : Math.round(v);
     };
     await apiJSON("/admin/api/groups/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-      name: $("eg-name").value.trim(), rate: parseFloat($("eg-rate").value) || 1, enabled: $("eg-enabled").checked,
+      // 不发 rate：成员组倍率不参与扣费，不提供修改入口（后端缺省 = 保持原值）。
+      name: $("eg-name").value.trim(), enabled: $("eg-enabled").checked,
       token_limit_5h: numOrNull("t5h", false), amount_limit_5h: numOrNull("a5h", true),
       token_limit_daily: numOrNull("td", false), amount_limit_daily: numOrNull("ad", true),
       token_limit_weekly: numOrNull("tw", false), amount_limit_weekly: numOrNull("aw", true),
@@ -1781,10 +1789,10 @@ window.viewGroup = async id => {
   openManageModal(`成员组「${esc(g.Name)}」信息`, `
     <div class="form-grid">
       <div class="field"><label>组名</label><div><b>${esc(g.Name)}</b></div></div>
-      <div class="field"><label>计费倍率</label><div class="mono">×${rate.toFixed(2)}</div></div>
+      <div class="field"><label>倍率（不参与扣费）</label><div class="mono">×${rate.toFixed(2)}</div></div>
       <div class="field"><label>状态</label><div>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</div></div>
     </div>
-    <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${groupMemberDetail(memberIds, rate)}</div>
+    <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${groupMemberDetail(memberIds, null)}</div>
   `);
 };
 $("group-form").onsubmit = async e => {

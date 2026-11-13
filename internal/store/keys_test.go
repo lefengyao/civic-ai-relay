@@ -310,16 +310,17 @@ func TestSetKeyGroupBindsUnbindsAndValidates(t *testing.T) {
 		t.Fatalf("解绑后 group = %v, want nil", got.GroupID)
 	}
 
-	// 不存在的组
-	if err := repo.SetKeyGroup(ctx, key.ID, 99999); err == nil {
-		t.Fatal("不存在的组被接受")
+	// 不存在的组：错误文案要能直接给运维看，不能把 sql.ErrNoRows 的原文
+	// （"sql: no rows in result set"）透出来。
+	if err := repo.SetKeyGroup(ctx, key.ID, 99999); err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("不存在的组应提示「不存在」，实际 %v", err)
 	}
 	// 停用的组（SetKeyGroup 的校验与旧多对多写入一致）
 	if _, err := repo.UpdateModelGroup(ctx, g.ID, UpdateModelGroup{Enabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.SetKeyGroup(ctx, key.ID, g.ID); err == nil || !strings.Contains(err.Error(), "disabled") {
-		t.Fatalf("停用的组应报 disabled，实际 %v", err)
+	if err := repo.SetKeyGroup(ctx, key.ID, g.ID); err == nil || !strings.Contains(err.Error(), "已停用") {
+		t.Fatalf("停用的组应提示「已停用」，实际 %v", err)
 	}
 	// 不存在的 Key
 	if err := repo.SetKeyGroup(ctx, 99999, g.ID); !errors.Is(err, sql.ErrNoRows) {

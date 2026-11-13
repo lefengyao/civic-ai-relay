@@ -136,7 +136,7 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」） |
+| GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」）。**组作用域主体**（非管理员）只看到自己分组实际能用的渠道：聚合组 = 自有 ∪ 启用成员组的渠道（与授权口径一致），且 `BaseURL` 为空 |
 | POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}`，可选带时段：`schedule_mode`（`always`/`range`/`daily`）、`schedule_start`、`schedule_end`（北京时间或 RFC3339）、`schedule_daily_start`、`schedule_daily_end`（`HH:MM`）、`schedule_weekdays`（`[1..7]`，1=周一） |
 | PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled, ScheduleMode, ScheduleStart, ScheduleEnd, ScheduleDailyStart, ScheduleDailyEnd, ScheduleWeekdays}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。`ScheduleMode` 缺省 = 保持原时段；给了就按同一请求里的 `Schedule*` 整段替换。**发 snake_case 会静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 与 `provider_schedule_test.go` 钉住 |
 | DELETE | `/admin/api/providers/{id}` | 删除，**级联删除该渠道下的所有模型**；重复删除返回 404 |
@@ -241,7 +241,7 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 
 - 一笔请求同时占两个组的额度：`group_id` = Key 绑定的组（可能是聚合组），`source_group_id` = 真正提供该模型的组（普通组两者相同；聚合组取「自有渠道命中则为自己，否则为 id 最小的成员组」）。
 - 任一组任一窗口用满都会 429，`error.message` 里写明是哪个组咬住的（`分组「xxx」#N`）。
-- 计价倍率取 **Key 绑定组**的 `rate_milli`，两边的金额是同一个数；成员组自己的倍率只对绑定它自己的 Key 生效。
+- 计价倍率只取 **Key 绑定的聚合组**的 `rate_milli`，两边金额是同一个数；**成员组自己的 `rate_milli` 不参与计费**（v0.10.0 起成员组无法被 Key 绑定，这个字段只在库里保留、不提供修改入口）。
 - 组概览的「已用」= `group_id=? OR source_group_id=?` 的行，所以聚合组与成员组看到的是同一笔流量。**账本只有一行**（不会翻倍），全局概览与 Key 总额度因此不受影响。
 
 | 方法 | 路径 | 说明 |
@@ -293,7 +293,7 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/api/keys` | 列表，含用量统计（见下） |
-| POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_id?, ttl_seconds?, keyless?}`。`group_id > 0` 时创建即绑定到该分组（一对一，**必须是聚合组**）；缺省/0 = 不绑；负数 = 400 `invalid_request`；目标组是成员组 = 400 `group_not_callable`（带原因）；组不存在或已停用 = 400 `key_invalid`——此时 Key 本体已创建（历史保留，需事后在编辑里改绑或删除）。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
+| POST | `/admin/api/keys` | 创建；body `{name, max_concurrency, token_limit_total?, money_limit_yuan_total?, group_id?, ttl_seconds?, keyless?}`。`group_id > 0` 时创建即绑定到该分组（一对一，**必须是聚合组**；组不可绑时返回 400 且**不会留下 Key**——明文 token 只在 201 里返回一次，失败必须等于什么都没发生）；缺省/0 = 不绑；负数 = 400 `invalid_request`；目标组是成员组 = 400 `group_not_callable`（带原因）；组不存在或已停用 = 400 `key_invalid`——此时 Key 本体已创建（历史保留，需事后在编辑里改绑或删除）。**明文 token 只在本次响应返回一次**。`ttl_seconds > 0` 时创建为**短时令牌**（从现在起 N 秒后自动失效），缺省/0/负数 = 永久有效。`keyless: true` 时创建**应用型凭据**：不产生任何可用密钥（响应里 `token` 为空串），改用公开的应用标识接入，见下节 |
 | GET | `/admin/api/keys/hints` | 脱敏缩略 `crk_xxxx…` + 非敏感标识 `key-xxxxxx`（独立接口，保证列表永不泄露密钥字符） |
 | PUT | `/admin/api/keys/{id}` | 更新 `{name?, enabled?, concurrency_limit?, token_limit_total?, money_limit_yuan_total?, ttl_seconds?}`；**nil 字段保持原值**。`ttl_seconds` 三态：缺省 = 不动；`0`/负数 = 改为永久有效；`>0` = 从现在起 N 秒后到期（**续期就是再传一次**） |
 | DELETE | `/admin/api/keys/{id}` | 删除：立即吊销访问；已结算账目保留（组用量不归零，A），有在途请求时拒绝；重复删除返回 404 |

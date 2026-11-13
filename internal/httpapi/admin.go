@@ -625,9 +625,10 @@ func (h *AdminHandler) providersList(w http.ResponseWriter, r *http.Request) {
 	}
 	sub := subjectOf(r)
 	if !sub.Admin {
-		// 密钥主体只看得到自己分组挂的渠道，而且拿不到上游地址——
-		// 地址属于内部拓扑，拿到就能绕过网关直连上游。
-		members, merr := h.repo.GroupProviderIDs(r.Context(), sub.GroupID)
+		// 密钥主体只看得到自己分组实际能用的渠道（聚合组要连成员组的渠道一起算，
+		// 否则「客户端能用、这里却看不到」），而且拿不到上游地址——地址属于内部
+		// 拓扑，拿到就能绕过网关直连上游。
+		members, merr := h.repo.EffectiveProviderIDs(r.Context(), sub.GroupID)
 		if merr != nil || sub.GroupID == 0 {
 			members = nil
 		}
@@ -1406,6 +1407,15 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 	if p.MaxConcurrency == 0 {
 		p.MaxConcurrency = 1
 	}
+	// 先验组再建 Key：创建 Key 会立刻落库，而明文 token 只在创建响应里返回一次。
+	// 如果等建完再绑、绑失败又直接返回 400，库里就多一把「运维手里没有密钥」的
+	// 孤儿 Key（它还会占着名字、出现在列表里）。所以目标组不可用时直接拒绝。
+	if p.GroupID != nil && *p.GroupID > 0 {
+		if err := h.repo.ValidateKeyGroup(r.Context(), *p.GroupID); err != nil {
+			writeKeyGroupError(w, err)
+			return
+		}
+	}
 	var money *int64
 	if p.MoneyLimitYuan != nil {
 		v := int64(*p.MoneyLimitYuan*1000000 + 0.5)
@@ -1413,7 +1423,12 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	k, err := h.repo.CreateClientKey(r.Context(), store.NewClientKey{Name: p.Name, ConcurrencyLimit: p.MaxConcurrency, TokenLimit: p.TokenLimit, AmountLimitMicroyuan: money, ExpiresAt: expiryFromTTL(p.TTLSeconds), Keyless: p.Keyless})
 	if err == nil && p.GroupID != nil && *p.GroupID > 0 {
-		if err = h.repo.SetKeyGroup(r.Context(), k.ID, *p.GroupID); err == nil {
+		if bindErr := h.repo.SetKeyGroup(r.Context(), k.ID, *p.GroupID); bindErr != nil {
+			// 校验与绑定之间有窗口（组刚好被停用/删除/改类型）。这时宁可把刚建的
+			// Key 删掉：留着它就是一把客户端拿不到的凭据，比「没建成」更难收拾。
+			_ = h.repo.DeleteClientKey(r.Context(), k.ID)
+			err = bindErr
+		} else {
 			// 绑定成功后回填，创建响应里能看到归属分组
 			k.GroupID = p.GroupID
 		}
@@ -1624,6 +1639,9 @@ func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, key
 	// 不影响接入信息整体可用。
 	var group any
 	enabledGroup := false
+	// callableGroup 区分「组停用了」和「组根本不是对外的那一类」：前者启用即恢复，
+	// 后者必须改绑聚合组。混成一句「授权模型为空」会让人去查模型定价。
+	callableGroup := false
 	if key.GroupID != nil {
 		entry := map[string]any{"id": *key.GroupID, "name": "", "enabled": false, "rate_milli": store.DefaultGroupRateMilli}
 		if catalog, err := h.repo.ListModelGroups(r.Context()); err == nil {
@@ -1631,14 +1649,18 @@ func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, key
 				if g.ID == *key.GroupID {
 					entry["name"] = g.Name
 					entry["enabled"] = g.Enabled
+					entry["kind"] = g.Kind
 					entry["rate_milli"] = g.RateMilli
 					enabledGroup = g.Enabled
+					callableGroup = g.Kind == store.GroupKindAggregate
 					break
 				}
 			}
 		} else {
 			entry["enabled"] = true
 			enabledGroup = true
+			// 拿不到分组目录时不误报「组类型不对」，按可用来处理
+			callableGroup = true
 		}
 		group = entry
 	}
@@ -1671,6 +1693,9 @@ func (h *AdminHandler) keyConnection(w http.ResponseWriter, r *http.Request, key
 	}
 	if key.GroupID == nil {
 		issues = append(issues, "该 Key 未绑定任何分组：客户端拉不到模型，对话返回 400 model_not_allowed")
+	} else if !callableGroup {
+		// 只可能是升级前留下的绑定（v23 起写路径已拦住）：说清怎么修，别让人去查定价。
+		issues = append(issues, "所属分组是成员组，不能直接对外提供服务：请在「编辑」里改绑一个聚合模型组")
 	} else if !enabledGroup {
 		issues = append(issues, "所属分组已停用：授权模型为空")
 	}

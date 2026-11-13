@@ -200,4 +200,35 @@ func TestAdminKeyGroupRejectsMemberGroup(t *testing.T) {
 	if created.Code != http.StatusBadRequest || !strings.Contains(created.Body.String(), "group_not_callable") {
 		t.Fatalf("创建即绑成员组 = %d: %s", created.Code, created.Body.String())
 	}
+	// 创建 Key 是先落库再绑组，而明文 token 只在 201 响应里返回一次。绑定被拒时
+	// 必须把刚建的 Key 删掉，否则库里会留下一把「运维拿不到密钥」的孤儿凭据。
+	keys := adminRequest(t, handler, http.MethodGet, "/admin/api/keys", adminKey, nil)
+	if strings.Contains(keys.Body.String(), `"k2"`) {
+		t.Fatalf("绑组失败却留下了 Key：%s", keys.Body.String())
+	}
+}
+
+// 绑一个不存在的组：错误要能读懂。之前直接把 sql.ErrNoRows 的原文
+// （"sql: no rows in result set"）塞进 message，运维看到只会更困惑。
+func TestAdminKeyGroupMissingGroupMessage(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+	keyResp := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey, map[string]any{"name": "k", "max_concurrency": 1})
+	if keyResp.Code != http.StatusCreated {
+		t.Fatalf("create key = %d: %s", keyResp.Code, keyResp.Body.String())
+	}
+	var keyBody struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(keyResp.Body.Bytes(), &keyBody); err != nil {
+		t.Fatal(err)
+	}
+	bad := adminRequest(t, handler, http.MethodPut, "/admin/api/keys/"+itoa(keyBody.Data.ID)+"/group", adminKey, map[string]any{"group_id": 999999})
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("绑不存在的组 = %d: %s", bad.Code, bad.Body.String())
+	}
+	if strings.Contains(bad.Body.String(), "sql: ") || !strings.Contains(bad.Body.String(), "不存在") {
+		t.Fatalf("错误文案不可读：%s", bad.Body.String())
+	}
 }

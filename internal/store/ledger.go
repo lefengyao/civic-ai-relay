@@ -463,8 +463,8 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if groupKind != GroupKindAggregate {
 		return rollback(errors.New("client key is bound to a member group; only aggregate groups can serve"))
 	}
-	// 解析「这个模型由谁提供」并取出计价依据。聚合组先看自有渠道；
-	// 聚合组先看自有渠道，没有再看成员组（取 id 最小的成员，确定性优先）。
+	// 解析「这个模型由谁提供」并取出计价依据：聚合组先看自有渠道，没有再取
+	// id 最小的成员组（确定性优先）。
 	// source_group_id 是「真正提供该模型的组」，额度要在它身上也扣一份——这是
 	// 老板明确要求的「两个组都扣」。它同时落库到 requests / key_reservations，
 	// 让成员组的概览与额度判定用同一口径。

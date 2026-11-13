@@ -478,16 +478,8 @@ func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 		return sql.ErrNoRows
 	}
 	if groupID > 0 {
-		var enabled int
-		var kind string
-		if err := tx.QueryRowContext(ctx, `SELECT enabled,kind FROM model_groups WHERE id=?`, groupID).Scan(&enabled, &kind); err != nil {
+		if err := checkCallableGroup(ctx, tx, groupID); err != nil {
 			return err
-		}
-		if enabled != 1 {
-			return fmt.Errorf("group %d is disabled", groupID)
-		}
-		if kind != GroupKindAggregate {
-			return fmt.Errorf("%w（#%d 是成员组）", ErrGroupNotCallable, groupID)
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE client_keys SET group_id=?, updated_at_utc=? WHERE id=?`, groupID, nowUTC(), keyID)
 	} else {
@@ -497,6 +489,50 @@ func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// rowQuerier 让同一份校验既能跑在事务里（SetKeyGroup），也能跑在连接上
+// （ValidateKeyGroup）。*sql.DB 与 *sql.Tx 都满足。
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// checkCallableGroup 是「这个分组能不能承载客户端 Key」的唯一判定：必须存在、
+// 处于启用状态、且是聚合组（v23）。
+//
+// 错误文案是直接给运维看的（管理端把它放进 message）：说清是哪一组、错在哪，
+// 比只回一个 key_invalid 更容易定位。ErrGroupNotCallable 用 %w 包装，调用方
+// 仍能用 errors.Is 分出「组类型不对」这一类。
+func checkCallableGroup(ctx context.Context, q rowQuerier, groupID int64) error {
+	var enabled int
+	var kind string
+	if err := q.QueryRowContext(ctx, `SELECT enabled,kind FROM model_groups WHERE id=?`, groupID).Scan(&enabled, &kind); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("分组 #%d 不存在", groupID)
+		}
+		return err
+	}
+	if enabled != 1 {
+		return fmt.Errorf("分组 #%d 已停用，启用后才能绑定密钥", groupID)
+	}
+	if kind != GroupKindAggregate {
+		return fmt.Errorf("%w（#%d 是成员组）", ErrGroupNotCallable, groupID)
+	}
+	return nil
+}
+
+// ValidateKeyGroup 在「创建 Key 并顺带绑组」之前先做一次校验。
+//
+// 为什么不能只靠 SetKeyGroup 那一关：CreateClientKey 已经把行写进去了，绑定
+// 失败时如果不预先拦，就会留下一个明文 token 从未返回过（只在创建响应里出现
+// 一次）的孤儿 Key —— 运维看到报错以为没建成，列表里却多一把再也拿不到密钥的
+// 凭据。校验与实际绑定之间仍有窗口（组可能刚好被停用/删除），所以调用方还要在
+// 绑定失败时删掉刚建的 Key。
+func (s *Store) ValidateKeyGroup(ctx context.Context, groupID int64) error {
+	if groupID <= 0 {
+		return errors.New("group ID is required")
+	}
+	return checkCallableGroup(ctx, s.db, groupID)
 }
 
 // KeyModelRateMilli returns the billing rate multiplier (in thousandths, 1000 = 1.0x)

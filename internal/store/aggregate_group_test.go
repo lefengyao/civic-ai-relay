@@ -397,3 +397,48 @@ func TestAggregateRateAppliesToMemberModels(t *testing.T) {
 		t.Fatalf("rate = %d, want 1500（聚合组倍率）", rate)
 	}
 }
+
+// 组作用域的管理视图要按「实际能用的渠道」过滤：聚合组自己的渠道 + 成员组的
+// 渠道。只取 group_providers 会让聚合组的使用者看到「客户端有模型、渠道列表里
+// 却没有这个渠道」——同一份权限在两个界面上说法不一致，最难解释。
+func TestEffectiveProviderIDsCoversMemberChannels(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, _ := setupGroupScope(t)
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, member.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	agg, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "agg", Kind: GroupKindAggregate, GroupIDs: []int64{member.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := repo.EffectiveProviderIDs(ctx, agg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != providerID {
+		t.Fatalf("聚合组有效渠道 = %v, want [%d]", ids, providerID)
+	}
+	// 成员组停用后它的渠道就不再被这个聚合组用了，视图必须同步消失。
+	res, err := repo.UpdateModelGroup(ctx, member.ID, UpdateModelGroup{Enabled: boolPtr(false)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Enabled {
+		t.Fatal("成员组应已停用")
+	}
+	ids, err = repo.EffectiveProviderIDs(ctx, agg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("成员组停用后聚合组有效渠道 = %v, want 空", ids)
+	}
+	// 自有渠道那条分支不受影响：编辑页仍然只列自己挂的渠道。
+	if own, err := repo.GroupProviderIDs(ctx, member.ID); err != nil || len(own) != 1 {
+		t.Fatalf("GroupProviderIDs(member) = %v, %v; want 1 个", own, err)
+	}
+}
