@@ -221,8 +221,8 @@ func TestAggregateGroupUsageVisibleOnMember(t *testing.T) {
 
 // v24：一个渠道只能属于一个组，所以「聚合组自己也挂这条渠道、同时成员组也挂它」
 // 这种双归属在保存时就会被拒——它正是过去「这笔请求到底扣谁额度」说不清的来源。
-// 记账侧仍保留「自有渠道优先」的分支（同一模型可能同时被自有渠道与成员组渠道提供），
-// 那是防御性写法，不再有数据能构造出冲突输入。
+// 记账侧因此只需读渠道的归属组（见 ledger.go 的 source_group 子查询），不再需要
+// 「自有渠道优先 / 取最小成员组 ID」这样的消歧规则。
 func TestAggregateCannotAlsoOwnMemberProvider(t *testing.T) {
 	ctx := context.Background()
 	repo, providerID, _ := setupGroupScope(t)
@@ -446,5 +446,36 @@ func TestEffectiveProviderIDsCoversMemberChannels(t *testing.T) {
 	// 自有渠道那条分支不受影响：编辑页仍然只列自己挂的渠道。
 	if own, err := repo.GroupProviderIDs(ctx, member.ID); err != nil || len(own) != 1 {
 		t.Fatalf("GroupProviderIDs(member) = %v, %v; want 1 个", own, err)
+	}
+}
+
+// 聚合组的自有渠道：来源组就是聚合组自己。这是 v24 改写 source_group 子查询后
+// 的第一条分支（旧写法是 EXISTS(group_providers WHERE group_id=g.id)）。
+func TestAggregateOwnChannelIsItsOwnSourceGroup(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	agg, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "agg", Kind: GroupKindAggregate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, agg.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, agg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "own-1", 600)); err != nil {
+		t.Fatal(err)
+	}
+	var sourceGroup int64
+	if err := repo.db.QueryRowContext(ctx, `SELECT source_group_id FROM key_reservations WHERE request_id=?`, "own-1").Scan(&sourceGroup); err != nil {
+		t.Fatal(err)
+	}
+	if sourceGroup != agg.ID {
+		t.Fatalf("source_group_id = %d, want %d（自有渠道应记在聚合组自己头上）", sourceGroup, agg.ID)
 	}
 }

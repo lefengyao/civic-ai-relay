@@ -100,7 +100,7 @@ func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, 
 			UNION
 			SELECT gc.parent_group_id AS group_id, gp.provider_id AS provider_id
 				FROM group_compositions gc
-				JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1
+				JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
 				JOIN group_providers gp ON gp.group_id=gc.child_group_id
 		) eff ON eff.group_id=g.id
 		LEFT JOIN providers p ON p.id=eff.provider_id

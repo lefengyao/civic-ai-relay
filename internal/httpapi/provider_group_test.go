@@ -122,3 +122,25 @@ func TestAdminProvidersListCarriesGroupName(t *testing.T) {
 		t.Fatalf("渠道列表缺少归属组：%s", listed.Body.String())
 	}
 }
+
+// 对不存在的组改渠道必须是 404，而不是 400 + "group_invalid: sql: no rows in
+// result set"。后者既没说清是哪个组，也让调用方以为是自己传的参数有问题。
+func TestAdminGroupProvidersOnMissingGroupReturns404(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+	cases := []struct {
+		method string
+		body   map[string]any
+	}{
+		{http.MethodGet, nil},
+		{http.MethodPut, map[string]any{"provider_ids": []int64{}}},
+	}
+	for _, c := range cases {
+		resp := adminRequest(t, handler, c.method, "/admin/api/groups/9999/providers", adminKey, c.body)
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("%s 不存在的组 = %d: %s", c.method, resp.Code, resp.Body.String())
+		}
+		if strings.Contains(resp.Body.String(), "no rows in result set") {
+			t.Fatalf("%s 把 SQLite 原文抛给了运维：%s", c.method, resp.Body.String())
+		}
+	}
+}

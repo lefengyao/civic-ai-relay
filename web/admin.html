@@ -1076,9 +1076,11 @@ async function loadProviders() {
   // 加了「启用时段」后已经是 9 列，再宽下去操作按钮会被挤出可视区。
   // 「未加入分组」单独标记：这种渠道的模型不会被任何 Key 授权，最常见的
   // 「我明明配好了却调不通」就是它。
-  const groupChip = p => p.GroupName
+  // 归属分组是管理员视角的拓扑：密钥主体的接口里 GroupID/GroupName 已被抹空，
+  // 照着渲染会让每条渠道都挂一个假的「未加入分组」黄标（读起来像配置坏了）。
+  const groupChip = p => !isAdmin ? "" : (p.GroupName
     ? `<div style="color:var(--muted);font-size:12px;margin-top:2px">${esc(p.GroupName)}</div>`
-    : `<div style="margin-top:2px"><span class="tag warn" title="这条渠道不属于任何分组：它的模型不会被任何 Key 授权">未加入分组</span></div>`;
+    : `<div style="margin-top:2px"><span class="tag warn" title="这条渠道不属于任何分组：它的模型不会被任何 Key 授权">未加入分组</span></div>`);
   $("provider-data").innerHTML = `<table><thead><tr><th>ID</th><th>名称</th><th>协议</th>${urlHead}<th>Key</th><th>状态</th><th>启用时段</th><th>操作</th></tr></thead><tbody>` +
     cache.providers.map(p => `<tr>
       <td class="mono">${p.ID}</td><td class="provider-name"><b>${esc(p.Name)}</b>${groupChip(p)}</td><td><span class="tag">${esc(p.Protocol || "openai")}</span></td>${urlCell(p)}

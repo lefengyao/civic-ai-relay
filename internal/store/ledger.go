@@ -463,19 +463,25 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if groupKind != GroupKindAggregate {
 		return rollback(errors.New("client key is bound to a member group; only aggregate groups can serve"))
 	}
-	// 解析「这个模型由谁提供」并取出计价依据：聚合组先看自有渠道，没有再取
-	// id 最小的成员组（确定性优先）。
+	// 解析「这个模型由谁提供」并取出计价依据。
+	//
+	// v24 起一个渠道只属于一个组，所以「提供者」不需要再替它挑：直接读渠道的
+	// 归属组，再确认这个组要么就是本组（自有渠道），要么是本组的启用成员组。
+	// 旧写法是「自有渠道优先，否则取 MIN(child_group_id)」——那是多组归属时代
+	// 的消歧规则，现在只会返回一行，留着反而让后来者以为还有歧义。
+	//
 	// source_group_id 是「真正提供该模型的组」，额度要在它身上也扣一份——这是
 	// 老板明确要求的「两个组都扣」。它同时落库到 requests / key_reservations，
 	// 让成员组的概览与额度判定用同一口径。
 	var inputPrice, outputPrice, cachedPrice, rate sql.NullInt64
 	var sourceGroupID int64
 	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli,
-		CASE WHEN EXISTS(SELECT 1 FROM group_providers gp WHERE gp.group_id=g.id AND gp.provider_id=m.provider_id) THEN g.id
-			ELSE COALESCE((SELECT MIN(gc.child_group_id) FROM group_compositions gc
+		COALESCE((SELECT gp.group_id FROM group_providers gp
+			WHERE gp.provider_id=m.provider_id
+			  AND (gp.group_id=g.id OR EXISTS(
+				SELECT 1 FROM group_compositions gc
 				JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
-				JOIN group_providers gp2 ON gp2.group_id=gc.child_group_id AND gp2.provider_id=m.provider_id
-				WHERE gc.parent_group_id=g.id),0) END
+				WHERE gc.parent_group_id=g.id AND gc.child_group_id=gp.group_id))),0)
 		FROM models m JOIN providers p ON p.id=m.provider_id AND p.enabled=1 JOIN model_groups g ON g.id=? AND g.enabled=1
 		WHERE m.id=? AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL`, groupID, in.ModelID).
 		Scan(&inputPrice, &outputPrice, &cachedPrice, &rate, &sourceGroupID); err != nil {

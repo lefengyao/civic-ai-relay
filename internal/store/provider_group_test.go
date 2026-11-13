@@ -102,3 +102,39 @@ func TestListProvidersCarriesGroupOwnership(t *testing.T) {
 		t.Fatalf("移出后 = %#v, want 未归属", cleared)
 	}
 }
+
+// 改一条渠道（改名 / 改地址 / 换时段）之后，PUT 的响应仍要带出归属组。
+// 就地拼 Provider 字面量会把 GroupID/GroupName 留成零值，调用方拿到的对象看起来
+// 像「这条渠道刚掉出分组」——管理台因为会重拉列表看不出来，直接读响应的脚本会。
+func TestUpdateProviderResponseCarriesOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, _ := setupGroupScope(t)
+	group, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "夜间池"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, group.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+
+	newName := "up1-renamed"
+	updated, err := repo.UpdateProvider(ctx, providerID, UpdateProvider{Name: newName})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != newName {
+		t.Fatalf("name = %q, want %q", updated.Name, newName)
+	}
+	if updated.GroupID != group.ID || updated.GroupName != "夜间池" {
+		t.Fatalf("归属 = #%d/%q, want #%d/夜间池", updated.GroupID, updated.GroupName, group.ID)
+	}
+}
+
+// 组不存在时「改渠道」要报一句能看懂的中文，而不是把 sql.ErrNoRows 原样抛给运维。
+func TestReplaceGroupProvidersOnMissingGroup(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, _ := setupGroupScope(t)
+	if err := repo.ReplaceGroupProviders(ctx, 9999, []int64{providerID}); err == nil {
+		t.Fatal("不存在的组应当报错")
+	}
+}

@@ -388,9 +388,10 @@ func boolInt(v bool) int {
 // EffectiveProviderIDs 返回「这个组实际能用到的渠道」：自有渠道 ∪ 处于启用
 // 状态的成员组渠道，与授权口径（authorizedModelsSelect）一致。
 //
-// 与 GroupProviderIDs 的区别：后者是「本组自己挂的渠道」，只该用于编辑（把
-// 成员组渠道也当成自有渠道列进去，保存时会被写进 group_providers，等于把成员
-// 关系复制成一份，之后拆成员就会拆不干净）。而组作用域的管理视图必须用这一份，
+// 与 GroupProviderIDs 的区别：后者是「本组自己挂的渠道」，只该用于编辑。把
+// 成员组渠道也列进编辑页会诱导运维把它们保存成自有渠道——v24 之后一个渠道只
+// 属于一个组，这样保存会被后端直接拒绝（provider_in_use），而在 v24 之前则会
+// 静默复制出一份归属，拆成员关系时拆不干净。组作用域的管理视图必须用这一份，
 // 否则聚合组的使用者只看到聚合组自己挂的渠道，成员组带来的渠道像是凭空消失。
 func (s *Store) EffectiveProviderIDs(ctx context.Context, groupID int64) ([]int64, error) {
 	if groupID <= 0 {
@@ -399,7 +400,7 @@ func (s *Store) EffectiveProviderIDs(ctx context.Context, groupID int64) ([]int6
 	rows, err := s.db.QueryContext(ctx, `SELECT provider_id FROM group_providers WHERE group_id=?
 		UNION
 		SELECT gp.provider_id FROM group_compositions gc
-			JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1
+			JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
 			JOIN group_providers gp ON gp.group_id=gc.child_group_id
 			WHERE gc.parent_group_id=?
 		ORDER BY 1`, groupID, groupID)
@@ -847,7 +848,7 @@ func (s *Store) ReplaceGroupProviders(ctx context.Context, groupID int64, provid
 		return err
 	}
 	if groupEnabled != 1 {
-		return errors.New("model group is disabled")
+		return errors.New("分组已停用，启用后才能调整渠道")
 	}
 	seen := make(map[int64]struct{}, len(providerIDs))
 	names := make(map[int64]string, len(providerIDs))
@@ -889,6 +890,12 @@ func (s *Store) ReplaceGroupProviders(ctx context.Context, groupID int64, provid
 					return conflict
 				}
 			}
+			// 另一种并发形态：预检时拿的是旧快照，写的时候另一个连接已经提交，
+			// WAL 下这里报的是 SQLITE_BUSY（"database is locked"），不是唯一约束。
+			// 同样是「有人同时改分组」，给一句能照着做的中文，别让运维去搜英文。
+			if isBusyError(err) {
+				return errors.New("保存冲突：另一个操作正在同时修改分组或渠道，请稍后重试")
+			}
 			return err
 		}
 	}
@@ -908,4 +915,17 @@ func checkProviderUnowned(ctx context.Context, q rowQuerier, groupID, providerID
 		return err
 	}
 	return &ProviderGroupConflict{ProviderID: providerID, ProviderName: providerName, GroupID: ownerID, GroupName: ownerName}
+}
+
+// isBusyError 识别 SQLite 的写-写冲突（SQLITE_BUSY / SQLITE_LOCKED）。WAL 下
+// 事务先读后写时，如果读到的快照已被别的连接提交打断，报的是 "database is
+// locked" 而不是唯一约束——它同样是「有人同时在改」，但对运维来说完全不可读。
+func isBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "sqlite_busy")
 }

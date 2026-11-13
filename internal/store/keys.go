@@ -549,7 +549,7 @@ func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (in
 	err := s.db.QueryRowContext(ctx, `SELECT g.rate_milli FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 AND g.kind='aggregate' WHERE k.id=? AND EXISTS (
 		SELECT 1 FROM models m WHERE m.id=? AND (
 			EXISTS(SELECT 1 FROM group_providers gp WHERE gp.group_id=g.id AND gp.provider_id=m.provider_id)
-			OR EXISTS(SELECT 1 FROM group_compositions gc JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 JOIN group_providers gp2 ON gp2.group_id=gc.child_group_id WHERE gc.parent_group_id=g.id AND gp2.provider_id=m.provider_id)
+			OR EXISTS(SELECT 1 FROM group_compositions gc JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal' JOIN group_providers gp2 ON gp2.group_id=gc.child_group_id WHERE gc.parent_group_id=g.id AND gp2.provider_id=m.provider_id)
 		)
 	)`, keyID, modelID).Scan(&rate)
 	if err != nil {
@@ -687,7 +687,7 @@ const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name
 	UNION
 	SELECT gc.parent_group_id AS group_id, gp.provider_id AS provider_id
 		FROM group_compositions gc
-		JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1
+		JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
 		JOIN group_providers gp ON gp.group_id=gc.child_group_id
 ) eff ON eff.group_id=g.id JOIN models m ON m.provider_id=eff.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
 

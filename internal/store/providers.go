@@ -273,10 +273,13 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 	if s.providerCacheEvict != nil && (rotated || baseURL != currentURL || protocol != currentProtocol) {
 		s.providerCacheEvict(id)
 	}
-	updated := Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: enabled == 1, APIKeyConfigured: s.providerConfigured(ciphertext),
-		ScheduleMode: scheduleMode, ScheduleStartUTC: scheduleStart, ScheduleEndUTC: scheduleEnd,
-		ScheduleStartMinute: scheduleStartMinute, ScheduleEndMinute: scheduleEndMinute, ScheduleWeekdays: scheduleWeekdays}
-	updated.ScheduleActive = updated.ActiveAt(time.Now())
+	// 回查一次而不是就地拼字面量：Provider 现在还带「归属分组」（v24），就地拼
+	// 会把 GroupID/GroupName 留成零值，PUT 的响应于是告诉调用方「这条渠道掉出了
+	// 分组」——管理台靠 loadProviders 重拉不会出错，但直接用 API 的调用方会误判。
+	updated, err := s.GetProvider(ctx, id)
+	if err != nil {
+		return Provider{}, err
+	}
 	return updated, nil
 }
 

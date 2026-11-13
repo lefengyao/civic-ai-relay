@@ -1357,6 +1357,18 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 		}
 	}
 	if len(parts) == 2 && parts[1] == "providers" {
+		// 先判组是否存在：ReplaceGroupProviders 的第一条 SELECT 直接落在
+		// model_groups 上，组缺失时 sql.ErrNoRows 会被包成「group_invalid:
+		// sql: no rows in result set」丢给运维——既不是 404 也没说清是哪个组。
+		// GET 同理：不存在的组不该回一个「0 个渠道」的假成功。
+		if _, err := h.repo.GetModelGroup(r.Context(), id); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeAdminError(w, 404, "not_found")
+				return
+			}
+			writeAdminError(w, 500, "store_error")
+			return
+		}
 		if r.Method == http.MethodGet {
 			ids, err := h.repo.GroupProviderIDs(r.Context(), id)
 			if err != nil {
