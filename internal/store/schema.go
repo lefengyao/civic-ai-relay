@@ -401,6 +401,24 @@ var migrations = []migration{
 		`CREATE INDEX idx_requests_source_group_time ON requests(source_group_id, created_at_utc)`,
 		`CREATE INDEX idx_key_reservations_source_group_time ON key_reservations(source_group_id, created_at_utc)`,
 	}},
+	// v23：把「只有聚合组能对外」这条规则落到既有数据上。
+	//
+	// v22 里两个类型都能被 Key 绑定，于是不存在「成员组 vs 可调用组」的区别；升级
+	// 上来之后如果不动数据，所有既有组都会变成成员组——它们本来是对外的组，会突然
+	// 一把 Key 都调不动。所以这里把**没有被任何聚合组包含**的 normal 组改成
+	// aggregate：它们历史上就是独立对外的组，语义不变。
+	//
+	// 只有「已经是某个聚合组成员」的 normal 组保留成员身份。这种组如果历史上还绑着
+	// Key（v22 允许），那把 Key 升级后确实调不动了——这是规则收紧的必然结果，管理台
+	// 的 Key 列表会标出来，改绑到聚合组即可恢复。没有密钥的成员组不受任何影响。
+	//
+	// 结构上没有变更（kind 列 v22 就有），所以不需要 ALTER：这条 UPDATE 只是给旧行
+	// 补上正确语义，新库执行时表里还没有任何组，等于空操作。
+	{version: 23, statements: []string{
+		`UPDATE model_groups SET kind='aggregate'
+			WHERE kind='normal'
+			  AND id NOT IN (SELECT child_group_id FROM group_compositions)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

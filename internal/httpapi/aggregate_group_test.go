@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -24,7 +25,7 @@ type groupPayload struct {
 func TestAdminAggregateGroupCreateAndList(t *testing.T) {
 	handler, adminKey := adminFixture(t)
 
-	member := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey, map[string]any{"name": "成员组"})
+	member := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey, map[string]any{"name": "成员组", "kind": "normal"})
 	if member.Code != http.StatusCreated {
 		t.Fatalf("member create = %d: %s", member.Code, member.Body.String())
 	}
@@ -78,9 +79,10 @@ func TestAdminAggregateGroupCreateAndList(t *testing.T) {
 		t.Fatal("列表里找不到刚建的聚合组")
 	}
 
-	// 普通组带成员必须被拒，且不能留下半成品。
+	// 成员组带成员必须被拒，且不能留下半成品（kind 必须显式写 normal：
+	// 不传 kind 现在按可对外的聚合组处理）。
 	bad := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey, map[string]any{
-		"name": "错误组", "group_ids": []int64{memberBody.Data.ID},
+		"name": "错误组", "kind": "normal", "group_ids": []int64{memberBody.Data.ID},
 	})
 	if bad.Code != http.StatusBadRequest {
 		t.Fatalf("普通组带成员 = %d，期望 400: %s", bad.Code, bad.Body.String())
@@ -110,7 +112,8 @@ func TestAdminAggregateGroupMembersPut(t *testing.T) {
 		}
 		return out.Data.ID
 	}
-	plain := newGroup("普通", "")
+	// 空 kind 现在按 aggregate（可对外）处理，成员组必须显式声明 normal。
+	plain := newGroup("普通", "normal")
 	inner := newGroup("内层聚合", "aggregate")
 	outer := newGroup("外层聚合", "aggregate")
 
@@ -151,5 +154,50 @@ func TestAdminAggregateGroupMembersPut(t *testing.T) {
 	}
 	if len(after.Data) != 1 || after.Data[0].ID != plain {
 		t.Fatalf("失败写入后成员关系被破坏：%+v", after.Data)
+	}
+}
+
+// v23：Key 只能绑聚合组。绑成员组必须 400，并且错误码要能让运维直接看懂
+// 「该换组类型」——只回 key_invalid 会被当成名字/并发没填对。
+func TestAdminKeyGroupRejectsMemberGroup(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+
+	member := adminRequest(t, handler, http.MethodPost, "/admin/api/groups", adminKey, map[string]any{"name": "成员组", "kind": "normal"})
+	if member.Code != http.StatusCreated {
+		t.Fatalf("create member = %d: %s", member.Code, member.Body.String())
+	}
+	var memberBody struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(member.Body.Bytes(), &memberBody); err != nil {
+		t.Fatal(err)
+	}
+
+	keyResp := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey, map[string]any{"name": "k", "max_concurrency": 1})
+	if keyResp.Code != http.StatusCreated {
+		t.Fatalf("create key = %d: %s", keyResp.Code, keyResp.Body.String())
+	}
+	var keyBody struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(keyResp.Body.Bytes(), &keyBody); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := adminRequest(t, handler, http.MethodPut, "/admin/api/keys/"+itoa(keyBody.Data.ID)+"/group", adminKey, map[string]any{"group_id": memberBody.Data.ID})
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("绑成员组 = %d，期望 400: %s", bad.Code, bad.Body.String())
+	}
+	if !strings.Contains(bad.Body.String(), "group_not_callable") {
+		t.Fatalf("错误码应为 group_not_callable，实际 %s", bad.Body.String())
+	}
+	// 创建时直接带 group_id 也要拦住，不能留下「建好了但绑错」的 Key。
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/keys", adminKey, map[string]any{"name": "k2", "max_concurrency": 1, "group_id": memberBody.Data.ID})
+	if created.Code != http.StatusBadRequest || !strings.Contains(created.Body.String(), "group_not_callable") {
+		t.Fatalf("创建即绑成员组 = %d: %s", created.Code, created.Body.String())
 	}
 }

@@ -456,7 +456,14 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	if groupID == 0 {
 		return rollback(errors.New("model is not authorized for key"))
 	}
-	// 解析「这个模型由谁提供」并取出计价依据。普通组只有自己的渠道；
+	// 只有聚合组对外（v23）。正常流程走不到这里——成员组绑不上 Key，就算历史数据
+	// 里有这种绑定，authorizedModelsSelect 也不会返回任何模型，请求在更早的
+	// Begin 就被判成 ErrModelNotAllowed 了。留着是为了让「成员组不对外」这条规则
+	// 在**记账**这一层也成立：额度、账目、上游都不该为一次非法调用动起来。
+	if groupKind != GroupKindAggregate {
+		return rollback(errors.New("client key is bound to a member group; only aggregate groups can serve"))
+	}
+	// 解析「这个模型由谁提供」并取出计价依据。聚合组先看自有渠道；
 	// 聚合组先看自有渠道，没有再看成员组（取 id 最小的成员，确定性优先）。
 	// source_group_id 是「真正提供该模型的组」，额度要在它身上也扣一份——这是
 	// 老板明确要求的「两个组都扣」。它同时落库到 requests / key_reservations，

@@ -359,6 +359,18 @@ func writeAdminError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message}})
 }
 
+// writeKeyGroupError 把「分组不能承载 Key」和「其它绑定失败」分开返回。
+//
+// v23 起 Key 只能绑聚合组：选到成员组是最常见的一类操作失误，如果只回一个
+// key_invalid，运维会以为是 Key 名字/并发填错了，完全想不到要换组类型。
+func writeKeyGroupError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrGroupNotCallable) {
+		writeAdminErrorDetail(w, http.StatusBadRequest, "group_not_callable", err.Error())
+		return
+	}
+	writeAdminErrorDetail(w, http.StatusBadRequest, "key_invalid", err.Error())
+}
+
 // writeAdminErrorDetail 在管理端错误结构上附加具体原因，形状与 json.go 的
 // writeErrorDetail 一致（message 带原因、code 保持稳定），但不带 relay_error
 // 的 type —— 那是面向上游客户端的标记，不属于管理台。
@@ -1100,6 +1112,7 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 			"ID": g.ID, "Name": g.Name, "Kind": g.Kind, "Enabled": g.Enabled, "RateMilli": g.RateMilli,
 			"BoundKeys":       g.BoundKeys,
 			"Providers":       g.Providers,
+			"ParentCount":     g.ParentCount,
 			"Members":         members,
 			"MemberIDs":       memberIDs,
 			"TokenLimit5H":    g.TokenLimit5H,
@@ -1406,7 +1419,7 @@ func (h *AdminHandler) keyCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		writeAdminError(w, 400, "key_invalid")
+		writeKeyGroupError(w, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"data": k, "token": k.Token})
@@ -1534,7 +1547,7 @@ func (h *AdminHandler) keyItem(w http.ResponseWriter, r *http.Request, raw strin
 				return
 			}
 			if err := h.repo.SetKeyGroup(r.Context(), id, p.GroupID); err != nil {
-				writeAdminError(w, 400, "key_invalid")
+				writeKeyGroupError(w, err)
 				return
 			}
 			writeJSON(w, 200, map[string]any{"ok": true})

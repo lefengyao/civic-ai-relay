@@ -480,8 +480,14 @@ func TestReapStaleReservationsReleasesQuotaAndConcurrency(t *testing.T) {
 		t.Fatalf("reaped = %d, want 1", reaped)
 	}
 	// 槽位与 5h 配额均已释放：新请求可用
-	if _, err := repo.ReserveRequest(context.Background(), newReservationArgs(key.ID, model.ID, "request-after-reap", 10)); err != nil {
+	fresh, err := repo.ReserveRequest(context.Background(), newReservationArgs(key.ID, model.ID, "request-after-reap", 10))
+	if err != nil {
 		t.Fatalf("quota/concurrency not released: %v", err)
+	}
+	// 先把它结算掉，再看重复回收：否则这行本身就是「刚建立、还没结束」的预留，
+	// 机器一忙就会超过 10ms 的陈旧阈值被回收掉，让断言随机失败（曾经就是这样抖的）。
+	if err := repo.SettleRequest(context.Background(), fresh.ID, 5, 5, 0, 0, "completed"); err != nil {
+		t.Fatal(err)
 	}
 	// 重复回收不应再次命中
 	if again, err := repo.ReapStaleReservations(context.Background(), 10*time.Millisecond); err != nil || again != 0 {

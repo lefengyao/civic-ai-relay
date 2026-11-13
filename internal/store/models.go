@@ -43,22 +43,33 @@ type UpdateModel struct {
 	Enabled                   *bool
 }
 
-// 分组类型（v22）。normal = 自己直接挂渠道；aggregate = 聚合组，除自有渠道外
-// 还可以包含若干普通模型组，合并它们的渠道与模型。聚合组只允许包含 normal 组，
-// 不支持多层嵌套（避免环与额度归属的递归歧义）。
+// 分组类型（v22 引入，v23 收紧语义）。
+//
+//   - normal（成员组）：只有「渠道 + 独立额度」，**不对外**——不能被客户端 Key
+//     绑定，也不参与任何请求的授权。它的全部意义是作为成员被聚合组包含。
+//   - aggregate（聚合组）：唯一可对外的一类组。除自有渠道外还能包含若干成员组，
+//     合并它们的渠道与模型；Key 只能绑定聚合组。只允许一层（聚合组不能包含聚合
+//     组），避免环与额度归属的递归歧义。
+//
+// 这样拆开是为了消除「两个组都能被 Key 绑定，到底扣谁的额度」的混淆：对外永远
+// 只有聚合组，成员组只是「有自己额度的供应商」。
 const (
 	GroupKindNormal    = "normal"
 	GroupKindAggregate = "aggregate"
 )
 
-// NormalizeGroupKind 把外部输入收敛成合法值；空串按 normal 处理，保持旧调用点
-// （不传 kind 的 API 调用方）行为不变。
+// NormalizeGroupKind 把外部输入收敛成合法值。
+//
+// 空串按 aggregate 处理：**可对外是默认，成员组必须显式声明**。理由是误建一个
+// 成员组的代价更大——它建出来什么都能配（渠道、额度、倍率），却永远接不到请求，
+// 排查时非常难看出「只是组类型选错了」。反过来，误建一个空聚合组在列表里一眼
+// 就能看到「未包含任何组、0 个渠道」。
 func NormalizeGroupKind(kind string) (string, error) {
 	switch strings.TrimSpace(strings.ToLower(kind)) {
-	case "", GroupKindNormal:
-		return GroupKindNormal, nil
-	case GroupKindAggregate:
+	case "", GroupKindAggregate:
 		return GroupKindAggregate, nil
+	case GroupKindNormal:
+		return GroupKindNormal, nil
 	default:
 		return "", fmt.Errorf("未知的分组类型 %q（只支持 normal / aggregate）", kind)
 	}
@@ -85,11 +96,15 @@ type ModelGroup struct {
 	// UpdateModelGroup 自动填 now（沿用 internal/config/settings.go 的既有行为）。
 	PeriodLimitStart *string
 	// BoundKeys 绑定到本组的客户端密钥数。删组前要让运维看到影响面。
+	// 成员组恒为 0：Key 只能绑聚合组（v23）。
 	BoundKeys int64
-	// Members / MemberIDs 仅在聚合组上非空：它包含的普通模型组。
+	// ParentCount 是「包含本组的聚合组数量」。成员组靠它说明自己还有没有被用到；
+	// 聚合组恒为 0（聚合组不能作为成员）。
+	ParentCount int
+	// Members / MemberIDs 仅在聚合组上非空：它包含的成员组。
 	MemberIDs []int64
 	Members   []ModelGroupBrief
-	// Providers 是组「自己能直接用的渠道数」：普通组 = 自己挂的渠道，聚合组
+	// Providers 是组「自己能直接用的渠道数」：成员组 = 自己挂的渠道，聚合组
 	// 只算自有渠道，不含成员组带来的（成员组各自有计数）。
 	Providers int
 }
@@ -108,7 +123,8 @@ type NewModelGroup struct {
 	Name      string
 	Enabled   bool
 	RateMilli int64 // 0 视为默认 1000
-	// Kind 为空按 normal；aggregate 时 GroupIDs 是成员组。
+	// Kind 为空按 aggregate（可对外）；aggregate 时 GroupIDs 是成员组，
+	// normal（成员组）不允许带 GroupIDs。
 	Kind     string
 	GroupIDs []int64
 }
@@ -599,7 +615,7 @@ func (s *Store) AggregatesContaining(ctx context.Context, groupID int64) ([]Mode
 }
 
 func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id) FROM model_groups g ORDER BY g.id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id),(SELECT count(*) FROM group_compositions gc WHERE gc.child_group_id=g.id) FROM model_groups g ORDER BY g.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -612,11 +628,12 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 		var enabled int
 		var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
 		var ps sql.NullString
-		var bound, providers int64
-		if err := rows.Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers); err != nil {
+		var bound, providers, parents int64
+		if err := rows.Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers, &parents); err != nil {
 			return nil, err
 		}
 		g.Enabled = enabled == 1
+		g.ParentCount = int(parents)
 		g.TokenLimit5H, g.AmountLimit5H = nullableInt(t5h), nullableInt(a5h)
 		g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
 		g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
@@ -679,13 +696,14 @@ func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error)
 	var enabled int
 	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
 	var ps sql.NullString
-	var bound, providers int64
-	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
-		Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers)
+	var bound, providers, parents int64
+	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id),(SELECT count(*) FROM group_compositions gc WHERE gc.child_group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
+		Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers, &parents)
 	if err != nil {
 		return ModelGroup{}, err
 	}
 	g.Enabled = enabled == 1
+	g.ParentCount = int(parents)
 	g.TokenLimit5H, g.AmountLimit5H = nullableInt(t5h), nullableInt(a5h)
 	g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
 	g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)

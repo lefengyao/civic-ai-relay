@@ -17,6 +17,13 @@ import (
 // 后者是凭据本身不对，混在一起会让调用方一直重试一个永远不会好的请求。
 var ErrClientKeyExpired = errors.New("client key expired")
 
+// ErrGroupNotCallable 表示「这个分组是成员组，不能绑定 Key」（v23）。
+//
+// 成员组只是「带自己额度的渠道池」，它的全部意义是被聚合组包含；对外提供服务
+// 的永远是聚合组。这里用哨兵错误，是为了让管理端能把「组类型不对」和「组不存在/
+// 已停用」分开返回——前者要引导运维去建聚合组，后者是选错了 ID。
+var ErrGroupNotCallable = errors.New("成员组不能直接对外提供服务，Key 只能绑定聚合模型组")
+
 type ClientKey struct {
 	ID                   int64
 	Name                 string
@@ -452,7 +459,8 @@ func (s *Store) UpdateClientKey(ctx context.Context, id int64, in UpdateClientKe
 }
 
 // SetKeyGroup 把密钥绑到唯一分组，groupID <= 0 表示解绑（授权模型随即为空）。
-// 组必须存在且启用。
+// 组必须存在、启用，且必须是**聚合组**（v23）：成员组不对外，绑上去等于把 Key
+// 扔进一个永远拿不到模型的状态，所以在写入时就挡住，而不是让它静默失效。
 func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 	if keyID <= 0 {
 		return errors.New("key ID is required")
@@ -471,11 +479,15 @@ func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 	}
 	if groupID > 0 {
 		var enabled int
-		if err := tx.QueryRowContext(ctx, `SELECT enabled FROM model_groups WHERE id=?`, groupID).Scan(&enabled); err != nil {
+		var kind string
+		if err := tx.QueryRowContext(ctx, `SELECT enabled,kind FROM model_groups WHERE id=?`, groupID).Scan(&enabled, &kind); err != nil {
 			return err
 		}
 		if enabled != 1 {
 			return fmt.Errorf("group %d is disabled", groupID)
+		}
+		if kind != GroupKindAggregate {
+			return fmt.Errorf("%w（#%d 是成员组）", ErrGroupNotCallable, groupID)
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE client_keys SET group_id=?, updated_at_utc=? WHERE id=?`, groupID, nowUTC(), keyID)
 	} else {
@@ -490,12 +502,20 @@ func (s *Store) SetKeyGroup(ctx context.Context, keyID, groupID int64) error {
 // KeyModelRateMilli returns the billing rate multiplier (in thousandths, 1000 = 1.0x)
 // for a model under the key's single group. Falls back to the default rate when the
 // key has no group, the group is disabled, or the model's provider is not in it.
+//
+// 渠道来源与授权口径一致（v22）：聚合组既认自有渠道，也认成员组的渠道，否则
+// 从成员组来的模型会被算回默认倍率，和预留事务里的报价（永远取绑定组的倍率）打架。
 func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (int64, error) {
 	if keyID <= 0 || modelID <= 0 {
 		return DefaultGroupRateMilli, errors.New("key and model IDs are required")
 	}
 	var rate sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT g.rate_milli FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN group_providers gp ON gp.group_id=g.id JOIN models m ON m.id=? AND m.provider_id=gp.provider_id WHERE k.id=?`, modelID, keyID).Scan(&rate)
+	err := s.db.QueryRowContext(ctx, `SELECT g.rate_milli FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 AND g.kind='aggregate' WHERE k.id=? AND EXISTS (
+		SELECT 1 FROM models m WHERE m.id=? AND (
+			EXISTS(SELECT 1 FROM group_providers gp WHERE gp.group_id=g.id AND gp.provider_id=m.provider_id)
+			OR EXISTS(SELECT 1 FROM group_compositions gc JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 JOIN group_providers gp2 ON gp2.group_id=gc.child_group_id WHERE gc.parent_group_id=g.id AND gp2.provider_id=m.provider_id)
+		)
+	)`, keyID, modelID).Scan(&rate)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DefaultGroupRateMilli, nil
@@ -616,15 +636,17 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 // Key 的唯一所属分组（client_keys.group_id，NULL = 未绑）→ 该分组可用的渠道 →
 // 渠道下已启用且已定价的模型 → 渠道本身启用。
 //
-// 渠道来源按分组类型区分（v22）：
-//   - normal：只有 group_providers 里自己挂的渠道；
-//   - aggregate：自己的渠道 **加上** 它包含的、处于启用状态的成员组的渠道
-//     （group_compositions）。只允许一层，成员关系在写入时已校验必须是 normal，
-//     所以这里不需要递归 CTE。
+// 分组类型（v23）：**只有聚合组能对外**。成员组（kind=normal）只是带额度的渠道
+// 池，即使历史上有一把 Key 绑在它上面，这里也必须查不出任何模型 —— 否则「成员组
+// 不能对外」就只写在文档里，实际转发路径仍会放行。
+//
+// 渠道来源：聚合组自己的渠道 **加上** 它包含的、处于启用状态的成员组的渠道
+// （group_compositions）。只允许一层，成员关系在写入时已校验必须是 normal，
+// 所以这里不需要递归 CTE。
 //
 // 公共 /v1/models 与管理端「接入信息」共用这一份 SQL，避免两处判断漂移出
 // 「客户端报 404、管理台却显示已授权」这类最难查的问题。
-const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 JOIN (
+const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 AND g.kind='aggregate' JOIN (
 	SELECT gp.group_id AS group_id, gp.provider_id AS provider_id FROM group_providers gp
 	UNION
 	SELECT gc.parent_group_id AS group_id, gp.provider_id AS provider_id

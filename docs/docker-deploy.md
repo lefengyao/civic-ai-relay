@@ -37,7 +37,7 @@ docker compose exec civic-relay cat /app/config/bootstrap-admin-key.txt
 docker compose exec civic-relay rm /app/config/bootstrap-admin-key.txt
 ```
 
-拿到管理员密钥后访问 `http://127.0.0.1:8000/admin`，依次添加供应商（渠道）→ 拉取/添加模型并定价 → 建模型组挂渠道 → 创建客户端 Key。
+拿到管理员密钥后访问 `http://127.0.0.1:8000/admin`，依次添加供应商（渠道）→ 拉取/添加模型并定价 → 建成员组挂渠道 → 建聚合模型组并包含该成员组 → 创建客户端 Key 并绑定这个聚合组（只有聚合组对外）。
 
 端口默认绑定所有网卡（`0.0.0.0:8000`，等价 `8000:8000`），局域网内其他设备用 `http://<本机IP>:8000/admin` 访问；只允许本机访问时设 `CIVIC_RELAY_BIND=127.0.0.1`。
 

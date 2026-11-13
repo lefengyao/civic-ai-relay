@@ -156,3 +156,46 @@ func TestMigrationV16BackfillPicksHighestRate(t *testing.T) {
 		}
 	}
 }
+
+// v23 的语义补丁：升级时把「没有被任何聚合组包含」的 normal 组改成 aggregate。
+//
+// 不这么做的话，老库升级后每个既有组都会变成成员组（v23 之前 normal 就是对外
+// 服务的组），所有 Key 会同时失效；这种「升级完整个服务不通」的故障代价远高于
+// 「个别预留成员组被当成独立组」。被聚合组包含的 normal 组保留成员身份。
+func TestMigrationV23PromotesStandaloneNormalGroups(t *testing.T) {
+	db := openLegacyV15(t)
+	for v := 16; v <= 22; v++ {
+		applyMigration(db, t, v)
+	}
+	const ts = `'2026-01-01T00:00:00Z'`
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	mustExec(`INSERT INTO model_groups(id,name,kind,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (1,'standalone','normal',1,1000,` + ts + `,` + ts + `)`)
+	mustExec(`INSERT INTO model_groups(id,name,kind,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (2,'member','normal',1,1000,` + ts + `,` + ts + `)`)
+	mustExec(`INSERT INTO model_groups(id,name,kind,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (3,'owner','aggregate',1,1000,` + ts + `,` + ts + `)`)
+	mustExec(`INSERT INTO group_compositions(parent_group_id,child_group_id) VALUES (3,2)`)
+
+	applyMigration(db, t, 23)
+
+	kindOf := func(id int64) string {
+		t.Helper()
+		var kind string
+		if err := db.QueryRow(`SELECT kind FROM model_groups WHERE id=?`, id).Scan(&kind); err != nil {
+			t.Fatal(err)
+		}
+		return kind
+	}
+	if got := kindOf(1); got != "aggregate" {
+		t.Fatalf("独立组 kind = %q, want aggregate", got)
+	}
+	if got := kindOf(2); got != "normal" {
+		t.Fatalf("成员组 kind = %q, want normal", got)
+	}
+	if got := kindOf(3); got != "aggregate" {
+		t.Fatalf("聚合组 kind = %q, want aggregate", got)
+	}
+}

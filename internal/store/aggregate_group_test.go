@@ -2,13 +2,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
 
-// v22 之前建立的组没有 kind 列，升级后必须一律是 normal——聚合是新建能力，
-// 不能让任何既有组因为默认值被当成「包含 0 个成员」，否则其可用模型会全空。
+// v22 的 kind 列必须有默认值，老库升级后才能读出来（聚合是 v22 新建的能力，
+// 不能让任何既有组因为列缺失而被当成「包含 0 个成员」，否则其可用模型会全空）。
+// 注意 v23 会把「没有被任何聚合组包含」的 normal 组改成 aggregate —— 那是语义
+// 收紧的补丁，与这里的列默认值不是一回事：列默认值保证能读，v23 保证能对外。
 func TestMigrationV22DefaultsToNormal(t *testing.T) {
 	repo, providerID, _ := setupGroupScope(t)
 	ctx := context.Background()
@@ -44,7 +47,7 @@ func TestMigrationV22DefaultsToNormal(t *testing.T) {
 func TestAggregateGroupAuthorizesMemberModels(t *testing.T) {
 	ctx := context.Background()
 	repo, providerID, modelID := setupGroupScope(t)
-	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member"})
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +101,7 @@ func TestAggregateGroupRejectsNestedAggregate(t *testing.T) {
 		t.Fatal("聚合组包含自己必须被拒绝")
 	}
 	// 普通组不能声明成员（前端选错类型时也要在服务端挡住）。
-	if _, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "plain", GroupIDs: []int64{inner.ID}}); err == nil {
+	if _, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "plain", Kind: GroupKindNormal, GroupIDs: []int64{inner.ID}}); err == nil {
 		t.Fatal("普通模型组带成员必须被拒绝")
 	}
 }
@@ -108,7 +111,7 @@ func TestAggregateGroupRejectsNestedAggregate(t *testing.T) {
 func TestAggregateGroupMemberQuotaAlsoBlocks(t *testing.T) {
 	ctx := context.Background()
 	repo, providerID, modelID := setupGroupScope(t)
-	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member"})
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,7 @@ func TestAggregateGroupMemberQuotaAlsoBlocks(t *testing.T) {
 func TestAggregateGroupUsageVisibleOnMember(t *testing.T) {
 	ctx := context.Background()
 	repo, providerID, modelID := setupGroupScope(t)
-	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member"})
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +224,7 @@ func TestAggregateGroupUsageVisibleOnMember(t *testing.T) {
 func TestAggregateGroupPrefersOwnProvider(t *testing.T) {
 	ctx := context.Background()
 	repo, providerID, modelID := setupGroupScope(t)
-	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member"})
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +261,7 @@ func TestAggregateGroupPrefersOwnProvider(t *testing.T) {
 func TestAggregateGroupSkipsDisabledMember(t *testing.T) {
 	ctx := context.Background()
 	repo, providerID, modelID := setupGroupScope(t)
-	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member"})
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,5 +294,106 @@ func TestAggregateGroupSkipsDisabledMember(t *testing.T) {
 	}
 	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "disabled-1", 600)); err == nil || !strings.Contains(err.Error(), "not authorized") {
 		t.Fatalf("停用成员组后预留应拒绝，实际 %v", err)
+	}
+}
+
+// v23：成员组不对外。绑 Key 必须在写入时就被拒，而不是绑上去以后「静默没有模型」。
+func TestMemberGroupCannotBeBoundToKey(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, _ := setupGroupScope(t)
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, member.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = repo.SetKeyGroup(ctx, key.ID, member.ID)
+	if !errors.Is(err, ErrGroupNotCallable) {
+		t.Fatalf("绑成员组 err = %v, want ErrGroupNotCallable", err)
+	}
+	// 拒绝之后不能留下「已绑上」的半成品。
+	stored, err := repo.GetClientKey(ctx, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.GroupID != nil {
+		t.Fatalf("绑定失败却写入了 group_id = %d", *stored.GroupID)
+	}
+}
+
+// v23：即使历史数据里已经有「Key 绑在成员组」的脏绑定，转发链路的两个出口
+// （授权 SQL / 预留事务）也都不许放行 —— 规则要落在读路径上，不能只靠写路径拦。
+func TestMemberGroupServesNothingEvenIfLegacyBinding(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, member.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 绕过 SetKeyGroup 的校验，模拟从 v22 升级上来的数据。
+	if _, err := repo.db.ExecContext(ctx, `UPDATE client_keys SET group_id=? WHERE id=?`, member.ID, key.ID); err != nil {
+		t.Fatal(err)
+	}
+	models, err := repo.UsableModelsForKey(ctx, key.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 0 {
+		t.Fatalf("成员组不应该授权任何模型，实际 %#v", models)
+	}
+	if _, err := repo.ReserveRequest(ctx, newReservationArgs(key.ID, modelID, "legacy-member-1", 600)); err == nil {
+		t.Fatal("成员组上的 Key 不允许产生预留")
+	}
+	// 记账也不能被动过：拒绝发生在写账目之前。
+	var rows int
+	if err := repo.db.QueryRowContext(ctx, `SELECT count(*) FROM key_reservations WHERE request_id=?`, "legacy-member-1").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("被拒的请求仍写入了 %d 行账目", rows)
+	}
+}
+
+// 聚合组的倍率要对**成员组提供的模型**同样生效。曾经这里只查自有渠道，
+// 从成员组来的模型会掉回默认倍率，与预留事务里的报价（永远取绑定组的倍率）打架。
+func TestAggregateRateAppliesToMemberModels(t *testing.T) {
+	ctx := context.Background()
+	repo, providerID, modelID := setupGroupScope(t)
+	member, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "member", Kind: GroupKindNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceGroupProviders(ctx, member.ID, []int64{providerID}); err != nil {
+		t.Fatal(err)
+	}
+	agg, err := repo.CreateModelGroup(ctx, NewModelGroup{Name: "agg", Kind: GroupKindAggregate, RateMilli: 1500, GroupIDs: []int64{member.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := repo.CreateClientKey(ctx, NewClientKey{Name: "k", ConcurrencyLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, key.ID, agg.ID); err != nil {
+		t.Fatal(err)
+	}
+	rate, err := repo.KeyModelRateMilli(ctx, key.ID, modelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate != 1500 {
+		t.Fatalf("rate = %d, want 1500（聚合组倍率）", rate)
 	}
 }
