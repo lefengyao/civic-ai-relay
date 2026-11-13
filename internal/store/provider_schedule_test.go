@@ -317,3 +317,336 @@ func openLegacyAt(t *testing.T, version int) *sql.DB {
 	}
 	return db
 }
+
+// multiWindowSchedule 给每段套同一份星期——只有在「所有段星期相同」时，
+// 才等价于一个全局星期。
+// sw 是测试里的时段简写。ScheduleWindow 有第三字段（每段自己的星期），
+// 位置式字面量读起来太吵；默认「每天」，与归一化后未指定星期的结果一致。
+func sw(startMinute, endMinute int) ScheduleWindow {
+	return ScheduleWindow{StartMinute: startMinute, EndMinute: endMinute, Weekdays: providerWeekdaysAll}
+}
+
+func multiWindowSchedule(weekdays int, windows ...ScheduleWindow) ProviderSchedule {
+	for i := range windows {
+		windows[i].Weekdays = weekdays
+	}
+	return ProviderSchedule{Mode: ProviderScheduleDaily, Weekdays: weekdays, Windows: windows}
+}
+
+// v25：一天里可以有多个窗口，「夜间 + 午休」不用再拆成两条渠道。
+func TestProviderScheduleMultipleWindowsActiveAt(t *testing.T) {
+	all := providerWeekdaysAll
+	monday := 1 << 0
+	cases := []struct {
+		name     string
+		schedule ProviderSchedule
+		now      time.Time
+		want     bool
+	}{
+		{
+			"两段都命中",
+			multiWindowSchedule(all, sw(8*60, 12*60), sw(20*60, 22*60)),
+			at(2026, 11, 13, 9, 0), true,
+		},
+		{
+			"两段之间不算",
+			multiWindowSchedule(all, sw(8*60, 12*60), sw(20*60, 22*60)),
+			at(2026, 11, 13, 13, 0), false,
+		},
+		{
+			"晚段命中",
+			multiWindowSchedule(all, sw(8*60, 12*60), sw(20*60, 22*60)),
+			at(2026, 11, 13, 21, 0), true,
+		},
+		{
+			"晚段终点不含",
+			multiWindowSchedule(all, sw(8*60, 12*60), sw(20*60, 22*60)),
+			at(2026, 11, 13, 22, 0), false,
+		},
+		{
+			"跨零点段与普通段混排：深夜",
+			multiWindowSchedule(all, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 13, 23, 30), true,
+		},
+		{
+			"跨零点段与普通段混排：凌晨",
+			multiWindowSchedule(all, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 14, 2, 0), true,
+		},
+		{
+			"跨零点段与普通段混排：午间",
+			multiWindowSchedule(all, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 14, 12, 30), true,
+		},
+		{
+			"跨零点段与普通段混排：上午空档",
+			multiWindowSchedule(all, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 14, 9, 0), false,
+		},
+		{
+			"星期是全局的：周一晚段",
+			multiWindowSchedule(monday, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 16, 23, 0), true,
+		},
+		{
+			"星期是全局的：跨零点归周一",
+			multiWindowSchedule(monday, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 17, 2, 0), true,
+		},
+		{
+			"星期是全局的：周二午间不生效",
+			multiWindowSchedule(monday, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 17, 12, 30), false,
+		},
+		{
+			"星期是全局的：周一午间生效",
+			multiWindowSchedule(monday, sw(22*60, 8*60), sw(12*60, 13*60)),
+			at(2026, 11, 16, 12, 30), true,
+		},
+		{
+			"多段里的全天段",
+			multiWindowSchedule(all, sw(0, 0)),
+			at(2026, 11, 14, 3, 17), true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.schedule.ActiveAt(tc.now); got != tc.want {
+				t.Fatalf("ActiveAt(%s) = %v, want %v（schedule=%+v）", tc.now.Format(time.RFC3339), got, tc.want, tc.schedule)
+			}
+		})
+	}
+}
+
+// 旧数据（v25 之前）没有多段列：Windows 为空时必须继续按单段列判定，
+// 不能在升级瞬间把「夜间渠道」读成「全天」。
+func TestProviderScheduleFallsBackToSingleWindow(t *testing.T) {
+	schedule := dailySchedule(22*60, 8*60, providerWeekdaysAll)
+	if !schedule.ActiveAt(at(2026, 11, 13, 23, 0)) {
+		t.Fatal("深夜应生效")
+	}
+	if schedule.ActiveAt(at(2026, 11, 13, 12, 0)) {
+		t.Fatal("白天不应生效")
+	}
+}
+
+func TestNormalizeProviderScheduleWindows(t *testing.T) {
+	t.Run("多段按开始时间排序并回写第一段", func(t *testing.T) {
+		schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode:     "daily",
+			Weekdays: []int{1, 2, 3, 4, 5},
+			Windows: []ScheduleWindowInput{
+				{Start: "20:00", End: "22:00"},
+				{Start: "8:00", End: "12:00"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(schedule.Windows) != 2 {
+			t.Fatalf("windows = %+v", schedule.Windows)
+		}
+		if schedule.Windows[0] != (sw(8*60, 12*60)) || schedule.Windows[1] != (sw(20*60, 22*60)) {
+			t.Fatalf("windows 未按钟点排序：%+v", schedule.Windows)
+		}
+		// 单段列写第一段：旧版本回滚后仍有一个能用的时段，不会变成全天。
+		if schedule.StartMinute != 8*60 || schedule.EndMinute != 12*60 {
+			t.Fatalf("单段列 = %d-%d, want 480-720", schedule.StartMinute, schedule.EndMinute)
+		}
+	})
+
+	t.Run("重复段去重", func(t *testing.T) {
+		schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode: "daily",
+			Windows: []ScheduleWindowInput{
+				{Start: "08:00", End: "12:00"},
+				{Start: "8:00", End: "12:00"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(schedule.Windows) != 1 {
+			t.Fatalf("windows = %+v", schedule.Windows)
+		}
+	})
+
+	t.Run("空数组要报错而不是静默变全天", func(t *testing.T) {
+		_, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "daily", Windows: []ScheduleWindowInput{}})
+		if err == nil || !strings.Contains(err.Error(), "至少") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("段落错误要指出第几段", func(t *testing.T) {
+		_, err := NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode: "daily",
+			Windows: []ScheduleWindowInput{
+				{Start: "08:00", End: "12:00"},
+				{Start: "25:00", End: "26:00"},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "第 2 段") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("段数上限", func(t *testing.T) {
+		windows := make([]ScheduleWindowInput, 0, maxScheduleWindows+1)
+		for i := 0; i <= maxScheduleWindows; i++ {
+			windows = append(windows, ScheduleWindowInput{Start: "00:00", End: "00:01"})
+		}
+		if _, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "daily", Windows: windows}); err == nil {
+			t.Fatal("超过上限应被拒")
+		}
+	})
+
+	t.Run("没传多段时仍认单段写法", func(t *testing.T) {
+		schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "daily", DailyStart: "22:00", DailyEnd: "08:00"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(schedule.Windows) != 1 || schedule.Windows[0] != (sw(22*60, 8*60)) {
+			t.Fatalf("windows = %+v", schedule.Windows)
+		}
+	})
+}
+
+func TestScheduleWindowsCodec(t *testing.T) {
+	windows := []ScheduleWindow{sw(8*60, 12*60), sw(22*60, 8*60)}
+	raw := encodeScheduleWindows(windows)
+	decoded := decodeScheduleWindows(raw)
+	if len(decoded) != 2 || decoded[0] != windows[0] || decoded[1] != windows[1] {
+		t.Fatalf("往返失败：raw=%q decoded=%+v", raw, decoded)
+	}
+	if encodeScheduleWindows(nil) != "" {
+		t.Fatal("空切片应存空串")
+	}
+	if got := decodeScheduleWindows(""); got != nil {
+		t.Fatalf("空串应为 nil，得到 %+v", got)
+	}
+	if got := decodeScheduleWindows("{not json"); got != nil {
+		t.Fatalf("坏 JSON 应为 nil，得到 %+v", got)
+	}
+	// 越界分钟（手工改库写坏）要丢掉，而不是让判定算出个永远不生效的时段。
+	sanitized := decodeScheduleWindows(`[{"StartMinute":-1,"EndMinute":10},{"StartMinute":600,"EndMinute":700}]`)
+	if len(sanitized) != 1 || sanitized[0] != (sw(600, 700)) {
+		t.Fatalf("越界项未被丢弃：%+v", sanitized)
+	}
+}
+
+// 多段要能完整落库并读回来：判定虽然只用内存结构，但管理台回显与重启后恢复
+// 都依赖这一列。
+func TestProviderScheduleWindowsPersist(t *testing.T) {
+	repo := newTestStore(t)
+	ctx := context.Background()
+	provider, err := repo.CreateProvider(ctx, NewProvider{Name: "night", BaseURL: "http://localhost:1", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := "daily"
+	// 多段时星期跟着每段走（v25）；顶层的 ScheduleWeekdays 只服务于单段老写法。
+	windows := []ScheduleWindowInput{
+		{Start: "22:00", End: "08:00", Weekdays: []int{1, 2, 3, 4, 5}},
+		{Start: "12:00", End: "13:00", Weekdays: []int{1, 2, 3, 4, 5}},
+	}
+	if _, err := repo.UpdateProvider(ctx, provider.ID, UpdateProvider{
+		ScheduleMode: &mode, ScheduleWindows: &windows,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.GetProvider(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.ScheduleWindows) != 2 {
+		t.Fatalf("落库后的 windows = %+v", stored.ScheduleWindows)
+	}
+	// 排序后第一段是 12:00-13:00（720-780），星期跟着这一段走。
+	if stored.ScheduleWindows[0] != (ScheduleWindow{StartMinute: 12 * 60, EndMinute: 13 * 60, Weekdays: 1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4}) {
+		t.Fatalf("windows[0] = %+v", stored.ScheduleWindows[0])
+	}
+	if stored.ScheduleStartMinute != 12*60 || stored.ScheduleEndMinute != 13*60 {
+		t.Fatalf("单段列 = %d-%d", stored.ScheduleStartMinute, stored.ScheduleEndMinute)
+	}
+	if stored.ScheduleWeekdays != 1<<0|1<<1|1<<2|1<<3|1<<4 {
+		t.Fatalf("weekdays = %07b", stored.ScheduleWeekdays)
+	}
+	// 只改名字不能顺手把多段清掉。
+	renamed, err := repo.UpdateProvider(ctx, provider.ID, UpdateProvider{Name: "night-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(renamed.ScheduleWindows) != 2 {
+		t.Fatalf("改名后 windows = %+v", renamed.ScheduleWindows)
+	}
+}
+
+// 每段自己的星期：最常见的组合是「工作日只在夜里、周末全天」。
+// 全局星期做不到这一点，只能拆成两条渠道——而 v24 之后一个渠道只属于一个组，
+// 那就意味着两个上游账号。
+func TestProviderSchedulePerWindowWeekdays(t *testing.T) {
+	workday := 1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4
+	weekend := 1<<5 | 1<<6
+	schedule := ProviderSchedule{Mode: ProviderScheduleDaily, Windows: []ScheduleWindow{
+		{StartMinute: 22 * 60, EndMinute: 8 * 60, Weekdays: workday},
+		{StartMinute: 0, EndMinute: 0, Weekdays: weekend},
+	}}
+	cases := []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		// 2026-11-13 周五，14 周六，15 周日，16 周一
+		{"周五夜间", at(2026, 11, 13, 23, 0), true},
+		{"周五白天不生效", at(2026, 11, 13, 12, 0), false},
+		{"周六凌晨归周五夜间", at(2026, 11, 14, 2, 0), true},
+		{"周六全天段", at(2026, 11, 14, 12, 0), true},
+		{"周日全天段", at(2026, 11, 15, 20, 0), true},
+		{"周一凌晨不再是周末", at(2026, 11, 16, 3, 0), false},
+		{"周一白天不生效", at(2026, 11, 16, 12, 0), false},
+		{"周一夜间恢复", at(2026, 11, 16, 23, 0), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := schedule.ActiveAt(tc.now); got != tc.want {
+				t.Fatalf("ActiveAt(%s) = %v, want %v", tc.now.Format(time.RFC3339), got, tc.want)
+			}
+		})
+	}
+}
+
+// 归一化要把每段的星期各自解析出来，空列表 = 这段每天生效。
+func TestNormalizeSchedulePerWindowWeekdays(t *testing.T) {
+	schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{
+		Mode: "daily",
+		Windows: []ScheduleWindowInput{
+			{Start: "22:00", End: "08:00", Weekdays: []int{1, 2, 3, 4, 5}},
+			{Start: "00:00", End: "00:00"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schedule.Windows) != 2 {
+		t.Fatalf("windows = %+v", schedule.Windows)
+	}
+	// 排序后整天段在前：00:00-00:00（每天），然后 22:00-08:00（工作日）。
+	if schedule.Windows[0].Weekdays != providerWeekdaysAll {
+		t.Fatalf("未指定星期的段应等于每天：%+v", schedule.Windows[0])
+	}
+	if schedule.Windows[1].Weekdays != 1<<0|1<<1|1<<2|1<<3|1<<4 {
+		t.Fatalf("工作日掩码 = %07b", schedule.Windows[1].Weekdays)
+	}
+	// 单段列回写第一段（含它的星期），回滚到旧版本后行为仍然一致。
+	if schedule.StartMinute != 0 || schedule.EndMinute != 0 || schedule.Weekdays != providerWeekdaysAll {
+		t.Fatalf("单段列 = %d-%d/%07b", schedule.StartMinute, schedule.EndMinute, schedule.Weekdays)
+	}
+
+	if _, err := NormalizeProviderSchedule(ProviderScheduleInput{
+		Mode:    "daily",
+		Windows: []ScheduleWindowInput{{Start: "08:00", End: "12:00", Weekdays: []int{0}}},
+	}); err == nil {
+		t.Fatal("星期 0 应被拒")
+	}
+}

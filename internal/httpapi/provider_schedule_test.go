@@ -131,3 +131,79 @@ func TestAdminProviderScheduleRejectsInvalidInput(t *testing.T) {
 		t.Fatalf("被拒的更新污染了时段: %s", after.Body.String())
 	}
 }
+
+// v25：多段时段的接口形态。[{start,end}] 提交、原样读回、清空要报错。
+func TestAdminProviderScheduleMultipleWindows(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", adminKey, map[string]any{
+		"name": "night", "base_url": "https://night.example", "api_key": "k",
+		"schedule_mode": "daily",
+		"ScheduleWindows": []map[string]any{
+			{"start": "22:00", "end": "08:00", "weekdays": []int{1, 2, 3, 4, 5}},
+			{"start": "12:00", "end": "13:00"},
+		},
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			ID              int64                  `json:"ID"`
+			ScheduleMode    string                 `json:"ScheduleMode"`
+			ScheduleWindows []store.ScheduleWindow `json:"ScheduleWindows"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.ScheduleMode != "daily" || len(payload.Data.ScheduleWindows) != 2 {
+		t.Fatalf("创建后的时段不对: %+v", payload.Data)
+	}
+	// 排序后第一段是 12:00-13:00。
+	if payload.Data.ScheduleWindows[0] != (store.ScheduleWindow{StartMinute: 12 * 60, EndMinute: 13 * 60, Weekdays: 0x7f}) {
+		t.Fatalf("windows[0] = %+v", payload.Data.ScheduleWindows[0])
+	}
+	// 每段的星期各自独立：第一段（12:00-13:00）没指定 = 每天，第二段是工作日。
+	if payload.Data.ScheduleWindows[1].Weekdays != 1<<0|1<<1|1<<2|1<<3|1<<4 {
+		t.Fatalf("windows[1] = %+v", payload.Data.ScheduleWindows[1])
+	}
+
+	// 整体替换成三段（前端保存走的正是这条 PUT）。
+	updated := adminRequest(t, handler, http.MethodPut, "/admin/api/providers/"+itoa(payload.Data.ID), adminKey, map[string]any{
+		"ScheduleMode": "daily", "ScheduleWeekdays": []int{1, 2, 3, 4, 5, 6, 7},
+		"ScheduleWindows": []map[string]any{
+			{"start": "00:00", "end": "06:00", "weekdays": []int{1, 2, 3, 4, 5}},
+			{"start": "13:00", "end": "14:00", "weekdays": []int{6, 7}},
+			{"start": "20:00", "end": "23:30"},
+		},
+	})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", updated.Code, updated.Body.String())
+	}
+	var reread struct {
+		Data struct {
+			ScheduleWindows []store.ScheduleWindow `json:"ScheduleWindows"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(updated.Body.Bytes(), &reread); err != nil {
+		t.Fatal(err)
+	}
+	if len(reread.Data.ScheduleWindows) != 3 {
+		t.Fatalf("更新后 windows = %+v", reread.Data.ScheduleWindows)
+	}
+	if reread.Data.ScheduleWindows[2] != (store.ScheduleWindow{StartMinute: 20 * 60, EndMinute: 23*60 + 30, Weekdays: 0x7f}) {
+		t.Fatalf("windows[2] = %+v", reread.Data.ScheduleWindows[2])
+	}
+	if reread.Data.ScheduleWindows[1].Weekdays != 1<<5|1<<6 {
+		t.Fatalf("周六周日段 = %+v", reread.Data.ScheduleWindows[1])
+	}
+
+	// 清空所有段：拒绝，并提示改选「不限」——静默变成全天会让时段保护凭空消失。
+	empty := adminRequest(t, handler, http.MethodPut, "/admin/api/providers/"+itoa(payload.Data.ID), adminKey, map[string]any{
+		"ScheduleMode": "daily", "ScheduleWindows": []map[string]string{},
+	})
+	if empty.Code != http.StatusBadRequest || !strings.Contains(empty.Body.String(), "至少") {
+		t.Fatalf("清空时段 = %d: %s", empty.Code, empty.Body.String())
+	}
+}

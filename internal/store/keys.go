@@ -639,7 +639,7 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 		return models, nil
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays FROM providers WHERE id IN (`+placeholders+`)`, ids...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows FROM providers WHERE id IN (`+placeholders+`)`, ids...)
 	if err != nil {
 		return nil, err
 	}
@@ -648,9 +648,11 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 	for rows.Next() {
 		var id int64
 		var schedule ProviderSchedule
-		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays); err != nil {
+		var windowsRaw string
+		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays, &windowsRaw); err != nil {
 			return nil, err
 		}
+		schedule.Windows = decodeScheduleWindows(windowsRaw)
 		active[id] = schedule.ActiveAt(now)
 	}
 	if err := rows.Err(); err != nil {

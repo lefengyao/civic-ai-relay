@@ -137,8 +137,8 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」）。每项另含 `GroupID`/`GroupName`（**归属分组**，0/空串 = 未加入任何组）。**组作用域主体**（非管理员）只看到自己分组实际能用的渠道：聚合组 = 自有 ∪ 启用成员组的渠道（与授权口径一致），且 `BaseURL` 与归属字段都为空 |
-| POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}`，可选带时段：`schedule_mode`（`always`/`range`/`daily`）、`schedule_start`、`schedule_end`（北京时间或 RFC3339）、`schedule_daily_start`、`schedule_daily_end`（`HH:MM`）、`schedule_weekdays`（`[1..7]`，1=周一） |
-| PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled, ScheduleMode, ScheduleStart, ScheduleEnd, ScheduleDailyStart, ScheduleDailyEnd, ScheduleWeekdays}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。`ScheduleMode` 缺省 = 保持原时段；给了就按同一请求里的 `Schedule*` 整段替换。**发 snake_case 会静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 与 `provider_schedule_test.go` 钉住 |
+| POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}`，可选带时段：`schedule_mode`（`always`/`range`/`daily`）、`schedule_start`、`schedule_end`（北京时间或 RFC3339）、`schedule_daily_start`、`schedule_daily_end`（`HH:MM`，单段老写法）、`schedule_weekdays`（`[1..7]`，1=周一）、`ScheduleWindows`（v25 多段，见下） |
+| PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled, ScheduleMode, ScheduleStart, ScheduleEnd, ScheduleDailyStart, ScheduleDailyEnd, ScheduleWeekdays, ScheduleWindows}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。`ScheduleMode` 缺省 = 保持原时段；给了就按同一请求里的 `Schedule*` 整段替换。**发 snake_case 会静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 与 `provider_schedule_test.go` 钉住 |
 | DELETE | `/admin/api/providers/{id}` | 删除，**级联删除该渠道下的所有模型**；重复删除返回 404 |
 | GET | `/admin/api/providers/{id}/remote-models` | 拉取上游 `/v1/models` 预览，返回 `{upstream_name, public_name, exists}`，不导入 |
 | POST | `/admin/api/providers/{id}/models/import` | 批量导入；body `{"models": [{upstream_name, public_name?}]}`。public_name 缺省为 `渠道名/上游名`。**幂等**：已存在的 public_name 跳过；导入结果为停用 + 未定价，需到模型页定价并启用后才能加入分组 |
@@ -153,12 +153,42 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 |---|---|---|
 | `always`（默认） | 供应商 `enabled=1` 即全天可用，与升级前行为一致 | 无 |
 | `range` | 区间 `[start, end)`；任一侧留空表示该侧不限 | `schedule_start_utc` / `schedule_end_utc`（UTC RFC3339） |
-| `daily` | 每天在 `HH:MM` 之间，可叠加星期；**支持跨零点** | `schedule_start_minute` / `schedule_end_minute`（0..1439，北京时间）、`schedule_weekdays` |
+| `daily` | 每天若干段 `HH:MM` 区间，**每段可以有自己的星期**，支持跨零点（v25） | `schedule_windows`（JSON 多段；空 = 回落到下面的单段列）、`schedule_start_minute` / `schedule_end_minute`（0..1439，北京时间）、`schedule_weekdays` |
 
 约定与坑：
 
 - `schedule_weekdays` 是位掩码：bit0=周一 … bit6=周日。`0` 与 `127` 都表示每天。
 - `daily` 起止相同 = 全天（只受星期约束）。
+
+#### 多段时段（v25）
+
+`daily` 支持一天多个窗口，每段带自己的星期 —— 「工作日 22:00-08:00 + 周末全天」是
+同一条渠道的一组配置，不需要拆成两条（v24 起一个渠道只能属于一个组，拆开就等于要
+两个上游账号）。管理台的时段弹窗就是按这个结构渲染的。
+
+```json
+{
+  "ScheduleMode": "daily",
+  "ScheduleWindows": [
+    {"start": "22:00", "end": "08:00", "weekdays": [1,2,3,4,5]},
+    {"start": "00:00", "end": "00:00", "weekdays": [6,7]}
+  ]
+}
+```
+
+- `weekdays` 是这一段的星期（`[1..7]`，1=周一）；**省略或空数组 = 这一段每天生效**。
+  管理台不允许把一段的所有星期都取消（那样这段永远不生效，几乎总是误操作），会提示
+  改选「不限」。
+- 段数上限 24；相同的段（起止 + 星期都相同）保存时去重，按开始时间排序。
+- 任一段命中即可用；段之间重叠不报错（结果相同，只是冗余）。
+- 跨零点的星期归属仍然按**段开始那天**算：`周一 22:00-08:00` 覆盖周二凌晨，
+  但周二 22:00 起的就不算周一了。这条对每一段独立生效。
+- `ScheduleWindows` 缺省（字段不出现）= 走 `ScheduleDailyStart/End` + `ScheduleWeekdays`
+  的单段老写法；显式传 `[]` 会被拒绝（避免「清空所有段」静默变成全天）。
+- 存库时 `schedule_windows` 存 JSON；同时把**第一段**（含它的星期）写回
+  `schedule_start_minute` / `schedule_end_minute` / `schedule_weekdays`，这样回滚到
+  旧版本后至少还留着一段，不会整条渠道变成「全天可用」。
+- 读取时 `schedule_windows` 为空或 JSON 损坏 → 回落到单段列；越界分钟/掩码被丢弃。
 - **跨零点归属开始那天**：`周一 22:00-08:00` 包含周二凌晨；周二 22:00 起的就不算周一了。
 - `range` 只填一侧时另一侧不限；两侧都空等价于 `always`（管理台保存时会自动回退成 `always`，不留一个永远生效的 `range`）。
 - 时段外的后果：该渠道下的模型**不会出现在 `/v1/models`**，请求也不会被路由过去（故障转移池会自动跳到时段内的成员）。分组探活与定时模型同步同样跳过这些渠道。
@@ -437,6 +467,7 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v19 | **故障转移供应商**：`model_pools`（单模型类别）+ `model_pool_members`（成员与优先级）。纯新增表，不改动任何既有表 |
 | v20 | `key_reservations` 重建为独立账本（去掉 `key_id` / `model_id` 外键），并按 `requests` 补回历史账目：删 Key / 模型 / 渠道不再清零组额度，保留期也不再裁剪账目 |
 | v21 | `providers` 加 6 列生效时段（`schedule_mode` 等），默认 `always` —— 既有渠道升级后行为不变 |
+| v25 | `providers` 加 `schedule_windows`（JSON 多段，默认空）—— 旧的单段列继续写第一段，历史数据不需要回填 |
 | v22 | 聚合模型组：`model_groups.kind`（默认 `normal`）、`group_compositions`（聚合组 → 成员组，只允许一层）、`requests.source_group_id` 与 `key_reservations.source_group_id`（真正提供该模型的组）。纯新增，既有组与账目行为不变 |
 | v23 | **只有聚合组对外**：把「没有被任何聚合组包含」的 `normal` 组改成 `aggregate`（升级前它们本来就是独立对外的组，不改会让既有 Key 全部失效）；成员关系里的 `normal` 组保留成员身份。无结构变更 |
 | v24 | **一个渠道只能属于一个组**：把历史上重复挂到多个组的渠道收敛成一条（保留**最早建立**的归属，rowid 最小），再建唯一索引 `group_providers(provider_id)`。重复的那条关系过去从未被计费（用量恒为 0），删掉不影响账目；若某个组因此变成 0 个渠道，管理台会直接显示「0 渠道」 |

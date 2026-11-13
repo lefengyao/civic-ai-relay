@@ -161,6 +161,14 @@ details .card{margin-bottom:0}
 .check-item:hover{border-color:var(--accent)}
 .check-item.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
 .check-item input{width:auto;margin:0}
+/* 时段行（v25）：一段 = 起止时间 + 这一段的星期。星期做成紧凑小格，7 个一行放得下。 */
+.sched-window{display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.sched-window input[type=time]{flex:1 1 96px;min-width:90px}
+.sched-days{display:flex;gap:2px}
+.sched-day{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--border);border-radius:5px;font-size:11px;color:var(--muted);cursor:pointer;user-select:none;background:#fff;transition:all .12s}
+.sched-day:hover{border-color:var(--accent)}
+.sched-day.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
+.sched-day input{display:none}
 
 /* ── 渠道模型管理弹窗 ─────────────── */
 .pm-sec{margin-bottom:20px;padding-bottom:16px;border-bottom:1px dashed var(--border)}
@@ -1125,19 +1133,62 @@ function scheduleText(p) {
     return `${fmt(p.ScheduleStartUTC)} → ${fmt(p.ScheduleEndUTC)}`;
   }
   if (mode === "daily") {
-    const start = scheduleClock(p.ScheduleStartMinute), end = scheduleClock(p.ScheduleEndMinute);
-    if (start === end) {
-      const allDay = scheduleWeekdayText(p.ScheduleWeekdays);
-      return allDay === "每天" ? "每天 全天" : `全天 · ${allDay}`;
-    }
-    const parts = [`${start}-${end}`];
-    if (Number(p.ScheduleStartMinute) > Number(p.ScheduleEndMinute)) parts.push("跨零点");
-    const days = scheduleWeekdayText(p.ScheduleWeekdays);
-    if (days !== "每天") parts.push(days);
+    // v25：一天可以有多段。老数据没有 ScheduleWindows，回落到单段列。
+    const windows = Array.isArray(p.ScheduleWindows) && p.ScheduleWindows.length
+      ? p.ScheduleWindows
+      : [{ StartMinute: p.ScheduleStartMinute, EndMinute: p.ScheduleEndMinute }];
+    const labels = windows.map(w => {
+      const start = scheduleClock(w.StartMinute), end = scheduleClock(w.EndMinute);
+      const span = start === end ? "全天" : `${start}-${end}`;
+      // v25：星期跟着每段走。老数据的那一段没有 Weekdays，沿用全局掩码。
+      const days = scheduleWeekdayText(w.Weekdays == null ? p.ScheduleWeekdays : w.Weekdays);
+      return days === "每天" ? span : `${span} ${days}`;
+    });
+    const parts = [labels.join("，")];
+    if (windows.some(w => Number(w.StartMinute) > Number(w.EndMinute))) parts.push("跨零点");
     return parts.join(" · ");
   }
   return "不限";
 }
+/* 时间段行（v25 多段）。start/end 是 "HH:MM"；起止相同 = 全天，start > end = 跨零点。
+   mask 是**这一段自己的**星期（bit0=周一…bit6=周日）；0 与 127 都表示每天。 */
+const scheduleWindowRowHTML = (start, end, mask) => {
+  const days = Number(mask) > 0 && Number(mask) <= 127 ? Number(mask) : 127;
+  const chips = scheduleWeekdayNames.map((name, i) => {
+    const on = (days & (1 << i)) !== 0;
+    return `<label class="sched-day${on ? " on" : ""}" title="周${name}"><input type="checkbox" value="${i + 1}" ${on ? "checked" : ""} onchange="this.closest('.sched-day').classList.toggle('on',this.checked)">${name}</label>`;
+  }).join("");
+  return `<div class="sched-window">
+  <input type="time" class="sched-window-start" value="${esc(start)}">
+  <span style="color:var(--muted)">→</span>
+  <input type="time" class="sched-window-end" value="${esc(end)}">
+  <div class="sched-days" title="这一段的生效星期；全不选 = 每天">${chips}</div>
+  <button type="button" class="btn-ghost btn-sm" onclick="removeScheduleWindow(this)" title="删除这一段">×</button>
+</div>`;
+};
+window.addScheduleWindow = () => {
+  $("es-windows").insertAdjacentHTML("beforeend", scheduleWindowRowHTML("22:00", "08:00", 127));
+  syncScheduleWindowRemove();
+};
+window.removeScheduleWindow = btn => {
+  const host = $("es-windows");
+  if (host.querySelectorAll(".sched-window").length <= 1) {
+    toast("至少保留一个时间段；不想限时段请把生效方式改成「不限」", "err");
+    return;
+  }
+  btn.closest(".sched-window").remove();
+  syncScheduleWindowRemove();
+};
+/* 只剩一段时把删除按钮置灰：比点下去才弹提示更省事。 */
+const syncScheduleWindowRemove = () => {
+  const rows = [...$("es-windows").querySelectorAll(".sched-window")];
+  rows.forEach(row => {
+    const btn = row.querySelector("button");
+    if (!btn) return;
+    btn.disabled = rows.length <= 1;
+    btn.style.opacity = rows.length <= 1 ? ".45" : "";
+  });
+};
 // 服务端存 UTC，datetime-local 没有时区概念，这里显式按北京时间来回换算。
 const bjInputValue = iso => {
   if (!iso) return "";
@@ -1162,11 +1213,14 @@ window.editProviderSchedule = id => {
   const p = cache.providers.find(x => x.ID === id);
   if (!p) return;
   const mode = p.ScheduleMode || "always";
-  const weekdays = Number(p.ScheduleWeekdays) || 127;
-  const dayChecks = scheduleWeekdayNames.map((name, i) => {
-    const bit = 1 << i, on = weekdays === 127 || (weekdays & bit) !== 0;
-    return `<label class="check-item ${on ? "on" : ""}"><input type="checkbox" value="${i + 1}" ${on ? "checked" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${name}</span></label>`;
-  }).join("");
+  // v25：多段，每段带自己的星期。老数据只有一对起止分钟 + 一个全局星期，
+  // 就当作唯一的一段（并沿用那份全局星期）显示，保存后自然升级成多段格式。
+  const windows = Array.isArray(p.ScheduleWindows) && p.ScheduleWindows.length
+    ? p.ScheduleWindows
+    : [{ StartMinute: p.ScheduleStartMinute, EndMinute: p.ScheduleEndMinute, Weekdays: p.ScheduleWeekdays }];
+  const windowRows = windows
+    .map(w => scheduleWindowRowHTML(scheduleClock(w.StartMinute), scheduleClock(w.EndMinute), w.Weekdays == null ? p.ScheduleWeekdays : w.Weekdays))
+    .join("");
   openEdit(`设置生效时段 #${id} · ${p.Name}`, `
     <div class="field"><label>生效方式</label><select id="es-mode" onchange="syncScheduleFields()">
       <option value="always" ${mode === "always" ? "selected" : ""}>不限（供应商启用即全天可用）</option>
@@ -1178,11 +1232,11 @@ window.editProviderSchedule = id => {
       <div class="field"><label>结束（北京时间）</label><input id="es-end" type="datetime-local" value="${bjInputValue(p.ScheduleEndUTC)}"><span class="hint">留空表示不限终点；到点后自动不可用</span></div>
     </div>
     <div id="es-daily" ${mode === "daily" ? "" : "hidden"}>
-      <div class="form-grid">
-        <div class="field"><label>每天从</label><input id="es-daily-start" type="time" value="${scheduleClock(p.ScheduleStartMinute)}"></div>
-        <div class="field"><label>到</label><input id="es-daily-end" type="time" value="${scheduleClock(p.ScheduleEndMinute)}"></div>
+      <div class="field"><label>时间段（北京时间，可加多段）</label>
+        <div id="es-windows">${windowRows}</div>
+        <button type="button" class="btn-ghost btn-sm" onclick="addScheduleWindow()">+ 添加时段</button>
+        <span class="hint">每段右侧的「一二三…」是这一段自己的生效星期，想只在某几天生效就取消其余几天，所以「工作日夜间 + 周末全天」可以放在同一条渠道里。起点含、终点不含；22:00 → 08:00 表示到次日早上八点；起止相同 = 全天；任一段命中即可用。跨零点时凌晨那段算作时段开始那天（周一 22:00-08:00 含周二凌晨）。</span>
       </div>
-      <div class="field"><label>星期</label><div class="check-list" id="es-weekdays">${dayChecks}</div><span class="hint">跨零点时，凌晨那段算作时段开始那天（周一 22:00-08:00 包含周二凌晨）</span></div>
     </div>
   `, async () => {
     const picked = $("es-mode").value;
@@ -1193,17 +1247,27 @@ window.editProviderSchedule = id => {
       // 两头都空 = 等于不限，别留一个永远生效的 range 让人误会
       if (!body.ScheduleStart && !body.ScheduleEnd) body.ScheduleMode = "always";
     } else if (picked === "daily") {
-      // 后端把「空数组」当成每天（兼容 API 直接调用），但用户取消全部勾选的本意
-      // 是「哪天都不用」。这里必须拦住，否则会静默反转成每周 7 天全开。
-      const pickedDays = [...$("es-weekdays").querySelectorAll("input:checked")].map(el => Number(el.value));
-      if (!pickedDays.length) throw new Error("至少选一天；要全天可用请选「不限」");
-      body.ScheduleDailyStart = $("es-daily-start").value || "00:00";
-      body.ScheduleDailyEnd = $("es-daily-end").value || "00:00";
-      body.ScheduleWeekdays = pickedDays;
+      // v25：整体替换多段，每段带自己的星期。空输入按 00:00 处理，与「起止相同
+      // = 全天」的语义一致。
+      const rows = [...$("es-windows").querySelectorAll(".sched-window")];
+      if (!rows.length) throw new Error("至少保留一个时间段；不想限时段请选「不限」");
+      body.ScheduleWindows = rows.map((row, index) => {
+        const days = [...row.querySelectorAll(".sched-day input:checked")].map(el => Number(el.value));
+        // 一段一天都不选 = 这段永远不生效，几乎肯定是误操作；而「全天」有专门的
+        // 表达（起止相同），不该用空星期来表示。
+        if (!days.length) throw new Error(`第 ${index + 1} 段至少要选一天；不想限时段请把生效方式改成「不限」`);
+        return {
+          start: row.querySelector(".sched-window-start").value || "00:00",
+          end: row.querySelector(".sched-window-end").value || "00:00",
+          weekdays: days,
+        };
+      });
     }
     await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     loadProviders();
   });
+  // 弹窗已插入 DOM：只有一段时先把它标成不可删，省得点了才被拒绝。
+  syncScheduleWindowRemove();
 };
 /* ── 通用编辑弹窗 ── */
 function openEdit(title, bodyHTML, onsave) {

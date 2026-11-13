@@ -93,7 +93,7 @@ func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, 
 	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,p.id,COALESCE(p.name,''),COALESCE(p.enabled,0),
 		(SELECT COUNT(*) FROM models m WHERE m.provider_id=p.id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL),
 		COALESCE(p.schedule_mode,'always'),COALESCE(p.schedule_start_utc,''),COALESCE(p.schedule_end_utc,''),
-		COALESCE(p.schedule_start_minute,0),COALESCE(p.schedule_end_minute,0),COALESCE(p.schedule_weekdays,0)
+		COALESCE(p.schedule_start_minute,0),COALESCE(p.schedule_end_minute,0),COALESCE(p.schedule_weekdays,0),COALESCE(p.schedule_windows,'')
 		FROM model_groups g
 		LEFT JOIN (
 			SELECT gp.group_id AS group_id, gp.provider_id AS provider_id FROM group_providers gp
@@ -120,10 +120,12 @@ func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, 
 		var providerEnabled int
 		var priced int
 		var schedule ProviderSchedule
+		var windowsRaw string
 		if err := rows.Scan(&groupID, &groupName, &groupEnabled, &providerID, &providerName, &providerEnabled, &priced,
-			&schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays); err != nil {
+			&schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays, &windowsRaw); err != nil {
 			return nil, err
 		}
+		schedule.Windows = decodeScheduleWindows(windowsRaw)
 		idx, ok := position[groupID]
 		if !ok {
 			out = append(out, GroupMonitorTarget{GroupID: groupID, GroupName: groupName, Enabled: groupEnabled == 1, Providers: make([]MonitorProvider, 0)})

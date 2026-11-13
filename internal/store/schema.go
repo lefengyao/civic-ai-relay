@@ -434,6 +434,18 @@ var migrations = []migration{
 		`DROP INDEX IF EXISTS idx_group_providers_provider`,
 		`CREATE UNIQUE INDEX idx_group_providers_provider ON group_providers(provider_id)`,
 	}},
+	// v25：「每天重复」支持多段。
+	//
+	// 原来的 daily 只有一对起止分钟，表达不了「夜间 + 午休」这类一天里的多个窗口，
+	// 运维只能拆成两条渠道（在归属唯一的规则下代价更大），或者干脆不配时段。
+	//
+	// 新列存 JSON 数组 `[{"StartMinute":1320,"EndMinute":480},…]`；判定在 Go 侧做
+	// （ActiveAt），SQL 依旧只存原值。旧的三列继续写**第一段**，这样回滚到旧版本
+	// 时渠道不会突然变成「全天可用」——只是少了几段，而不是时段保护整个失效。
+	// 新列留空表示「没配多段」，读取时回落到旧列，v25 之前的数据不需要回填。
+	{version: 25, statements: []string{
+		`ALTER TABLE providers ADD COLUMN schedule_windows TEXT NOT NULL DEFAULT ''`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {
