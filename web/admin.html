@@ -660,6 +660,14 @@ function selectView(btn) {
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + currentView));
   refreshView(currentView);
 }
+/* 「未到时段」标签是服务端按当前时刻算出的快照，页面开着不会自己变。
+   每分钟静默刷一次（只在供应商页、标签可见、且没开弹窗时），到点自动切换状态。 */
+setInterval(() => {
+  if (!scope || currentView !== "providers") return;
+  if (document.visibilityState !== "visible") return;
+  if ($("edit-modal").classList.contains("on")) return;
+  refreshView("providers");
+}, 60000);
 $("nav").addEventListener("click", e => {
   const btn = e.target.closest("[data-view]");
   if (!btn) return;
@@ -1100,7 +1108,15 @@ const bjInputValue = iso => {
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? new Date(ms + SCHEDULE_BJ_OFFSET).toISOString().slice(0, 16) : "";
 };
-const bjInputToISO = value => value ? new Date(value + ":00+08:00").toISOString() : "";
+// datetime-local 默认 step=60 只给到分钟；万一拿到带秒的值（step 非 60、浏览器差异），
+// 直接拼 ":00" 会拼成 "20:00:00:00+08:00" 抛 Invalid time value。按长度区分，别猜。
+const bjInputToISO = value => {
+  if (!value) return "";
+  const local = value.length === 16 ? value + ":00" : value;
+  const parsed = new Date(local + "+08:00");
+  if (Number.isNaN(parsed.getTime())) throw new Error("时间格式无法识别：" + value);
+  return parsed.toISOString();
+};
 window.syncScheduleFields = () => {
   const mode = $("es-mode").value;
   $("es-range").hidden = mode !== "range";
@@ -1141,9 +1157,13 @@ window.editProviderSchedule = id => {
       // 两头都空 = 等于不限，别留一个永远生效的 range 让人误会
       if (!body.ScheduleStart && !body.ScheduleEnd) body.ScheduleMode = "always";
     } else if (picked === "daily") {
+      // 后端把「空数组」当成每天（兼容 API 直接调用），但用户取消全部勾选的本意
+      // 是「哪天都不用」。这里必须拦住，否则会静默反转成每周 7 天全开。
+      const pickedDays = [...$("es-weekdays").querySelectorAll("input:checked")].map(el => Number(el.value));
+      if (!pickedDays.length) throw new Error("至少选一天；要全天可用请选「不限」");
       body.ScheduleDailyStart = $("es-daily-start").value || "00:00";
       body.ScheduleDailyEnd = $("es-daily-end").value || "00:00";
-      body.ScheduleWeekdays = [...$("es-weekdays").querySelectorAll("input:checked")].map(el => Number(el.value));
+      body.ScheduleWeekdays = pickedDays;
     }
     await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     loadProviders();
@@ -1500,6 +1520,7 @@ const MONITOR_STATUS = {
   degraded:             { dot: "warn", label: "部分渠道不可达" },
   upstream_unreachable: { dot: "err",  label: "全部渠道不可达" },
   config_unavailable:   { dot: "err",  label: "配置不可用" },
+  schedule_idle:        { dot: "off",  label: "全部渠道在时段外" },
   disabled:             { dot: "off",  label: "已停用" },
 };
 function monStatus(status) { return MONITOR_STATUS[status] || { dot: "off", label: status || "未知" }; }

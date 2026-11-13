@@ -118,8 +118,14 @@ func NormalizeProviderSchedule(in ProviderScheduleInput) (ProviderSchedule, erro
 			return ProviderSchedule{}, err
 		}
 		if start != "" && end != "" {
-			startAt, _ := time.Parse(time.RFC3339, start)
-			endAt, _ := time.Parse(time.RFC3339, end)
+			// start/end 已由 parseScheduleInstant 归一化成 RFC3339，这里的解析在正常
+			// 情况下不会失败；仍然显式检查 err，避免将来改格式时把解析失败误报成
+			// 「结束时间必须晚于开始时间」这种指错方向的提示。
+			startAt, startErr := time.Parse(time.RFC3339, start)
+			endAt, endErr := time.Parse(time.RFC3339, end)
+			if startErr != nil || endErr != nil {
+				return ProviderSchedule{}, fmt.Errorf("时段无法归一化（%q → %q），请检查时间格式后重试", start, end)
+			}
 			if !startAt.Before(endAt) {
 				return ProviderSchedule{}, fmt.Errorf("结束时间必须晚于开始时间（当前：%s → %s）", formatScheduleInstant(start), formatScheduleInstant(end))
 			}

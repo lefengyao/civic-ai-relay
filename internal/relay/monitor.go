@@ -123,7 +123,6 @@ func (m *Monitor) evaluate(ctx context.Context, target store.GroupMonitorTarget,
 	if target.PricedModelCount() == 0 {
 		return finish(store.GroupStatusConfigUnavailable, "组内渠道下没有「已启用且已定价」的模型，客户端拿不到任何可用模型")
 	}
-	result.TotalProviders = len(providers)
 	// 时段外渠道本来就不该被调用，探活一定失败——照常探会让分组整夜显示「全部不可达」。
 	// 这类渠道直接跳过，并在明细里说清楚跳过了几个，避免运维把它当成故障。
 	now := m.now()
@@ -137,7 +136,18 @@ func (m *Monitor) evaluate(ctx context.Context, target store.GroupMonitorTarget,
 		active = append(active, provider)
 	}
 	if len(active) == 0 {
-		return finish(store.GroupStatusOK, fmt.Sprintf("%d 个启用渠道均不在生效时段，跳过探活", len(providers)))
+		// 不能报 ok：此刻客户端一个模型也拿不到，绿灯会让人以为服务正常。
+		// 也不能报 upstream_unreachable：上游根本没被探测过。
+		return finish(store.GroupStatusScheduleIdle, fmt.Sprintf("%d 个启用渠道均不在生效时段，跳过探活（到点自动恢复）", len(providers)))
+	}
+	// 组里虽然有定价模型，但可能全在时段外；时段内的渠道若一个都没定价，
+	// 客户端此刻同样拿不到模型，这属于配置问题，不能算可用。
+	pricedActive := 0
+	for _, provider := range active {
+		pricedActive += provider.PricedModels
+	}
+	if pricedActive == 0 {
+		return finish(store.GroupStatusConfigUnavailable, fmt.Sprintf("时段内的 %d 个渠道下没有「已启用且已定价」的模型，客户端此刻拿不到任何可用模型", len(active)))
 	}
 	result.TotalProviders = len(active)
 	suffix := ""
@@ -173,7 +183,8 @@ func (m *Monitor) probe(ctx context.Context, providerID int64) error {
 // report 只在非正常状态下打日志。正常与主动停用不刷日志，避免把容器日志淹掉。
 func (m *Monitor) report(r store.GroupMonitorResult) {
 	switch r.Status {
-	case store.GroupStatusOK, store.GroupStatusDisabled:
+	// schedule_idle 是计划内状态（到点自动恢复），每轮打一条 warn 只会把日志刷满。
+	case store.GroupStatusOK, store.GroupStatusDisabled, store.GroupStatusScheduleIdle:
 		return
 	}
 	logging.Warnf("group monitor: 分组「%s」状态 %s —— %s", r.GroupName, r.Status, r.Detail)

@@ -248,6 +248,31 @@ func TestUsableModelsForKeySkipsOutOfWindowProvider(t *testing.T) {
 	}
 }
 
+// 转发口径自己再挡一层：停用 Key 即使调用方忘了鉴权，也拿不到「此刻可用」的模型。
+// AuthorizedModelsForKey 刻意不校验 enabled（管理台要展示配置口径），两者不能混。
+func TestUsableModelsForKeyRejectsDisabledKey(t *testing.T) {
+	repo, key, _, _ := newReservationFixture(t, 1_000_000, 1_000_000)
+	ctx := context.Background()
+	disabled := false
+	if _, err := repo.UpdateClientKey(ctx, key.ID, UpdateClientKey{Enabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+	usable, err := repo.UsableModelsForKey(ctx, key.ID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usable) != 0 {
+		t.Fatalf("停用 Key 不应拿到可用模型，got %d", len(usable))
+	}
+	authorized, err := repo.AuthorizedModelsForKey(ctx, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorized) != 1 {
+		t.Fatalf("AuthorizedModelsForKey 仍应展示授权关系（停用不影响配置口径），got %d", len(authorized))
+	}
+}
+
 // v21 之前建的渠道没有时段列，升级后必须一律是「不限」，不能因为默认值把渠道
 // 悄悄停掉——这是这个迁移唯一可能造成事故的地方。
 func TestMigrationV21DefaultsToAlways(t *testing.T) {

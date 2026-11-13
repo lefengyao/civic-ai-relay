@@ -15,12 +15,15 @@ import (
 //   - upstream_unreachable：所有启用渠道都探不通，整组无法服务；
 //   - config_unavailable：配置层面就不成立（无启用渠道、或渠道下没有已启用且
 //     已定价的模型），跟上游通不通无关；
+//   - schedule_idle：所有启用渠道此刻都在生效时段外。这不是故障（到点会自动恢复），
+//     但也不能算 ok —— 否则运维看到绿灯，客户端却拿不到任何模型；
 //   - disabled：运维主动停用。这不算故障，界面用灰色区分，避免一片红。
 const (
 	GroupStatusOK                  = "ok"
 	GroupStatusDegraded            = "degraded"
 	GroupStatusUpstreamUnreachable = "upstream_unreachable"
 	GroupStatusConfigUnavailable   = "config_unavailable"
+	GroupStatusScheduleIdle        = "schedule_idle"
 	GroupStatusDisabled            = "disabled"
 )
 

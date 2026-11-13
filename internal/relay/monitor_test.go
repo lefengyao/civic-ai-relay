@@ -8,11 +8,25 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"civic-ai-relay/internal/secret"
 	"civic-ai-relay/internal/store"
 	"civic-ai-relay/internal/upstream"
 )
+
+// expireSchedule 把渠道放到一个已经结束的固定区间里，用来模拟「此刻在时段外」。
+func expireSchedule(t *testing.T, repo *store.Store, providerID int64) {
+	t.Helper()
+	mode := "range"
+	start := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339)
+	end := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	if _, err := repo.UpdateProvider(context.Background(), providerID, store.UpdateProvider{
+		ScheduleMode: &mode, ScheduleStart: &start, ScheduleEnd: &end,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // fakeProbe 记录每个渠道被探活的次数，并可按渠道返回指定错误。
 type fakeProbe struct {
@@ -217,6 +231,78 @@ func TestMonitorAllProvidersReachable(t *testing.T) {
 	}
 	if probe.totalCalls() != 2 {
 		t.Fatalf("probe calls = %d, want 2", probe.totalCalls())
+	}
+}
+
+// 全部渠道都在时段外：既不能报 ok（客户端此刻拿不到任何模型，绿灯会误导），
+// 也不能报不可达（上游根本没被探测）。单独一个 schedule_idle，且一次探针都不打。
+func TestMonitorScheduleIdleWhenAllProvidersOutOfWindow(t *testing.T) {
+	repo, probe := monitorFixture(t)
+	first := addProvider(t, repo, "night-1", true)
+	second := addProvider(t, repo, "night-2", true)
+	group := addGroup(t, repo, "g", []int64{first.ID, second.ID}, true)
+	expireSchedule(t, repo, first.ID)
+	expireSchedule(t, repo, second.ID)
+
+	result, err := NewMonitor(repo, probe).RunGroup(context.Background(), group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != store.GroupStatusScheduleIdle {
+		t.Fatalf("status = %q, want schedule_idle: %s", result.Status, result.Detail)
+	}
+	if !strings.Contains(result.Detail, "不在生效时段") {
+		t.Fatalf("detail = %q，应说明渠道都在时段外", result.Detail)
+	}
+	if probe.totalCalls() != 0 {
+		t.Fatalf("时段外不该探活，probe 被调用 %d 次", probe.totalCalls())
+	}
+}
+
+// 只有部分渠道在时段外：照常探窗口内的，总数按实际探活的算，明细说明跳过了几个。
+func TestMonitorSkipsOutOfWindowProviders(t *testing.T) {
+	repo, probe := monitorFixture(t)
+	inside := addProvider(t, repo, "inside", true)
+	outside := addProvider(t, repo, "outside", true)
+	group := addGroup(t, repo, "g", []int64{inside.ID, outside.ID}, true)
+	expireSchedule(t, repo, outside.ID)
+
+	result, err := NewMonitor(repo, probe).RunGroup(context.Background(), group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != store.GroupStatusOK || result.TotalProviders != 1 || result.FailedProviders != 0 {
+		t.Fatalf("result = %#v, want ok with 1/1 reachable", result)
+	}
+	if !strings.Contains(result.Detail, "另有 1 个渠道不在生效时段") {
+		t.Fatalf("detail = %q，应说明跳过了一个渠道", result.Detail)
+	}
+	if probe.callCount(inside.ID) != 1 || probe.callCount(outside.ID) != 0 {
+		t.Fatalf("探活次数不对：inside=%d outside=%d", probe.callCount(inside.ID), probe.callCount(outside.ID))
+	}
+}
+
+// 时段内的渠道一个定价模型都没有、定价模型全在时段外时，客户端此刻同样拿不到模型：
+// 这是配置问题，不能因为「组里总共有定价模型」就报 ok。
+func TestMonitorConfigUnavailableWhenPricedModelsAreAllOutOfWindow(t *testing.T) {
+	repo, probe := monitorFixture(t)
+	priced := addProvider(t, repo, "priced", true)
+	empty := addProvider(t, repo, "empty", false)
+	group := addGroup(t, repo, "g", []int64{priced.ID, empty.ID}, true)
+	expireSchedule(t, repo, priced.ID)
+
+	result, err := NewMonitor(repo, probe).RunGroup(context.Background(), group.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != store.GroupStatusConfigUnavailable {
+		t.Fatalf("status = %q, want config_unavailable: %s", result.Status, result.Detail)
+	}
+	if !strings.Contains(result.Detail, "时段内") {
+		t.Fatalf("detail = %q，应说明是时段内的渠道没有定价模型", result.Detail)
+	}
+	if probe.totalCalls() != 0 {
+		t.Fatalf("配置不可用时不该探活，probe 被调用 %d 次", probe.totalCalls())
 	}
 }
 

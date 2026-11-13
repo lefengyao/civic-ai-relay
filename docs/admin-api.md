@@ -138,7 +138,7 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 |---|---|---|
 | GET | `/admin/api/providers` | 列表（不返回明文 Key，仅返回是否已配置）。含生效时段字段与只读的 `ScheduleActive`（按**当前时刻**算出的「是否在时段内」） |
 | POST | `/admin/api/providers` | 创建；body `{name, base_url, api_key}`，可选带时段：`schedule_mode`（`always`/`range`/`daily`）、`schedule_start`、`schedule_end`（北京时间或 RFC3339）、`schedule_daily_start`、`schedule_daily_end`（`HH:MM`）、`schedule_weekdays`（`[1..7]`，1=周一） |
-| PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。改成 snake_case 会**静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 钉住 |
+| PUT | `/admin/api/providers/{id}` | 更新（nil 字段保持原值）。⚠️ **body 用 PascalCase**：`{Name, BaseURL, APIKey, Enabled, ScheduleMode, ScheduleStart, ScheduleEnd, ScheduleDailyStart, ScheduleDailyEnd, ScheduleWeekdays}` —— `store.UpdateProvider` 没有 json tag，靠 `encoding/json` 的大小写不敏感匹配对上（与 POST 的 snake_case 不一致，管理台就是这么发的）。`ScheduleMode` 缺省 = 保持原时段；给了就按同一请求里的 `Schedule*` 整段替换。**发 snake_case 会静默变成空更新**（不报错也不生效），契约由 `admin_test.go::TestAdminUpdateProviderAcceptsPascalCasePayload` 与 `provider_schedule_test.go` 钉住 |
 | DELETE | `/admin/api/providers/{id}` | 删除，**级联删除该渠道下的所有模型**；重复删除返回 404 |
 | GET | `/admin/api/providers/{id}/remote-models` | 拉取上游 `/v1/models` 预览，返回 `{upstream_name, public_name, exists}`，不导入 |
 | POST | `/admin/api/providers/{id}/models/import` | 批量导入；body `{"models": [{upstream_name, public_name?}]}`。public_name 缺省为 `渠道名/上游名`。**幂等**：已存在的 public_name 跳过；导入结果为停用 + 未定价，需到模型页定价并启用后才能加入分组 |
@@ -161,8 +161,10 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 - `daily` 起止相同 = 全天（只受星期约束）。
 - **跨零点归属开始那天**：`周一 22:00-08:00` 包含周二凌晨；周二 22:00 起的就不算周一了。
 - `range` 只填一侧时另一侧不限；两侧都空等价于 `always`（管理台保存时会自动回退成 `always`，不留一个永远生效的 `range`）。
-- 时段外的后果：该渠道下的模型**不会出现在 `/v1/models`**，请求也不会被路由过去（故障转移池会自动跳到时段的成员）。分组探活与定时模型同步同样跳过这些渠道。
+- 时段外的后果：该渠道下的模型**不会出现在 `/v1/models`**，请求也不会被路由过去（故障转移池会自动跳到时段内的成员）。分组探活与定时模型同步同样跳过这些渠道。
+- 时段只在**请求开始时**判定：已经建立的在途（流式）请求不会被到点掐断，下次请求才受新状态影响。
 - 管理台「接入信息」里的模型清单**不按时段过滤** —— 那是「配置上授权了哪些模型」；想知道此刻能不能用，看供应商列表的「未到时段」标签。
+- `range` 的 `start_utc` / `end_utc` 若被手工改成非法时间，该侧按「不限」处理（fail-open）：宁可让渠道多开一会儿，也不让脏数据把渠道永久停掉。正常写入路径经 `NormalizeProviderSchedule` 校验，不会产生这种数据。
 - 脏数据（`range` 的时间解析不出）按「该侧不限」处理：宁可放行，也不让一条坏记录把渠道永久停掉。
 
 `PUT` 更新时段时 `ScheduleMode` 缺省表示**保持原时段**（只改名字不会顺手清掉时段）；要清空请显式传 `{"ScheduleMode":"always"}`。
@@ -259,7 +261,8 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 | `ok` | 启用渠道全部探活成功 | 无需处理 |
 | `degraded` | 部分渠道探活失败；组仍可服务，但走这些渠道的模型会失败 | 看 `detail` 里点名的渠道 |
 | `upstream_unreachable` | 全部启用渠道探活失败，整组无法服务 | 查网络/上游/密钥 |
-| `config_unavailable` | 配置层面不成立（无启用渠道，或渠道下没有已启用且已定价的模型） | 去配渠道或定价；**此时不做探活** |
+| `config_unavailable` | 配置层面不成立（无启用渠道，或渠道下没有已启用且已定价的模型；v0.8.1 起若渠道有时段，按**时段内**的渠道判断定价） | 去配渠道或定价；**此时不做探活** |
+| `schedule_idle` | 全部启用渠道此刻都在生效时段外，没有探活（到点自动恢复） | 不是故障，灰色显示；若不该休眠就检查时段配置 |
 | `disabled` | 分组被主动停用，跳过探活 | 不算故障，灰色显示 |
 
 `detail` 是给运维直接照着处理的中文说明，例如

@@ -551,7 +551,10 @@ func (s *Store) UsableModelsForKey(ctx context.Context, keyID int64, now time.Ti
 	if keyID <= 0 {
 		return nil, errors.New("key ID is required")
 	}
-	models, err := s.authorizedModels(ctx, "k.id=?", keyID)
+	// 与 AuthorizedModelsForKey 的唯一差别：这里校验 k.enabled=1。调用方（Begin /
+	// Models）已经过 authenticate 校验，但「转发口径」自己再挡一层，将来新增调用
+	// 点忘了鉴权也不会把停用 Key 的模型放出去。
+	models, err := s.authorizedModels(ctx, "k.id=? AND k.enabled=1", keyID)
 	if err != nil {
 		return nil, err
 	}
@@ -563,12 +566,24 @@ func (s *Store) UsableModelsForKey(ctx context.Context, keyID int64, now time.Ti
 }
 
 // filterByProviderSchedule 丢掉「所属渠道此刻不在生效时段」的模型。
-// 渠道只有几条，一次全表读进内存比把跨零点/星期规则塞进 SQL 更可靠。
+// 只读本次用到的渠道（IN 查询），渠道再多也不会在转发热路径上全表扫。
 func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, now time.Time) ([]Model, error) {
 	if len(models) == 0 {
 		return models, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays FROM providers`)
+	ids := make([]any, 0, len(models))
+	seen := make(map[int64]bool, len(models))
+	for _, model := range models {
+		if model.ProviderID > 0 && !seen[model.ProviderID] {
+			seen[model.ProviderID] = true
+			ids = append(ids, model.ProviderID)
+		}
+	}
+	if len(ids) == 0 {
+		return models, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays FROM providers WHERE id IN (`+placeholders+`)`, ids...)
 	if err != nil {
 		return nil, err
 	}

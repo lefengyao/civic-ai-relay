@@ -225,7 +225,7 @@ python scripts\package_release.py v0.3.2
 
 ## 更多文档
 
-- [docs/changelog.md](docs/changelog.md) — **变更记录（v0.3.4 → v0.8.0）**：每个版本「当时存在的问题 → 修复 → 回归」，以及尚未实现的事项。
+- [docs/changelog.md](docs/changelog.md) — **变更记录（v0.3.4 → v0.8.1）**：每个版本「当时存在的问题 → 修复 → 回归」，以及尚未实现的事项。
 - [docs/client-integration.md](docs/client-integration.md) — **客户端接入指南**：其他软件要填什么、怎么自检、错误码对照、代理配置、密钥安全边界。
 - [docs/deploy-with-trailblazer.md](docs/deploy-with-trailblazer.md) — **用部署管理器部署/更新本服务**：打包站点 zip、首次接管、Nginx（宝塔）SSE 配置。
 - [docs/admin-api.md](docs/admin-api.md) — 完整的管理端与公共 API 参考（路由、请求/响应字段、语义约定）。
