@@ -126,6 +126,13 @@ type ModelGroup struct {
 	// PeriodLimitStart 为 RFC3339 文本；PeriodLimitDays>0 且为空时由
 	// UpdateModelGroup 自动填 now（沿用 internal/config/settings.go 的既有行为）。
 	PeriodLimitStart *string
+	// ConcurrencyLimit 是这个组「同时能压几个请求」的上限：nil 或 0 = 不限。
+	// 与额度是两回事——额度管用掉多少，并发管同时有多少笔在跑；判定按
+	// source_group_id（真正提供渠道的组）数 status='reserved'，与全局并发上限
+	// 各判各的（全局超了同样算超限，不需要拿两者的数值互相换算）。
+	ConcurrencyLimit *int64
+	// ActiveConcurrency 是按当前时刻数出来的在跑请求数，只用于展示，不落库。
+	ActiveConcurrency int64
 	// BoundKeys 绑定到本组的客户端密钥数。删组前要让运维看到影响面。
 	// 成员组恒为 0：Key 只能绑聚合组（v23）。
 	BoundKeys int64
@@ -158,6 +165,9 @@ type NewModelGroup struct {
 	// normal（成员组）不允许带 GroupIDs。
 	Kind     string
 	GroupIDs []int64
+	// ConcurrencyLimit 是并发上限：nil 或 0 = 不限，负数拒绝。
+	// 主要给成员组用（上游账号的并发限制），判定按渠道归属组算。
+	ConcurrencyLimit *int64
 }
 
 type UpdateModelGroup struct {
@@ -177,6 +187,30 @@ type UpdateModelGroup struct {
 	TokenLimitPeriod  *int64
 	AmountLimitPeriod *int64
 	PeriodStart       *string // RFC3339；"" = 清除起点
+	// ConcurrencyLimit：nil = 保持原值；0 = 不限（落库为 NULL，不保留第二种表示）。
+	ConcurrencyLimit *int64
+}
+
+// normalizeConcurrencyLimit 归一化并发上限：nil / 0 都表示不限（统一落成 NULL，
+// 避免库里同时存在「没设」与「设成 0」两种等价表示），负数拒绝。
+func normalizeConcurrencyLimit(v *int64) (*int64, error) {
+	if v == nil || *v == 0 {
+		return nil, nil
+	}
+	if *v < 0 {
+		return nil, errors.New("并发上限不能为负数；0 或留空表示不限")
+	}
+	value := *v
+	return &value, nil
+}
+
+// nullableIntArg 把可空上限写库：nil → NULL，而不是 0（0 在业务上等于不限，
+// 但库里保留 NULL 才是「没设」的唯一表示）。
+func nullableIntArg(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 const DefaultGroupRateMilli int64 = 1000
@@ -435,12 +469,16 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 	if kind == GroupKindNormal && len(in.GroupIDs) > 0 {
 		return ModelGroup{}, errors.New("成员组不能包含其他模型组；需要包含成员组请改用「聚合模型组」类型")
 	}
+	concurrency, err := normalizeConcurrencyLimit(in.ConcurrencyLimit)
+	if err != nil {
+		return ModelGroup{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ModelGroup{}, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO model_groups(name,kind,enabled,rate_milli,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?)`, name, kind, 1, rate, nowUTC(), nowUTC())
+	result, err := tx.ExecContext(ctx, `INSERT INTO model_groups(name,kind,enabled,rate_milli,concurrency_limit,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?)`, name, kind, 1, rate, nullableIntArg(concurrency), nowUTC(), nowUTC())
 	if err != nil {
 		return ModelGroup{}, err
 	}
@@ -456,7 +494,7 @@ func (s *Store) CreateModelGroup(ctx context.Context, in NewModelGroup) (ModelGr
 	if err := tx.Commit(); err != nil {
 		return ModelGroup{}, err
 	}
-	return ModelGroup{ID: id, Name: name, Kind: kind, Enabled: true, RateMilli: rate}, nil
+	return ModelGroup{ID: id, Name: name, Kind: kind, Enabled: true, RateMilli: rate, ConcurrencyLimit: concurrency}, nil
 }
 
 // replaceGroupCompositionsTx 重建聚合组的成员关系。校验全部在事务内完成：
@@ -524,9 +562,9 @@ func (s *Store) ReplaceGroupCompositions(ctx context.Context, parentID int64, ch
 func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGroup) (ModelGroup, error) {
 	var g ModelGroup
 	var enabled int
-	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
+	var t5h, a5h, td, ad, tw, aw, pd, tp, ap, concurrency sql.NullInt64
 	var ps sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT name,kind,enabled,rate_milli,token_limit_5h,amount_limit_5h,token_limit_daily,amount_limit_daily,token_limit_weekly,amount_limit_weekly,period_limit_days,token_limit_period,amount_limit_period,period_limit_start FROM model_groups WHERE id=?`, id).Scan(&g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT name,kind,enabled,rate_milli,token_limit_5h,amount_limit_5h,token_limit_daily,amount_limit_daily,token_limit_weekly,amount_limit_weekly,period_limit_days,token_limit_period,amount_limit_period,period_limit_start,concurrency_limit FROM model_groups WHERE id=?`, id).Scan(&g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &concurrency); err != nil {
 		return ModelGroup{}, err
 	}
 	g.ID, g.Enabled = id, enabled == 1
@@ -534,6 +572,7 @@ func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGr
 	g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
 	g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
 	g.TokenLimitPeriod, g.AmountLimitPeriod = nullableInt(tp), nullableInt(ap)
+	g.ConcurrencyLimit = nullableInt(concurrency)
 	if pd.Valid {
 		days := int(pd.Int64)
 		g.PeriodLimitDays = &days
@@ -599,7 +638,14 @@ func (s *Store) UpdateModelGroup(ctx context.Context, id int64, in UpdateModelGr
 	if g.PeriodLimitDays == nil || *g.PeriodLimitDays == 0 {
 		g.PeriodLimitStart = nil
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,rate_milli=?,token_limit_5h=?,amount_limit_5h=?,token_limit_daily=?,amount_limit_daily=?,token_limit_weekly=?,amount_limit_weekly=?,period_limit_days=?,token_limit_period=?,amount_limit_period=?,period_limit_start=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), g.RateMilli, g.TokenLimit5H, g.AmountLimit5H, g.TokenLimitDaily, g.AmountLimitDaily, g.TokenLimitWeekly, g.AmountLimitWeekly, g.PeriodLimitDays, g.TokenLimitPeriod, g.AmountLimitPeriod, g.PeriodLimitStart, nowUTC(), id); err != nil {
+	if in.ConcurrencyLimit != nil {
+		concurrency, err := normalizeConcurrencyLimit(in.ConcurrencyLimit)
+		if err != nil {
+			return ModelGroup{}, err
+		}
+		g.ConcurrencyLimit = concurrency
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE model_groups SET name=?,enabled=?,rate_milli=?,token_limit_5h=?,amount_limit_5h=?,token_limit_daily=?,amount_limit_daily=?,token_limit_weekly=?,amount_limit_weekly=?,period_limit_days=?,token_limit_period=?,amount_limit_period=?,period_limit_start=?,concurrency_limit=?,updated_at_utc=? WHERE id=?`, g.Name, boolInt(g.Enabled), g.RateMilli, g.TokenLimit5H, g.AmountLimit5H, g.TokenLimitDaily, g.AmountLimitDaily, g.TokenLimitWeekly, g.AmountLimitWeekly, g.PeriodLimitDays, g.TokenLimitPeriod, g.AmountLimitPeriod, g.PeriodLimitStart, nullableIntArg(g.ConcurrencyLimit), nowUTC(), id); err != nil {
 		return ModelGroup{}, err
 	}
 	if g.Kind == GroupKindAggregate {
@@ -680,7 +726,7 @@ func (s *Store) AggregatesContaining(ctx context.Context, groupID int64) ([]Mode
 }
 
 func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id),(SELECT count(*) FROM group_compositions gc WHERE gc.child_group_id=g.id) FROM model_groups g ORDER BY g.id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,g.concurrency_limit,(SELECT count(*) FROM key_reservations kr WHERE kr.source_group_id=g.id AND kr.status='reserved'),(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id),(SELECT count(*) FROM group_compositions gc WHERE gc.child_group_id=g.id) FROM model_groups g ORDER BY g.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -691,10 +737,10 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 	for rows.Next() {
 		var g ModelGroup
 		var enabled int
-		var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
+		var t5h, a5h, td, ad, tw, aw, pd, tp, ap, concurrency sql.NullInt64
 		var ps sql.NullString
-		var bound, providers, parents int64
-		if err := rows.Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers, &parents); err != nil {
+		var active, bound, providers, parents int64
+		if err := rows.Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &concurrency, &active, &bound, &providers, &parents); err != nil {
 			return nil, err
 		}
 		g.Enabled = enabled == 1
@@ -703,6 +749,8 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 		g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
 		g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
 		g.TokenLimitPeriod, g.AmountLimitPeriod = nullableInt(tp), nullableInt(ap)
+		g.ConcurrencyLimit = nullableInt(concurrency)
+		g.ActiveConcurrency = active
 		if pd.Valid {
 			days := int(pd.Int64)
 			g.PeriodLimitDays = &days
@@ -759,11 +807,11 @@ func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error)
 	}
 	var g ModelGroup
 	var enabled int
-	var t5h, a5h, td, ad, tw, aw, pd, tp, ap sql.NullInt64
+	var t5h, a5h, td, ad, tw, aw, pd, tp, ap, concurrency sql.NullInt64
 	var ps sql.NullString
-	var bound, providers, parents int64
-	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id),(SELECT count(*) FROM group_compositions gc WHERE gc.child_group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
-		Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &bound, &providers, &parents)
+	var active, bound, providers, parents int64
+	err := s.db.QueryRowContext(ctx, `SELECT g.id,g.name,g.kind,g.enabled,g.rate_milli,g.token_limit_5h,g.amount_limit_5h,g.token_limit_daily,g.amount_limit_daily,g.token_limit_weekly,g.amount_limit_weekly,g.period_limit_days,g.token_limit_period,g.amount_limit_period,g.period_limit_start,g.concurrency_limit,(SELECT count(*) FROM key_reservations kr WHERE kr.source_group_id=g.id AND kr.status='reserved'),(SELECT count(*) FROM client_keys k WHERE k.group_id=g.id),(SELECT count(*) FROM group_providers gp WHERE gp.group_id=g.id),(SELECT count(*) FROM group_compositions gc WHERE gc.child_group_id=g.id) FROM model_groups g WHERE g.id=?`, id).
+		Scan(&g.ID, &g.Name, &g.Kind, &enabled, &g.RateMilli, &t5h, &a5h, &td, &ad, &tw, &aw, &pd, &tp, &ap, &ps, &concurrency, &active, &bound, &providers, &parents)
 	if err != nil {
 		return ModelGroup{}, err
 	}
@@ -773,6 +821,8 @@ func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error)
 	g.TokenLimitDaily, g.AmountLimitDaily = nullableInt(td), nullableInt(ad)
 	g.TokenLimitWeekly, g.AmountLimitWeekly = nullableInt(tw), nullableInt(aw)
 	g.TokenLimitPeriod, g.AmountLimitPeriod = nullableInt(tp), nullableInt(ap)
+	g.ConcurrencyLimit = nullableInt(concurrency)
+	g.ActiveConcurrency = active
 	if pd.Valid {
 		days := int(pd.Int64)
 		g.PeriodLimitDays = &days

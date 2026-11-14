@@ -1035,12 +1035,16 @@ func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 		ProviderIDs []int64  `json:"provider_ids"`
 		// GroupIDs 只在聚合组上有意义：它包含的普通模型组。
 		GroupIDs []int64 `json:"group_ids"`
+		// ConcurrencyLimit 并发上限（v26）：0 或缺省 = 不限。与全局并发上限
+		// 各判各的，不做「必须小于全局」这类联动校验。
+		ConcurrencyLimit *int64 `json:"concurrency_limit"`
 	}
 	if json.NewDecoder(r.Body).Decode(&p) != nil {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
-	g, err := h.repo.CreateModelGroup(r.Context(), store.NewModelGroup{Name: p.Name, Kind: p.Kind, RateMilli: rateMilli(p.Rate, p.RateMilli), GroupIDs: p.GroupIDs})
+	g, err := h.repo.CreateModelGroup(r.Context(), store.NewModelGroup{Name: p.Name, Kind: p.Kind, RateMilli: rateMilli(p.Rate, p.RateMilli), GroupIDs: p.GroupIDs,
+		ConcurrencyLimit: p.ConcurrencyLimit})
 	if err == nil {
 		err = h.repo.ReplaceGroupProviders(r.Context(), g.ID, p.ProviderIDs)
 	}
@@ -1140,6 +1144,8 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 			"TokenLimitWeekly": g.TokenLimitWeekly, "AmountLimitWeekly": g.AmountLimitWeekly,
 			"PeriodLimitDays": g.PeriodLimitDays, "PeriodLimitStart": g.PeriodLimitStart,
 			"TokenLimitPeriod": g.TokenLimitPeriod, "AmountLimitPeriod": g.AmountLimitPeriod,
+			// 并发上限与实时占用一起给：只给上限，运维无法判断「现在还剩几个名额」。
+			"ConcurrencyLimit": g.ConcurrencyLimit, "ActiveConcurrency": g.ActiveConcurrency,
 			"TensionPct": math.Round(pct*10) / 10,
 			"Overdrawn":  over,
 		})
@@ -1275,6 +1281,8 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			TokenLimitPeriod  *int64  `json:"token_limit_period"`
 			AmountLimitPeriod *int64  `json:"amount_limit_period"`
 			PeriodLimitStart  *string `json:"period_limit_start"`
+			// 并发上限（v26）：缺省 = 不动；0 = 不限；负数由 store 拒绝。
+			ConcurrencyLimit *int64 `json:"concurrency_limit"`
 		}
 		if json.NewDecoder(r.Body).Decode(&p) != nil {
 			writeAdminError(w, 400, "invalid_request")
@@ -1292,6 +1300,7 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			TokenLimitWeekly: p.TokenLimitWeekly, AmountLimitWeekly: p.AmountLimitWeekly,
 			PeriodLimitDays: p.PeriodLimitDays, TokenLimitPeriod: p.TokenLimitPeriod,
 			AmountLimitPeriod: p.AmountLimitPeriod, PeriodStart: p.PeriodLimitStart,
+			ConcurrencyLimit: p.ConcurrencyLimit,
 		})
 		if err != nil {
 			writeAdminError(w, 400, "group_invalid")

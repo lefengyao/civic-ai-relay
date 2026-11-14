@@ -401,6 +401,7 @@ details .card{margin-bottom:0}
           <div class="form-grid">
             <div class="field" style="margin-bottom:12px"><label>组名</label><input name="name" required placeholder="例如 素材池 / 夜间通道" style="max-width:280px"></div>
             <div class="field" style="margin-bottom:12px"><label>计费倍率（1.00 = 原价）</label><input name="rate" type="number" step="0.01" min="0.01" value="1.00" required style="max-width:140px"></div>
+            <div class="field" style="margin-bottom:12px"><label>并发上限（留空 = 不限）</label><input name="concurrency" type="number" step="1" min="0" placeholder="例如 4" style="max-width:140px"><span class="hint">同时在跑的请求数上限；满了直接 429。与全局并发上限各判各的。</span></div>
           </div>
           <div class="field"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label><div class="check-list" id="group-model-checks"></div></div>
           <div class="form-actions"><button class="btn">创建成员组</button></div>
@@ -1716,7 +1717,7 @@ async function loadGroups() {
   // 错误的页面上编辑它（成员组编辑弹窗只改自有渠道，聚合组的成员关系会被误解为丢失）。
   const plainGroups = cache.groups.filter(g => g.Kind !== "aggregate");
   if (!plainGroups.length) { $("group-data").innerHTML = `<div class="empty">还没有成员组。成员组是「渠道 + 额度」的池子，建好后要加进某个聚合模型组才会对外提供模型。</div>`; return; }
-  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>额度</th><th>被聚合组包含</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
+  $("group-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>状态</th><th>额度</th><th>并发</th><th>被聚合组包含</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
     plainGroups.map(g => {
       const ops = isAdmin
         ? `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="monitorGroup(${g.ID},this)">检测</button> <button class="btn-ghost btn-sm" onclick="editGroup(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delGroup(${g.ID})">删除</button>`
@@ -1736,11 +1737,19 @@ async function loadGroups() {
             : `<span class="tag ok" title="三个主窗口中最高用量占比（按 Token）">${tension.toFixed(0)}%</span>`;
       // 成员组自己接不到请求：它的渠道与额度只在被聚合组包含之后才会被用到。
       // 这一列就是为了让「这个组到底有没有在被使用」一眼可见，避免建完忘了加进聚合组。
+      // 并发：上限为空 = 不限，但「现在在跑几个」仍然值得看（尤其排查上游 429 时）。
+      const active = Number(g.ActiveConcurrency || 0);
+      const concLimit = g.ConcurrencyLimit == null ? 0 : Number(g.ConcurrencyLimit);
+      const concCell = concLimit <= 0
+        ? `<span style="color:var(--muted)" title="没有设并发上限">不限${active ? `（在跑 ${active}）` : ""}</span>`
+        : active >= concLimit
+          ? `<span class="tag err" title="名额已满：新请求会被 429 拒绝，等前面的请求结束即恢复">${active} / ${concLimit} 已满</span>`
+          : `<span class="tag ${active / concLimit >= 0.8 ? "warn" : "ok"}" title="在跑 / 上限">${active} / ${concLimit}</span>`;
       const parents = Number(g.ParentCount || 0);
       const parentCell = parents > 0
         ? `<span class="tag ok" title="已被 ${parents} 个聚合组包含：它的渠道与额度随这些组对外提供">${parents} 个</span>`
         : `<span class="tag off" title="还没有聚合组包含它：这个组的渠道与额度不会被任何请求用到">未被包含</span>`;
-      return `<tr><td class="mono">${g.ID}</td><td style="min-width:96px"><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td style="white-space:nowrap">${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td style="white-space:nowrap">${quotaCell}</td><td style="white-space:nowrap">${parentCell}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td style="white-space:nowrap">${ops}</td></tr>`;
+      return `<tr><td class="mono">${g.ID}</td><td style="min-width:96px"><b>${esc(g.Name)}</b></td><td class="mono">${g.RateMilli != null ? "×" + (g.RateMilli / 1000).toFixed(2) : "—"}</td><td style="white-space:nowrap">${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td style="white-space:nowrap">${quotaCell}</td><td style="white-space:nowrap">${concCell}</td><td style="white-space:nowrap">${parentCell}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td style="white-space:nowrap">${ops}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
 /* ── 分组概览：与全局概览同口径，但仅统计走该组内渠道的请求 ── */
@@ -1836,6 +1845,10 @@ window.editGroup = async id => {
         ${quotaField("ap", "自定义周期金额限额（元）", moneyVal(g.AmountLimitPeriod), true)}
       </div>
       ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}（填天数时若起点为空会自动从现在开始；周期用满后拒绝新请求，调大限额即恢复）</p>` : ""}
+      <div class="field" style="margin-top:12px"><label>并发上限（同时在跑的请求数；留空 = 保持原值，0 = 不限）</label>
+        <input id="eg-concurrency" type="number" min="0" step="1" placeholder="例如 4" value="${g.ConcurrencyLimit == null ? "" : g.ConcurrencyLimit}" style="max-width:180px">
+        <span class="hint">只约束「由本组渠道承接」的请求：名额满了发出去的请求直接 429（在跑 ${Number(g.ActiveConcurrency || 0)} 个）。与全局并发上限各判各的——全局先超同样是超限，两者不需要互相比大小。</span>
+      </div>
     </div>
     <div class="field" style="margin-top:14px"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label>${providerChecksHTML(okProviders, memberIds, id, "暂无启用中的渠道")}</div>
     ${offMembers.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${offMembers.length} 个已停用的成员渠道保存后将被移除</p>` : ""}
@@ -1857,7 +1870,7 @@ window.editGroup = async id => {
       token_limit_daily: numOrNull("td", false), amount_limit_daily: numOrNull("ad", true),
       token_limit_weekly: numOrNull("tw", false), amount_limit_weekly: numOrNull("aw", true),
       period_limit_days: numOrNull("pd", false), token_limit_period: numOrNull("tp", false),
-      amount_limit_period: numOrNull("ap", true),
+      amount_limit_period: numOrNull("ap", true), concurrency_limit: numOrNull("concurrency", false),
     }) });
     await apiJSON("/admin/api/groups/" + id + "/providers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider_ids: checkedIds($("edit-body")) }) });
     loadGroups();
@@ -1876,6 +1889,7 @@ window.viewGroup = async id => {
       <div class="field"><label>组名</label><div><b>${esc(g.Name)}</b></div></div>
       <div class="field"><label>倍率（不参与扣费）</label><div class="mono">×${rate.toFixed(2)}</div></div>
       <div class="field"><label>状态</label><div>${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</div></div>
+      <div class="field"><label>并发上限</label><div class="mono">${g.ConcurrencyLimit == null ? "不限" : `${g.ConcurrencyLimit}（在跑 ${Number(g.ActiveConcurrency || 0)}）`}</div></div>
     </div>
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${groupMemberDetail(memberIds, null)}</div>
   `);
@@ -1885,7 +1899,11 @@ $("group-form").onsubmit = async e => {
   const ids = [...$("group-model-checks").querySelectorAll("input:checked")].map(i => Number(i.value));
   try {
     // kind 必须显式写 normal：不传 kind 时后端按「可对外」的聚合组处理。
-    await apiJSON("/admin/api/groups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: new FormData(e.target).get("name"), kind: "normal", rate: parseFloat(new FormData(e.target).get("rate")) || 1, provider_ids: ids }) });
+    // concurrency 留空 → 不传，后端按「不限」；填 0 也等于不限。
+    const concurrencyRaw = String(new FormData(e.target).get("concurrency") || "").trim();
+    const concurrency = concurrencyRaw === "" ? null : Number(concurrencyRaw);
+    if (concurrency != null && (!Number.isFinite(concurrency) || concurrency < 0)) throw new Error("并发上限不能为负数；留空或 0 表示不限");
+    await apiJSON("/admin/api/groups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: new FormData(e.target).get("name"), kind: "normal", rate: parseFloat(new FormData(e.target).get("rate")) || 1, concurrency_limit: concurrency, provider_ids: ids }) });
     toast("成员组已创建", "ok"); loadGroups();
   } catch (err) { toast(err.message, "err"); }
 };

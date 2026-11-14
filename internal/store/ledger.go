@@ -65,6 +65,12 @@ func (e *QuotaError) Detail() string {
 	if window == "" {
 		window = e.Scope
 	}
+	// 并发上限不是额度：它不需要等窗口轮换，也不是「欠费」，重试间隔对了就能过。
+	// 套用下面「已用满…处于欠费状态」的文案会把运维引到错误的处置方向。
+	if e.Code == "group_concurrency_exceeded" {
+		detail := fmt.Sprintf("分组「%s」#%d 并发已满（在跑 %d，上限 %d），请等前面的请求结束后重试", e.Group, e.GroupID, e.Used, e.Limit)
+		return detail
+	}
 	metric := "Token"
 	if e.Metric == "amount" {
 		metric = "金额"
@@ -372,6 +378,37 @@ func checkGroupQuota(ctx context.Context, conn *sql.Conn, groupID int64, groupNa
 	return nil
 }
 
+// checkGroupConcurrency 判定「真正提供这条渠道的组」还有没有并发余量。
+//
+// 与额度两回事：额度管窗口内用掉多少，并发管同一时刻有几笔在跑。上游账号常见的
+// 限制是并发数（超过就排队或直接 429），窗口额度咬不住瞬时打满。
+//
+// 计数口径与额度一致，都按 source_group_id：一笔请求由成员组的渠道承接，就占成员组
+// 的名额。全局并发上限是另一道闸，两边各自判定——全局先超也算超限，不需要把两个
+// 数字换算成同一个尺度（这是老板明确要的「与全局上限无关」）。
+//
+// 事务内 count + insert 不会超发：ReserveRequest 全程持有 reservationMu，并且用的是
+// BEGIN IMMEDIATE，同一进程内的预留是串行的。
+func checkGroupConcurrency(ctx context.Context, conn *sql.Conn, groupID int64) error {
+	var name string
+	var limit sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT name,concurrency_limit FROM model_groups WHERE id=?`, groupID).Scan(&name, &limit); err != nil {
+		return err
+	}
+	if !limit.Valid || limit.Int64 <= 0 {
+		return nil
+	}
+	var active int64
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM key_reservations WHERE source_group_id=? AND status='reserved'`, groupID).Scan(&active); err != nil {
+		return err
+	}
+	if active >= limit.Int64 {
+		return &QuotaError{Code: "group_concurrency_exceeded", Scope: "concurrency", Metric: "requests",
+			Used: active, Limit: limit.Int64, Group: name, GroupID: groupID}
+	}
+	return nil
+}
+
 func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestReservation, error) {
 	s.reservationMu.Lock()
 	defer s.reservationMu.Unlock()
@@ -549,6 +586,11 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 		if err := checkGroupQuota(ctx, conn, sourceGroupID, srcName, srcLimits, in.StartedAt, started, date); err != nil {
 			return rollback(err)
 		}
+	}
+	// 并发上限按「承接这条渠道的组」判。放在额度之后：额度是硬闸（要等窗口轮换
+	// 或调额），并发是瞬时状态（前面的请求一结束就恢复），先报硬闸对运维更有用。
+	if err := checkGroupConcurrency(ctx, conn, sourceGroupID); err != nil {
+		return rollback(err)
 	}
 	// Key 总额度不随窗口轮换，用满即欠费。这里只拒绝请求，不再自动停用 Key：
 	// 永久停用会让"明明调大了限额却仍然用不了"，而且必须人工恢复，比欠费即拒更难排查。

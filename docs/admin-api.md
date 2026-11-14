@@ -121,12 +121,28 @@
 | `key_amount_quota_exceeded` | Key 的金额总额度已用满 |
 | `rpm_exceeded` | 超过 `RPM_LIMIT`（滚动一分钟） |
 | `rate_limit_exceeded` | 全局并发或 Key 并发达到上限 |
+| `group_concurrency_exceeded` | 该组自己的并发上限已满（v26） |
 
 `error.message` 形如（`error.detail` 还会带上**分组名与 ID**，一眼看出是哪一组的额度咬住了）：
 
 ```
 token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，限额 5,000,000，分组「团队A」#3）。当前处于欠费状态，请等待窗口轮换或在管理台调大限额
 ```
+
+#### 分组并发上限（v26）
+
+额度管「一段时间里用掉多少」，并发管「同一时刻有几笔在跑」。上游账号常见的限制是并发数
+（超了排队或直接 429），窗口额度咬不住瞬时打满，所以每个组另有 `concurrency_limit`：
+
+- **0 或 `null` = 不限**（默认，既有组升级后行为不变）。
+- 计数口径与额度一致：按 `key_reservations.source_group_id` 数 `status='reserved'`，也就是
+  「这条渠道真正由哪个组提供」。成员组被聚合组调用时才会计入它自己的名额；聚合组自有
+  渠道的请求计入聚合组自己。
+- **与全局并发上限（`GLOBAL_CONCURRENCY_LIMIT`）各判各的**：两者都要满足，全局先超同样是
+  超限，不需要把两个数字换算成同一尺度（管理台也不做「必须小于全局」这类联动校验）。
+- 名额满时返回 429 `group_concurrency_exceeded`，`message` 指出是哪个组、在跑几个、上限多少；
+  前面的请求结算后**立即恢复**，无需等窗口轮换，也不需要人工干预。
+- 计数与预留同在一个事务里（`BEGIN IMMEDIATE` + 进程内串行），不会超发。
 
 > 额度用满**不会**停用 Key。Key 停用只能手动操作；停用后公共接口返回 401 `invalid_api_key`。
 > 旧版本会在 Key 总额度用满时自动置 `enabled=0`，该行为已移除，升级时的迁移会把历史遗留的
@@ -276,9 +292,9 @@ curl -sS -X POST http://<服务器>:8000/admin/api/providers \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/api/groups` | 列表。每项含 `ID/Name/Kind/Enabled/RateMilli`、`BoundKeys`（绑定到该组的密钥数；**成员组恒为 0**，v23 起 Key 只能绑聚合组）、`ParentCount`（被几个聚合组包含；聚合组恒为 0）、`Providers`（**自有**渠道数）、`Members`/`MemberIDs`（聚合组的成员组摘要 `{ID,Name,Enabled,RateMilli,Providers}`，普通组为空数组）、10 个额度字段（`TokenLimit5H` … `PeriodLimitStart`）以及 `TensionPct` / `Overdrawn`（三个主窗口中最高用量占比按 Token 计；`Overdrawn=true` 表示至少一个窗口已用满）。密钥主体登录时 `Members`/`MemberIDs` 恒为空 —— 成员组名属于管理员视角的拓扑 |
-| POST | `/admin/api/groups` | 创建；body `{name, kind?, rate?, rate_milli?, provider_ids?, group_ids?}`。`kind` 缺省 `aggregate`（v23：可对外是默认，成员组要显式声明）；`aggregate` 时 `group_ids` 是成员组（必须存在且为 `normal`，不接受聚合组与自身，违反返回 400 且**不留下半成品**）。成员组（`normal`）带 `group_ids` 一律 400。`provider_ids` 里的渠道必须**尚未属于其他组**（v24），否则 400 `provider_in_use` 并带「已属于哪个组」，同时**不会留下这个组**。**创建不带额度字段**，额度创建后在 PUT 里设 |
-| PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` + 9 个额度字段（`token_limit_5h`/`amount_limit_5h`/`token_limit_daily`/`amount_limit_daily`/`token_limit_weekly`/`amount_limit_weekly`/`period_limit_days`/`token_limit_period`/`amount_limit_period`）与 `period_limit_start`。**缺省 = 保持原值**，`0` = 不限，负数 400（`group_invalid`）。`period_limit_days > 0` 且起点为空时自动填 `now`；天数归零会清掉起点。**`kind` 不可改**（建组时定） |
+| GET | `/admin/api/groups` | 列表。每项含 `ID/Name/Kind/Enabled/RateMilli`、`BoundKeys`（绑定到该组的密钥数；**成员组恒为 0**，v23 起 Key 只能绑聚合组）、`ParentCount`（被几个聚合组包含；聚合组恒为 0）、`Providers`（**自有**渠道数）、`Members`/`MemberIDs`（聚合组的成员组摘要 `{ID,Name,Enabled,RateMilli,Providers}`，普通组为空数组）、10 个额度字段（`TokenLimit5H` … `PeriodLimitStart`）、`ConcurrencyLimit` / `ActiveConcurrency`（v26：并发上限与此刻在跑数，`null` = 不限）以及 `TensionPct` / `Overdrawn`（三个主窗口中最高用量占比按 Token 计；`Overdrawn=true` 表示至少一个窗口已用满）。密钥主体登录时 `Members`/`MemberIDs` 恒为空 —— 成员组名属于管理员视角的拓扑 |
+| POST | `/admin/api/groups` | 创建；body `{name, kind?, rate?, rate_milli?, provider_ids?, group_ids?, concurrency_limit?}`（`concurrency_limit` v26，见下方「并发上限」）。`kind` 缺省 `aggregate`（v23：可对外是默认，成员组要显式声明）；`aggregate` 时 `group_ids` 是成员组（必须存在且为 `normal`，不接受聚合组与自身，违反返回 400 且**不留下半成品**）。成员组（`normal`）带 `group_ids` 一律 400。`provider_ids` 里的渠道必须**尚未属于其他组**（v24），否则 400 `provider_in_use` 并带「已属于哪个组」，同时**不会留下这个组**。**创建不带额度字段**，额度创建后在 PUT 里设 |
+| PUT | `/admin/api/groups/{id}` | 更新 `{name?, enabled?, rate?, rate_milli?}` + 9 个额度字段（`token_limit_5h`/`amount_limit_5h`/`token_limit_daily`/`amount_limit_daily`/`token_limit_weekly`/`amount_limit_weekly`/`period_limit_days`/`token_limit_period`/`amount_limit_period`）、`period_limit_start` 与 `concurrency_limit`（v26）。**缺省 = 保持原值**，`0` = 不限，负数 400（`group_invalid`）。`period_limit_days > 0` 且起点为空时自动填 `now`；天数归零会清掉起点。**`kind` 不可改**（建组时定） |
 | DELETE | `/admin/api/groups/{id}` | 删除；返回 `{"ok": true, "unbound_keys": N, "aggregates": [...]}`（N = 刚才被解绑的密钥数，解绑后它们立即无法调用任何模型；`aggregates` = 把该组当成员的聚合组，删成员组会改变它们的可用模型）；重复删除返回 404 |
 | GET | `/admin/api/groups/{id}/providers` | 组内**自有**渠道 ID 列表（聚合组不含成员组带来的渠道）；组不存在返回 404（v0.11.1 之前会回一个 `200 {"data":[]}`，看起来像「这个组没有渠道」） |
 | PUT | `/admin/api/groups/{id}/providers` | **整体替换**自有渠道；body `{"provider_ids": [...]}`；拒绝停用渠道（400，文案带渠道名）；分组已停用 400；渠道已被**别的组**占用时 400 `provider_in_use`（同一组重复保存是幂等的）。聚合组同样可用。**组不存在返回 404**（v0.11.1 之前是 400 `group_invalid: sql: no rows in result set`） |
@@ -470,6 +486,7 @@ curl http://<relay-ip>:8000/v1/chat/completions \
 | v25 | `providers` 加 `schedule_windows`（JSON 多段，默认空）—— 旧的单段列继续写第一段，历史数据不需要回填 |
 | v22 | 聚合模型组：`model_groups.kind`（默认 `normal`）、`group_compositions`（聚合组 → 成员组，只允许一层）、`requests.source_group_id` 与 `key_reservations.source_group_id`（真正提供该模型的组）。纯新增，既有组与账目行为不变 |
 | v23 | **只有聚合组对外**：把「没有被任何聚合组包含」的 `normal` 组改成 `aggregate`（升级前它们本来就是独立对外的组，不改会让既有 Key 全部失效）；成员关系里的 `normal` 组保留成员身份。无结构变更 |
+| v26 | `model_groups` 加 `concurrency_limit`（并发上限，`NULL` = 不限），并建 `key_reservations(source_group_id,status)` 索引供计数。纯新增，既有组不限并发，升级后行为不变 |
 | v24 | **一个渠道只能属于一个组**：把历史上重复挂到多个组的渠道收敛成一条（保留**最早建立**的归属，rowid 最小），再建唯一索引 `group_providers(provider_id)`。重复的那条关系过去从未被计费（用量恒为 0），删掉不影响账目；若某个组因此变成 0 个渠道，管理台会直接显示「0 渠道」 |
 
 迁移在启动时自动应用，记录在 `schema_migrations` 表。

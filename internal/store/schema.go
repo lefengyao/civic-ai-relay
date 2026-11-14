@@ -446,6 +446,19 @@ var migrations = []migration{
 	{version: 25, statements: []string{
 		`ALTER TABLE providers ADD COLUMN schedule_windows TEXT NOT NULL DEFAULT ''`,
 	}},
+	// v26：成员组并发上限（NULL = 不限）。
+	//
+	// 额度管的是「用掉多少」，并发管的是「同时压几个」——上游账号的限流通常按
+	// 并发算（比如某个池子只能同时跑 4 个），只靠窗口额度咬不住瞬时打满。
+	//
+	// 判定口径与额度一致：按 source_group_id（真正提供该渠道的组）数 status='reserved'，
+	// 与全局并发上限各判各的——全局先超也是超限，两者是「都要满足」，不需要互相换算。
+	// 计数走 (source_group_id, status) 索引；预留事务本身是串行的（reservationMu +
+	// BEGIN IMMEDIATE），所以「先数后插」不会超发。
+	{version: 26, statements: []string{
+		`ALTER TABLE model_groups ADD COLUMN concurrency_limit INTEGER`,
+		`CREATE INDEX idx_key_reservations_source_status ON key_reservations(source_group_id, status)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {
