@@ -163,14 +163,30 @@ details .card{margin-bottom:0}
 .check-item:hover{border-color:var(--accent)}
 .check-item.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
 .check-item input{width:auto;margin:0}
-/* 时段行（v25）：一段 = 起止时间 + 这一段的星期。星期做成紧凑小格，7 个一行放得下。 */
-.sched-window{display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap}
-.sched-window input[type=time]{flex:1 1 96px;min-width:90px}
-.sched-days{display:flex;gap:2px}
-.sched-day{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--border);border-radius:5px;font-size:11px;color:var(--muted);cursor:pointer;user-select:none;background:#fff;transition:all .12s}
+/* 时段行（v25）：一段 = 起止时间 + 这一段的星期。
+   列宽全固定，不让 flex 自由伸缩 —— 否则输入框会抢空间把星期格压扁，
+   两行内容一样却宽度不同（同一张表里最显眼的那种不齐）。 */
+#es-windows{margin:0 0 10px}
+.sched-window{display:grid;grid-template-columns:88px 14px 88px auto 1fr;align-items:center;column-gap:8px;margin-bottom:8px}
+.sched-window input[type=time]{width:100%;height:36px;padding:0 6px;font-size:13.5px;box-sizing:border-box}
+/* 时间输入框内部由浏览器排版：把时钟图标贴紧文字，别让中间空出一大片。 */
+.sched-window input[type=time]::-webkit-calendar-picker-indicator{padding:0;margin-left:4px;opacity:.55;cursor:pointer}
+.sched-window input[type=time]::-webkit-datetime-edit{padding:0}
+.sched-arrow{justify-self:center;color:var(--muted);font-size:13px;line-height:1}
+.sched-days{display:flex;gap:3px;justify-self:start}
+.sched-day{display:inline-flex;flex:0 0 24px;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--border);border-radius:6px;font-size:11.5px;line-height:1;color:var(--muted);cursor:pointer;user-select:none;background:#fff;transition:all .12s}
 .sched-day:hover{border-color:var(--accent)}
 .sched-day.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600}
 .sched-day input{display:none}
+/* 删除段：与时间框同高、正方形，靠右成一列；hover 才转红，平时不抢注意力。 */
+.sched-del{justify-self:end;width:30px;height:36px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:15px;line-height:1;border-radius:8px}
+.sched-del:hover{color:#dc2626;border-color:#fca5a5;background:#fef2f2}
+.sched-del:disabled{cursor:not-allowed;color:var(--muted);border-color:var(--border);background:transparent}
+@media(max-width:640px){
+  .sched-window{grid-template-columns:minmax(0,1fr) 14px minmax(0,1fr) 30px;row-gap:8px}
+  .sched-days{grid-row:2;grid-column:1/4}
+  .sched-del{grid-row:1;grid-column:4}
+}
 
 /* ── 渠道模型管理弹窗 ─────────────── */
 .pm-sec{margin-bottom:20px;padding-bottom:16px;border-bottom:1px dashed var(--border)}
@@ -1189,10 +1205,10 @@ const scheduleWindowRowHTML = (start, end, mask) => {
   }).join("");
   return `<div class="sched-window">
   <input type="time" class="sched-window-start" value="${esc(start)}">
-  <span style="color:var(--muted)">→</span>
+  <span class="sched-arrow" aria-hidden="true">→</span>
   <input type="time" class="sched-window-end" value="${esc(end)}">
   <div class="sched-days" title="这一段的生效星期；全不选 = 每天">${chips}</div>
-  <button type="button" class="btn-ghost btn-sm" onclick="removeScheduleWindow(this)" title="删除这一段">×</button>
+  <button type="button" class="btn-ghost sched-del" onclick="removeScheduleWindow(this)" title="删除这一段" aria-label="删除这一段">×</button>
 </div>`;
 };
 window.addScheduleWindow = () => {
@@ -1264,7 +1280,7 @@ window.editProviderSchedule = id => {
       <div class="field"><label>时间段（北京时间，可加多段）</label>
         <div id="es-windows">${windowRows}</div>
         <button type="button" class="btn-ghost btn-sm" onclick="addScheduleWindow()">+ 添加时段</button>
-        <span class="hint">每段右侧的「一二三…」是这一段自己的生效星期，想只在某几天生效就取消其余几天，所以「工作日夜间 + 周末全天」可以放在同一条渠道里。起点含、终点不含；22:00 → 08:00 表示到次日早上八点；起止相同 = 全天；任一段命中即可用。跨零点时凌晨那段算作时段开始那天（周一 22:00-08:00 含周二凌晨）。</span>
+        <span class="hint">每段右侧的一二三是这一段自己的生效星期，取消不需要的天即可；起点含、终点不含，22:00 → 08:00 表示到次日八点，起止相同 = 全天；任一段命中即可用，跨零点时凌晨算作开始那天。</span>
       </div>
     </div>
   `, async () => {
