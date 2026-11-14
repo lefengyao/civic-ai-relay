@@ -476,6 +476,18 @@ var migrations = []migration{
 		)`,
 		`CREATE INDEX idx_group_pools_pool ON group_pools(pool_id)`,
 	}},
+	// v28：不生效时间段（排除时段）。
+	//
+	// 之前只能用「包含时段」表达可用性，于是「每天凌晨 02:00-04:00 上游维护」这种
+	// 需求没法写：改成 daily 就要把剩下 22 小时逐段列出来（还得分工作日/周末），
+	// 漏一段就等于把渠道关掉。排除段是「减法」，与三种生效方式正交——不限 + 排除
+	// 夜里两小时、夜间窗口 + 排除周三下午，都能直接表达。
+	//
+	// 存法与 schedule_windows 一致（JSON 数组，Go 侧判定），空串 = 不排除，
+	// 老数据不需要回填。
+	{version: 28, statements: []string{
+		`ALTER TABLE providers ADD COLUMN schedule_exclude_windows TEXT NOT NULL DEFAULT ''`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

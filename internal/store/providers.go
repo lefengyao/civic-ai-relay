@@ -31,6 +31,9 @@ type Provider struct {
 	// ScheduleWindows 是「每天重复」下的多段时段（v25）。空表示没配多段，
 	// 时段以 StartMinute/EndMinute 那条单段为准。
 	ScheduleWindows []ScheduleWindow
+	// ScheduleExcludeWindows 是排除时间段（v28）。命中任一段即不可用，
+	// 与 ScheduleMode 无关；空表示不排除。
+	ScheduleExcludeWindows []ScheduleWindow
 	// GroupID / GroupName 是这条渠道归哪个组（v24 起一个渠道最多属于一个组）。
 	// 由 ListProviders / GetProvider 填充：管理台列表要显示归属，组编辑的渠道
 	// 勾选列表也要靠它把已经在别组的渠道灰掉。
@@ -64,6 +67,9 @@ type UpdateProvider struct {
 	// ScheduleWindows 是 v25 的多段写法。nil = 没传，按 DailyStart/DailyEnd 单段
 	// 处理（老客户端）；非 nil（含空切片）= 按多段重建，空切片由归一化层报错。
 	ScheduleWindows *[]ScheduleWindowInput `json:"ScheduleWindows"`
+	// ScheduleExcludeWindows 是 v28 的排除段（[{"start":"02:00","end":"04:00"},…]）。
+	// 跟着 ScheduleMode 一起「整段替换」：没传 ScheduleMode 时保持原排除段不变。
+	ScheduleExcludeWindows []ScheduleWindowInput `json:"ScheduleExcludeWindows"`
 }
 
 func derefString(value *string) string {
@@ -180,10 +186,11 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 		schedule = ProviderSchedule{Mode: ProviderScheduleAlways}
 	}
 	now := nowUTC()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO providers(name,base_url,protocol,api_key_ciphertext,enabled,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	result, err := s.db.ExecContext(ctx, `INSERT INTO providers(name,base_url,protocol,api_key_ciphertext,enabled,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows,schedule_exclude_windows,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		name, baseURL, protocol, []byte(ciphertext), enabled,
 		schedule.Mode, schedule.StartUTC, schedule.EndUTC, schedule.StartMinute, schedule.EndMinute, schedule.Weekdays,
 		encodeScheduleWindows(schedule.Windows),
+		encodeScheduleWindows(schedule.ExcludeWindows),
 		now, now)
 	if err != nil {
 		return Provider{}, friendlyProviderWriteError(err, name)
@@ -195,8 +202,9 @@ func (s *Store) CreateProvider(ctx context.Context, in NewProvider) (Provider, e
 	return Provider{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Enabled: true, APIKeyConfigured: true,
 		ScheduleMode: schedule.Mode, ScheduleStartUTC: schedule.StartUTC, ScheduleEndUTC: schedule.EndUTC,
 		ScheduleStartMinute: schedule.StartMinute, ScheduleEndMinute: schedule.EndMinute, ScheduleWeekdays: schedule.Weekdays,
-		ScheduleWindows: schedule.Windows,
-		ScheduleActive:  schedule.ActiveAt(time.Now())}, nil
+		ScheduleWindows:        schedule.Windows,
+		ScheduleExcludeWindows: schedule.ExcludeWindows,
+		ScheduleActive:         schedule.ActiveAt(time.Now())}, nil
 }
 
 func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider) (Provider, error) {
@@ -208,10 +216,11 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 	var currentScheduleMode, currentStart, currentEnd string
 	var currentStartMinute, currentEndMinute, currentWeekdays int
 	var currentWindowsRaw string
-	if err := s.db.QueryRowContext(ctx, `SELECT name,base_url,protocol,api_key_ciphertext,enabled,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows FROM providers WHERE id=?`, id).Scan(
+	var currentExcludeRaw string
+	if err := s.db.QueryRowContext(ctx, `SELECT name,base_url,protocol,api_key_ciphertext,enabled,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows,schedule_exclude_windows FROM providers WHERE id=?`, id).Scan(
 		&currentName, &currentURL, &currentProtocol, &currentCipher, &currentEnabled,
 		&currentScheduleMode, &currentStart, &currentEnd, &currentStartMinute, &currentEndMinute, &currentWeekdays,
-		&currentWindowsRaw); err != nil {
+		&currentWindowsRaw, &currentExcludeRaw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Provider{}, fmt.Errorf("供应商 #%d 不存在（可能已被删除，请刷新页面）", id)
 		}
@@ -258,15 +267,17 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 	scheduleMode, scheduleStart, scheduleEnd := currentScheduleMode, currentStart, currentEnd
 	scheduleStartMinute, scheduleEndMinute, scheduleWeekdays := currentStartMinute, currentEndMinute, currentWeekdays
 	windowsRaw := currentWindowsRaw
+	excludeRaw := currentExcludeRaw
 	if in.ScheduleMode != nil {
 		normalized, scheduleErr := NormalizeProviderSchedule(ProviderScheduleInput{
-			Mode:       *in.ScheduleMode,
-			Start:      derefString(in.ScheduleStart),
-			End:        derefString(in.ScheduleEnd),
-			DailyStart: derefString(in.ScheduleDailyStart),
-			DailyEnd:   derefString(in.ScheduleDailyEnd),
-			Weekdays:   derefWeekdays(in.ScheduleWeekdays),
-			Windows:    derefWindows(in.ScheduleWindows),
+			Mode:           *in.ScheduleMode,
+			Start:          derefString(in.ScheduleStart),
+			End:            derefString(in.ScheduleEnd),
+			DailyStart:     derefString(in.ScheduleDailyStart),
+			DailyEnd:       derefString(in.ScheduleDailyEnd),
+			Weekdays:       derefWeekdays(in.ScheduleWeekdays),
+			Windows:        derefWindows(in.ScheduleWindows),
+			ExcludeWindows: in.ScheduleExcludeWindows,
 		})
 		if scheduleErr != nil {
 			return Provider{}, scheduleErr
@@ -274,11 +285,12 @@ func (s *Store) UpdateProvider(ctx context.Context, id int64, in UpdateProvider)
 		scheduleMode, scheduleStart, scheduleEnd = normalized.Mode, normalized.StartUTC, normalized.EndUTC
 		scheduleStartMinute, scheduleEndMinute, scheduleWeekdays = normalized.StartMinute, normalized.EndMinute, normalized.Weekdays
 		windowsRaw = encodeScheduleWindows(normalized.Windows)
+		excludeRaw = encodeScheduleWindows(normalized.ExcludeWindows)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,protocol=?,api_key_ciphertext=?,enabled=?,schedule_mode=?,schedule_start_utc=?,schedule_end_utc=?,schedule_start_minute=?,schedule_end_minute=?,schedule_weekdays=?,schedule_windows=?,updated_at_utc=? WHERE id=?`,
+	if _, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?,base_url=?,protocol=?,api_key_ciphertext=?,enabled=?,schedule_mode=?,schedule_start_utc=?,schedule_end_utc=?,schedule_start_minute=?,schedule_end_minute=?,schedule_weekdays=?,schedule_windows=?,schedule_exclude_windows=?,updated_at_utc=? WHERE id=?`,
 		name, baseURL, protocol, []byte(ciphertext), enabled,
 		scheduleMode, scheduleStart, scheduleEnd, scheduleStartMinute, scheduleEndMinute, scheduleWeekdays,
-		windowsRaw, nowUTC(), id); err != nil {
+		windowsRaw, excludeRaw, nowUTC(), id); err != nil {
 		return Provider{}, friendlyProviderWriteError(err, name)
 	}
 	// 轮换密钥或修改地址后，缓存的 upstream client 已过期，必须驱逐重建；
@@ -313,7 +325,7 @@ func derefWindows(value *[]ScheduleWindowInput) []ScheduleWindowInput {
 
 // providerSelect 是读渠道的唯一列清单：时段列必须一起读，否则管理台会看到
 // 「时段已保存但状态永远是不限」这种自相矛盾的界面。
-const providerSelect = `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows FROM providers`
+const providerSelect = `SELECT id,name,base_url,protocol,enabled,api_key_ciphertext,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows,schedule_exclude_windows FROM providers`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -324,12 +336,14 @@ func (s *Store) scanProvider(row rowScanner) (Provider, error) {
 	var enabled int
 	var ciphertext string
 	var windowsRaw string
+	var excludeRaw string
 	if err := row.Scan(&p.ID, &p.Name, &p.BaseURL, &p.Protocol, &enabled, &ciphertext,
 		&p.ScheduleMode, &p.ScheduleStartUTC, &p.ScheduleEndUTC,
-		&p.ScheduleStartMinute, &p.ScheduleEndMinute, &p.ScheduleWeekdays, &windowsRaw); err != nil {
+		&p.ScheduleStartMinute, &p.ScheduleEndMinute, &p.ScheduleWeekdays, &windowsRaw, &excludeRaw); err != nil {
 		return Provider{}, err
 	}
 	p.ScheduleWindows = decodeScheduleWindows(windowsRaw)
+	p.ScheduleExcludeWindows = decodeScheduleWindows(excludeRaw)
 	p.Enabled, p.APIKeyConfigured = enabled == 1, s.providerConfigured(ciphertext)
 	if strings.TrimSpace(p.ScheduleMode) == "" {
 		p.ScheduleMode = ProviderScheduleAlways

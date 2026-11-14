@@ -686,19 +686,22 @@ func (h *AdminHandler) providerCreate(w http.ResponseWriter, r *http.Request) {
 		// 多段时段（v25）：[{"start":"22:00","end":"08:00"},…]。给了就优先于
 		// schedule_daily_start/end，后者只作为老客户端的兼容写法。
 		ScheduleWindows []store.ScheduleWindowInput `json:"ScheduleWindows"`
+		// 排除时段（v28）：[{"start":"02:00","end":"04:00"},…]，与生效方式无关。
+		ScheduleExcludeWindows []store.ScheduleWindowInput `json:"ScheduleExcludeWindows"`
 	}
 	if json.NewDecoder(r.Body).Decode(&payload) != nil {
 		writeAdminError(w, 400, "invalid_request")
 		return
 	}
 	schedule, err := store.NormalizeProviderSchedule(store.ProviderScheduleInput{
-		Mode:       payload.ScheduleMode,
-		Start:      payload.ScheduleStart,
-		End:        payload.ScheduleEnd,
-		DailyStart: payload.ScheduleDailyStart,
-		DailyEnd:   payload.ScheduleDailyEnd,
-		Weekdays:   payload.ScheduleWeekdays,
-		Windows:    payload.ScheduleWindows,
+		Mode:           payload.ScheduleMode,
+		Start:          payload.ScheduleStart,
+		End:            payload.ScheduleEnd,
+		DailyStart:     payload.ScheduleDailyStart,
+		DailyEnd:       payload.ScheduleDailyEnd,
+		Weekdays:       payload.ScheduleWeekdays,
+		Windows:        payload.ScheduleWindows,
+		ExcludeWindows: payload.ScheduleExcludeWindows,
 	})
 	if err != nil {
 		writeProviderError(w, err)

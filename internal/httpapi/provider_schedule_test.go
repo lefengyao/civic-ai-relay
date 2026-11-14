@@ -207,3 +207,78 @@ func TestAdminProviderScheduleMultipleWindows(t *testing.T) {
 		t.Fatalf("清空时段 = %d: %s", empty.Code, empty.Body.String())
 	}
 }
+
+type providerExcludeResponse struct {
+	Data struct {
+		ID                     int64                  `json:"ID"`
+		ScheduleMode           string                 `json:"ScheduleMode"`
+		ScheduleActive         bool                   `json:"ScheduleActive"`
+		ScheduleExcludeWindows []store.ScheduleWindow `json:"ScheduleExcludeWindows"`
+	} `json:"data"`
+}
+
+// 排除时段（v28）：创建与更新都要能带上，列表/详情要能读回；与生效方式无关，
+// 所以「不限 + 排除」也必须有意义。
+func TestAdminProviderScheduleExcludeWindows(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", adminKey, map[string]any{
+		"name": "maint", "base_url": "https://maint.example", "api_key": "k",
+		"schedule_mode": "always",
+		"ScheduleExcludeWindows": []map[string]any{
+			{"start": "02:00", "end": "04:00"},
+			{"start": "23:00", "end": "01:00", "weekdays": []int{6, 7}},
+		},
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", created.Code, created.Body.String())
+	}
+	var payload providerExcludeResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.ScheduleExcludeWindows) != 2 {
+		t.Fatalf("创建后的排除段 = %+v", payload.Data.ScheduleExcludeWindows)
+	}
+	// 排序后 02:00-04:00 在前，未指定星期 = 每天。
+	first := payload.Data.ScheduleExcludeWindows[0]
+	if first.StartMinute != 2*60 || first.EndMinute != 4*60 || first.Weekdays != 0x7f {
+		t.Fatalf("exclude[0] = %+v", first)
+	}
+	if payload.Data.ScheduleExcludeWindows[1].Weekdays != 1<<5|1<<6 {
+		t.Fatalf("exclude[1] = %+v", payload.Data.ScheduleExcludeWindows[1])
+	}
+	// 此刻是否可用必须和同一份配置独立算出来的一致。
+	wantActive := store.ProviderSchedule{
+		Mode:           store.ProviderScheduleAlways,
+		ExcludeWindows: payload.Data.ScheduleExcludeWindows,
+	}.ActiveAt(time.Now())
+	if payload.Data.ScheduleActive != wantActive {
+		t.Fatalf("ScheduleActive = %v，按当前时刻应为 %v", payload.Data.ScheduleActive, wantActive)
+	}
+
+	// 整段替换：只留一段，并把星期收窄成工作日。
+	updated := adminRequest(t, handler, http.MethodPut, "/admin/api/providers/"+itoa(payload.Data.ID), adminKey, map[string]any{
+		"ScheduleMode":           "daily",
+		"ScheduleWindows":        []map[string]any{{"start": "22:00", "end": "08:00"}},
+		"ScheduleExcludeWindows": []map[string]any{{"start": "03:00", "end": "04:00", "weekdays": []int{1, 2, 3, 4, 5}}},
+	})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", updated.Code, updated.Body.String())
+	}
+	var after providerExcludeResponse
+	if err := json.Unmarshal(updated.Body.Bytes(), &after); err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Data.ScheduleExcludeWindows) != 1 || after.Data.ScheduleExcludeWindows[0].Weekdays != 0x1f {
+		t.Fatalf("更新后的排除段 = %+v", after.Data.ScheduleExcludeWindows)
+	}
+
+	// 全天排除（起止相同）必须 400：那等于永久停用，报错要指向该怎么做。
+	bad := adminRequest(t, handler, http.MethodPut, "/admin/api/providers/"+itoa(payload.Data.ID), adminKey, map[string]any{
+		"ScheduleMode":           "always",
+		"ScheduleExcludeWindows": []map[string]any{{"start": "02:00", "end": "02:00"}},
+	})
+	if bad.Code != http.StatusBadRequest || !strings.Contains(bad.Body.String(), "全天排除") {
+		t.Fatalf("全天排除应被拒: %d %s", bad.Code, bad.Body.String())
+	}
+}

@@ -1,6 +1,49 @@
-# 变更记录（v0.3.4 → v0.14.1）
+# 变更记录（v0.3.4 → v0.15.0）
 
 只记「改了什么、为什么」与「当时存在的问题」，不逐个列代码。更早的版本见 git 历史。
+
+---
+
+## v0.15.0 — 时段支持「排除时间段」（schema v28）
+
+**背景**
+
+之前的时段只有「什么时候可用」，表达不了「每天凌晨 02:00-04:00 上游维护，这期间
+别用这条渠道」。唯一的变通是把剩下的 22 小时逐段列成 `daily` 窗口，还得分工作日/周末，
+漏一段就等于把渠道关掉；而 `always` 模式下干脆没有办法。
+
+**改了什么**
+
+- `ProviderSchedule` 增加 `ExcludeWindows []ScheduleWindow`，判定在 `ActiveAt` 的
+  **最前面**：命中任一段即不可用，与 `Mode` 无关。于是「不限 + 每天排除两小时」
+  「夜间窗口 + 排除周三下午」都能直接表达，不用再做包含段的集合运算。
+- 排除段与包含段共用同一套语义：每段自己的星期、起点含终点不含、跨零点时凌晨算作
+  开始那天（`dailyWindowActive` 复用，不另写一份判定）。
+- 归一化（`normalizeExcludeWindows`）：允许一段都没有；**拒绝起止相同**（等于全天
+  排除）。后者有更直白的开关可用，却是最容易手滑配出来的状态，一旦配成管理台只会
+  显示「未到时段」，很难自查。
+- 存库新列 `schedule_exclude_windows`（JSON，空串 = 不排除）；`providerSelect`、
+  `activeProviderIDs`、`GroupMonitorTargets` 三处读取同步补列 —— 少一处就会让
+  `/v1/models`、转发、探活对「是否在时段内」给出不同答案。
+- 接口：创建用 `ScheduleExcludeWindows`（与 `ScheduleWindows` 同为 PascalCase），
+  更新沿 `ScheduleMode` 做整段替换，只改名字不会清掉排除段。
+- 界面：时段弹窗新增「排除时间段（可选）」区块，行模板与包含段一致（可加多段、
+  每段单独选星期、可删到空）；供应商列表的「启用时段」列显示成
+  `不限 · 排除 03:30-05:00`。
+
+**验证**
+
+- `TestProviderScheduleExcludeWindowsActiveAt`：always / daily / range 三种方式下
+  排除段都生效；终点不含、星期命中、跨零点归属都覆盖。
+- `TestNormalizeProviderExcludeWindows`：空 → nil、去重排序、起止相同报「全天排除」。
+- `TestProviderScheduleExcludeWindowsPersist`：落库读回、改名保留、整段替换清空。
+- `TestUsableModelsForKeySkipsExcludeWindow`：排除当前这一小时后模型可用集合为空，
+  清空后恢复 —— 证明影响的是 `/v1/models` 与转发共用的那份判定，而不只是展示字段。
+- `TestAdminProviderScheduleExcludeWindows`：创建/更新/读回，全天排除返回 400。
+- `TestMigrationV28AddsExcludeWindows`：v27 存量库补列后默认空串、旧渠道仍全天可用。
+- 本地隔离实例（18080，schema 27 → 28 自动迁移）：`PUT always + 排除当前小时` 后
+  `ScheduleActive=false`；daily + 两段排除按 02:00-04:00、23:00-01:00（周末）落库；
+  UI 端「加一段 → 删空 → 再加一段 → 保存 → 重新打开回显」全通，console 无报错。
 
 ---
 

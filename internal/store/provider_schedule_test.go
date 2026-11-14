@@ -650,3 +650,224 @@ func TestNormalizeSchedulePerWindowWeekdays(t *testing.T) {
 		t.Fatal("星期 0 应被拒")
 	}
 }
+
+// 排除时段（v28）与三种生效方式正交：它先判，命中即不可用。
+func TestProviderScheduleExcludeWindowsActiveAt(t *testing.T) {
+	// 2026-11-13 周五，11-14 周六，11-18 周三
+	always := ProviderSchedule{Mode: ProviderScheduleAlways}
+	always.ExcludeWindows = []ScheduleWindow{sw(2*60, 4*60)}
+	daily := ProviderSchedule{Mode: ProviderScheduleDaily, Windows: []ScheduleWindow{sw(22*60, 8*60)}}
+	daily.ExcludeWindows = []ScheduleWindow{sw(3*60, 4*60)}
+	rangeSched := ProviderSchedule{Mode: ProviderScheduleRange, StartUTC: "2026-11-01T00:00:00Z", EndUTC: "2026-12-01T00:00:00Z"}
+	rangeSched.ExcludeWindows = []ScheduleWindow{sw(2*60, 4*60)}
+	// 只排除周三 10:00-11:00
+	weekdayExclude := ProviderSchedule{Mode: ProviderScheduleAlways}
+	weekdayExclude.ExcludeWindows = []ScheduleWindow{{StartMinute: 10 * 60, EndMinute: 11 * 60, Weekdays: 1 << 2}}
+	// 排除周五 23:00-01:00（跨零点，凌晨算作周五）
+	crossMidnight := ProviderSchedule{Mode: ProviderScheduleAlways}
+	crossMidnight.ExcludeWindows = []ScheduleWindow{{StartMinute: 23 * 60, EndMinute: 1 * 60, Weekdays: 1 << 4}}
+
+	cases := []struct {
+		name     string
+		schedule ProviderSchedule
+		now      time.Time
+		want     bool
+	}{
+		{"不限 + 排除：排除段内", always, at(2026, 11, 13, 3, 0), false},
+		{"不限 + 排除：排除段起点含", always, at(2026, 11, 13, 2, 0), false},
+		{"不限 + 排除：排除段终点不含", always, at(2026, 11, 13, 4, 0), true},
+		{"不限 + 排除：段外", always, at(2026, 11, 13, 1, 59), true},
+
+		{"夜间窗口 + 排除：窗口内被排除", daily, at(2026, 11, 13, 3, 30), false},
+		{"夜间窗口 + 排除：窗口内未被排除", daily, at(2026, 11, 13, 23, 0), true},
+		{"夜间窗口 + 排除：本来就不可用", daily, at(2026, 11, 13, 12, 0), false},
+
+		{"固定区间 + 排除：区间内被排除", rangeSched, at(2026, 11, 13, 3, 0), false},
+		{"固定区间 + 排除：区间内未被排除", rangeSched, at(2026, 11, 13, 5, 0), true},
+
+		{"排除段带星期：周三命中", weekdayExclude, at(2026, 11, 18, 10, 30), false},
+		{"排除段带星期：周四不命中", weekdayExclude, at(2026, 11, 19, 10, 30), true},
+
+		{"排除段跨零点：当日深夜", crossMidnight, at(2026, 11, 13, 23, 30), false},
+		{"排除段跨零点：次日凌晨归周五", crossMidnight, at(2026, 11, 14, 0, 30), false},
+		{"排除段跨零点：次日凌晨过后恢复", crossMidnight, at(2026, 11, 14, 1, 0), true},
+		{"排除段跨零点：周六深夜不受周五段影响", crossMidnight, at(2026, 11, 14, 23, 30), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.schedule.ActiveAt(tc.now); got != tc.want {
+				t.Fatalf("ActiveAt(%s) = %v, want %v", tc.now.Format(time.RFC3339), got, tc.want)
+			}
+		})
+	}
+}
+
+// 排除段的归一化：允许为空；起止相同（全天排除）必须拒绝，否则一次手滑就把渠道
+// 永久停掉，而排查时管理台只会显示「未到时段」。
+func TestNormalizeProviderExcludeWindows(t *testing.T) {
+	schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "always"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.ExcludeWindows != nil {
+		t.Fatalf("没传排除段应为 nil，得到 %+v", schedule.ExcludeWindows)
+	}
+
+	schedule, err = NormalizeProviderSchedule(ProviderScheduleInput{
+		Mode: "always",
+		ExcludeWindows: []ScheduleWindowInput{
+			{Start: "04:00", End: "05:00"},
+			{Start: "02:00", End: "03:00", Weekdays: []int{1, 2, 3, 4, 5}},
+			{Start: "04:00", End: "05:00"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schedule.ExcludeWindows) != 2 {
+		t.Fatalf("去重/排序后应为 2 段：%+v", schedule.ExcludeWindows)
+	}
+	if schedule.ExcludeWindows[0] != (ScheduleWindow{StartMinute: 2 * 60, EndMinute: 3 * 60, Weekdays: 0x1f}) {
+		t.Fatalf("第一段 = %+v", schedule.ExcludeWindows[0])
+	}
+	if schedule.ExcludeWindows[1] != (ScheduleWindow{StartMinute: 4 * 60, EndMinute: 5 * 60, Weekdays: providerWeekdaysAll}) {
+		t.Fatalf("未指定星期的排除段应等于每天：%+v", schedule.ExcludeWindows[1])
+	}
+
+	// 排除段跟着「不限」一起保存：daily/range 之外也要生效（与 Mode 无关）。
+	if schedule.Mode != ProviderScheduleAlways {
+		t.Fatalf("mode = %q", schedule.Mode)
+	}
+
+	if _, err := NormalizeProviderSchedule(ProviderScheduleInput{
+		Mode:           "always",
+		ExcludeWindows: []ScheduleWindowInput{{Start: "02:00", End: "02:00"}},
+	}); err == nil || !strings.Contains(err.Error(), "全天排除") {
+		t.Fatalf("起止相同的排除段应被拒，得到 %v", err)
+	}
+}
+
+// 排除段要能落库、读回，并且改名不会顺手清掉；整段替换（给了 ScheduleMode）才清空。
+func TestProviderScheduleExcludeWindowsPersist(t *testing.T) {
+	repo := newTestStore(t)
+	ctx := context.Background()
+	provider, err := repo.CreateProvider(ctx, NewProvider{Name: "maint", BaseURL: "http://localhost:1", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := "always"
+	if _, err := repo.UpdateProvider(ctx, provider.ID, UpdateProvider{
+		ScheduleMode: &mode,
+		ScheduleExcludeWindows: []ScheduleWindowInput{
+			{Start: "02:00", End: "04:00"},
+			{Start: "23:00", End: "01:00", Weekdays: []int{6, 7}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.GetProvider(ctx, provider.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ScheduleMode != ProviderScheduleAlways || len(stored.ScheduleExcludeWindows) != 2 {
+		t.Fatalf("落库后 = %+v", stored.ScheduleExcludeWindows)
+	}
+	// 排序后 02:00-04:00 在前。
+	if stored.ScheduleExcludeWindows[0] != (ScheduleWindow{StartMinute: 2 * 60, EndMinute: 4 * 60, Weekdays: providerWeekdaysAll}) {
+		t.Fatalf("exclude[0] = %+v", stored.ScheduleExcludeWindows[0])
+	}
+	if stored.ScheduleExcludeWindows[1].Weekdays != 1<<5|1<<6 {
+		t.Fatalf("exclude[1] = %+v", stored.ScheduleExcludeWindows[1])
+	}
+
+	// 只改名字：排除段必须原样保留。
+	renamed, err := repo.UpdateProvider(ctx, provider.ID, UpdateProvider{Name: "maint-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(renamed.ScheduleExcludeWindows) != 2 {
+		t.Fatalf("改名后 = %+v", renamed.ScheduleExcludeWindows)
+	}
+
+	// 整段替换成 daily 且不带排除段：清空。
+	daily := "daily"
+	windows := []ScheduleWindowInput{{Start: "22:00", End: "08:00"}}
+	replaced, err := repo.UpdateProvider(ctx, provider.ID, UpdateProvider{ScheduleMode: &daily, ScheduleWindows: &windows})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replaced.ScheduleExcludeWindows) != 0 {
+		t.Fatalf("整段替换后应清空排除段：%+v", replaced.ScheduleExcludeWindows)
+	}
+}
+
+// v28 给存量库补列，默认空串 = 不排除，旧渠道行为完全不变。
+func TestMigrationV28AddsExcludeWindows(t *testing.T) {
+	db := openLegacyAt(t, 27)
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`INSERT INTO providers(id,name,base_url,api_key_ciphertext,enabled,created_at_utc,updated_at_utc) VALUES (1,'legacy','https://legacy.example',x'00',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	applyMigration(db, t, 28)
+
+	var raw string
+	if err := db.QueryRow(`SELECT schedule_exclude_windows FROM providers WHERE id=1`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "" {
+		t.Fatalf("默认值应为空串，得到 %q", raw)
+	}
+	if !(ProviderSchedule{Mode: ProviderScheduleAlways, ExcludeWindows: decodeScheduleWindows(raw)}).ActiveAt(time.Now()) {
+		t.Fatal("升级后的旧渠道应仍然全天可用")
+	}
+}
+
+// 排除段必须真的影响「客户端可见/可路由」：把当前这一小时排除掉，模型的可用集合
+// 立刻变空；清空排除段后恢复。这里走的是 UsableModelsForKey（/v1/models 与转发的
+// 同一份判定），而不是只验 ActiveAt。
+func TestUsableModelsForKeySkipsExcludeWindow(t *testing.T) {
+	repo, key, model, _ := newReservationFixture(t, 1_000_000, 1_000_000)
+	ctx := context.Background()
+
+	now := time.Now().In(beijingZone)
+	start := now.Format("15:00") // 当前小时整点
+	end := now.Add(time.Hour).Format("15:00")
+
+	mode := "always"
+	if _, err := repo.UpdateProvider(ctx, model.ProviderID, UpdateProvider{
+		ScheduleMode:           &mode,
+		ScheduleExcludeWindows: []ScheduleWindowInput{{Start: start, End: end}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	usable, err := repo.UsableModelsForKey(ctx, key.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usable) != 0 {
+		t.Fatalf("排除段命中时应没有任何可用模型，got %d", len(usable))
+	}
+	// 授权关系本身不随排除段变化：管理台仍要能看到「本来授权了哪些模型」。
+	authorized, err := repo.AuthorizedModelsForKey(ctx, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorized) != 1 {
+		t.Fatalf("AuthorizedModelsForKey 不应按排除段过滤，got %d", len(authorized))
+	}
+
+	// 清空排除段 → 立刻恢复（同样走 UpdateProvider 的整段替换）。
+	if _, err := repo.UpdateProvider(ctx, model.ProviderID, UpdateProvider{
+		ScheduleMode:           &mode,
+		ScheduleExcludeWindows: []ScheduleWindowInput{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	usable, err = repo.UsableModelsForKey(ctx, key.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usable) != 1 {
+		t.Fatalf("清空排除段后应恢复，got %d", len(usable))
+	}
+}

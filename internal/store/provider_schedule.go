@@ -51,12 +51,27 @@ type ProviderSchedule struct {
 	EndMinute   int
 	Weekdays    int              // daily：bit0=周一 … bit6=周日；0 或 127 都表示每天
 	Windows     []ScheduleWindow // daily：多段；空 = 回落到 StartMinute/EndMinute 单段（v25 之前的数据）
+	// ExcludeWindows 是「排除时间段」（v28）：命中任一段即不可用，**与 Mode 无关**。
+	//
+	// 之所以独立于三种生效方式，是因为「每天凌晨上游维护」这类需求跟「平时到底
+	// 用哪种方式限定可用性」是正交的两件事：不限 + 排除夜里两小时、夜间窗口 +
+	// 排除周三下午，都要能表达。夹在包含判定里做只能是「包含减排除」，写成独立
+	// 判定既好读，也不会在 always 分支上被漏掉。
+	ExcludeWindows []ScheduleWindow
 }
 
 // ActiveAt 判断 now 是否落在生效时段内。它是全链路唯一的时段口径：
 // /v1/models、请求路由、故障转移成员筛选、探活、模型同步都用它，
 // 避免出现「客户端看不到但管理台说可用」这类难查的漂移。
 func (s ProviderSchedule) ActiveAt(now time.Time) bool {
+	local := now.In(beijingZone)
+	minute := local.Hour()*60 + local.Minute()
+	// 排除段优先（v28）：命中即不可用，不看生效方式。没有排除段时这一步是空转。
+	for _, window := range s.ExcludeWindows {
+		if dailyWindowActive(window, local, minute) {
+			return false
+		}
+	}
 	switch strings.ToLower(strings.TrimSpace(s.Mode)) {
 	case ProviderScheduleRange:
 		// 起点含、终点不含：区间 [start, end)
@@ -68,8 +83,6 @@ func (s ProviderSchedule) ActiveAt(now time.Time) bool {
 		}
 		return true
 	case ProviderScheduleDaily:
-		local := now.In(beijingZone)
-		minute := local.Hour()*60 + local.Minute()
 		// 多段（v25）任一命中即可用。没配多段时回落到单段列——那是 v25 之前的
 		// 数据形态，也兼容直接写库的老脚本。
 		if len(s.Windows) == 0 {
@@ -122,13 +135,14 @@ func scheduleWeekdayAllows(mask int, day time.Time) bool {
 // Schedule 把 Provider 上的散列字段收成一个值类型，方便判定与测试。
 func (p Provider) Schedule() ProviderSchedule {
 	return ProviderSchedule{
-		Mode:        p.ScheduleMode,
-		StartUTC:    p.ScheduleStartUTC,
-		EndUTC:      p.ScheduleEndUTC,
-		StartMinute: p.ScheduleStartMinute,
-		EndMinute:   p.ScheduleEndMinute,
-		Weekdays:    p.ScheduleWeekdays,
-		Windows:     p.ScheduleWindows,
+		Mode:           p.ScheduleMode,
+		StartUTC:       p.ScheduleStartUTC,
+		EndUTC:         p.ScheduleEndUTC,
+		StartMinute:    p.ScheduleStartMinute,
+		EndMinute:      p.ScheduleEndMinute,
+		Weekdays:       p.ScheduleWeekdays,
+		Windows:        p.ScheduleWindows,
+		ExcludeWindows: p.ScheduleExcludeWindows,
 	}
 }
 
@@ -147,6 +161,9 @@ type ProviderScheduleInput struct {
 	// Windows 是 daily 的多段写法（v25）。nil = 没传，回落到 DailyStart/DailyEnd；
 	// 空切片 = 明确要求「一段都不留」，直接报错而不是静默变成全天。
 	Windows []ScheduleWindowInput
+	// ExcludeWindows 是 v28 的排除段。空/nil 都表示不排除——这与 Windows 的
+	// 「空切片即报错」刻意不同：排除段本来就可以一段都没有。
+	ExcludeWindows []ScheduleWindowInput
 }
 
 // ScheduleWindowInput 是多段时段的单段入参，钟点用 "HH:MM" 表达。
@@ -160,9 +177,14 @@ type ScheduleWindowInput struct {
 // NormalizeProviderSchedule 校验并归一化时段输入。错误信息会直接显示在管理台，
 // 所以要说清「该改成什么」，而不是只回 invalid_schedule。
 func NormalizeProviderSchedule(in ProviderScheduleInput) (ProviderSchedule, error) {
+	// 排除段先归一化：它独立于生效方式，三种分支都要带上（v28）。
+	exclude, err := normalizeExcludeWindows(in.ExcludeWindows)
+	if err != nil {
+		return ProviderSchedule{}, err
+	}
 	mode := strings.ToLower(strings.TrimSpace(in.Mode))
 	if mode == "" || mode == ProviderScheduleAlways {
-		return ProviderSchedule{Mode: ProviderScheduleAlways}, nil
+		return ProviderSchedule{Mode: ProviderScheduleAlways, ExcludeWindows: exclude}, nil
 	}
 	switch mode {
 	case ProviderScheduleRange:
@@ -187,7 +209,7 @@ func NormalizeProviderSchedule(in ProviderScheduleInput) (ProviderSchedule, erro
 				return ProviderSchedule{}, fmt.Errorf("结束时间必须晚于开始时间（当前：%s → %s）", formatScheduleInstant(start), formatScheduleInstant(end))
 			}
 		}
-		return ProviderSchedule{Mode: ProviderScheduleRange, StartUTC: start, EndUTC: end}, nil
+		return ProviderSchedule{Mode: ProviderScheduleRange, StartUTC: start, EndUTC: end, ExcludeWindows: exclude}, nil
 	case ProviderScheduleDaily:
 		windows, err := normalizeScheduleWindows(in)
 		if err != nil {
@@ -196,11 +218,12 @@ func NormalizeProviderSchedule(in ProviderScheduleInput) (ProviderSchedule, erro
 		// 第一段同步写进单段列（含它自己的星期）：旧版本回滚后仍能看到一个能用的
 		// 时段，而不是整条渠道被读成「00:00-00:00 全天」。
 		return ProviderSchedule{
-			Mode:        ProviderScheduleDaily,
-			StartMinute: windows[0].StartMinute,
-			EndMinute:   windows[0].EndMinute,
-			Weekdays:    windows[0].Weekdays,
-			Windows:     windows,
+			Mode:           ProviderScheduleDaily,
+			StartMinute:    windows[0].StartMinute,
+			EndMinute:      windows[0].EndMinute,
+			Weekdays:       windows[0].Weekdays,
+			Windows:        windows,
+			ExcludeWindows: exclude,
 		}, nil
 	default:
 		return ProviderSchedule{}, fmt.Errorf("不支持的生效方式 %q：可选 always（不限）、range（固定区间）、daily（每天重复）", in.Mode)
@@ -235,24 +258,10 @@ func normalizeScheduleWindows(in ProviderScheduleInput) ([]ScheduleWindow, error
 	out := make([]ScheduleWindow, 0, len(in.Windows))
 	seen := make(map[ScheduleWindow]bool, len(in.Windows))
 	for index, item := range in.Windows {
-		start, err := parseScheduleClock(item.Start, fmt.Sprintf("第 %d 段的开始时间", index+1))
+		window, err := parseScheduleWindow(item, fmt.Sprintf("第 %d 段", index+1))
 		if err != nil {
 			return nil, err
 		}
-		end, err := parseScheduleClock(item.End, fmt.Sprintf("第 %d 段的结束时间", index+1))
-		if err != nil {
-			return nil, err
-		}
-		mask, err := scheduleWeekdayMask(item.Weekdays)
-		if err != nil {
-			return nil, err
-		}
-		if mask == 0 {
-			// scheduleWeekdayMask 对空列表返回「每天」；0 只可能来自显式传入的空掩码，
-			// 这里统一成每天，避免一段配置因为星期为空而永远不生效。
-			mask = providerWeekdaysAll
-		}
-		window := ScheduleWindow{StartMinute: start, EndMinute: end, Weekdays: mask}
 		if seen[window] {
 			continue
 		}
@@ -270,6 +279,74 @@ func normalizeScheduleWindows(in ProviderScheduleInput) ([]ScheduleWindow, error
 		return out[i].EndMinute < out[j].EndMinute
 	})
 	return out, nil
+}
+
+// normalizeExcludeWindows 解析排除段（v28）。与包含段的差别只有两点：
+// 允许一段都没有；起止相同（= 全天排除）直接拒绝——那等于把渠道永久停掉，
+// 有更直白的开关可用，却是手滑最容易配出来的状态。
+func normalizeExcludeWindows(items []ScheduleWindowInput) ([]ScheduleWindow, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if len(items) > maxScheduleWindows {
+		return nil, fmt.Errorf("排除时段最多 %d 段，收到 %d 段", maxScheduleWindows, len(items))
+	}
+	out := make([]ScheduleWindow, 0, len(items))
+	for index, item := range items {
+		window, err := parseScheduleWindow(item, fmt.Sprintf("排除段 %d", index+1))
+		if err != nil {
+			return nil, err
+		}
+		if window.StartMinute == window.EndMinute {
+			return nil, fmt.Errorf("排除段 %d 的起止时间相同（%s）= 全天排除，会让这条渠道永久不可用；要停用它请关闭供应商开关", index+1, formatScheduleClock(window.StartMinute))
+		}
+		out = append(out, window)
+	}
+	return dedupeScheduleWindows(out), nil
+}
+
+// parseScheduleWindow 解析一段「HH:MM → HH:MM + 自己的星期」。label 只用于错误提示，
+// 例如「第 1 段」「排除段 2」，让报错能直接指到弹窗里的哪一行。
+func parseScheduleWindow(item ScheduleWindowInput, label string) (ScheduleWindow, error) {
+	start, err := parseScheduleClock(item.Start, label+"的开始时间")
+	if err != nil {
+		return ScheduleWindow{}, err
+	}
+	end, err := parseScheduleClock(item.End, label+"的结束时间")
+	if err != nil {
+		return ScheduleWindow{}, err
+	}
+	mask, err := scheduleWeekdayMask(item.Weekdays)
+	if err != nil {
+		return ScheduleWindow{}, err
+	}
+	if mask == 0 {
+		// scheduleWeekdayMask 对空列表返回「每天」；0 只可能来自显式传入的空掩码，
+		// 这里统一成每天，避免一段配置因为星期为空而永远不生效。
+		mask = providerWeekdaysAll
+	}
+	return ScheduleWindow{StartMinute: start, EndMinute: end, Weekdays: mask}, nil
+}
+
+// dedupeScheduleWindows 去重并按开始钟点排序：管理台回显稳定，人肉比对时也不用
+// 在脑子里重排（排除段与包含段共用同一套展示顺序）。
+func dedupeScheduleWindows(windows []ScheduleWindow) []ScheduleWindow {
+	out := make([]ScheduleWindow, 0, len(windows))
+	seen := make(map[ScheduleWindow]bool, len(windows))
+	for _, window := range windows {
+		if seen[window] {
+			continue
+		}
+		seen[window] = true
+		out = append(out, window)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].StartMinute != out[j].StartMinute {
+			return out[i].StartMinute < out[j].StartMinute
+		}
+		return out[i].EndMinute < out[j].EndMinute
+	})
+	return out
 }
 
 // encodeScheduleWindows 把多段时段序列化成库里的一列。空切片存空串——「没配多段」
@@ -369,6 +446,11 @@ func scheduleWeekdayMask(days []int) (int, error) {
 		return providerWeekdaysAll, nil
 	}
 	return mask, nil
+}
+
+// formatScheduleClock 只用于错误提示：把「北京时间第几分钟」显示成 HH:MM。
+func formatScheduleClock(minute int) string {
+	return fmt.Sprintf("%02d:%02d", minute/60, minute%60)
 }
 
 // formatScheduleInstant 只用于错误提示：把 UTC 显示成北京时间的可读形式。

@@ -168,7 +168,7 @@ details .card{margin-bottom:0}
 /* 时段行（v25）：一段 = 起止时间 + 这一段的星期。
    列宽全固定，不让 flex 自由伸缩 —— 否则输入框会抢空间把星期格压扁，
    两行内容一样却宽度不同（同一张表里最显眼的那种不齐）。 */
-#es-windows{margin:0 0 10px}
+#es-windows,#es-exclude{margin:0 0 10px}
 .sched-window{display:grid;grid-template-columns:88px 14px 88px auto 1fr;align-items:center;column-gap:8px;margin-bottom:8px}
 .sched-window input[type=time]{width:100%;height:36px;padding:0 6px;font-size:13.5px;box-sizing:border-box}
 /* 时间输入框内部由浏览器排版：把时钟图标贴紧文字，别让中间空出一大片。 */
@@ -1171,29 +1171,36 @@ function scheduleWeekdayText(mask) {
   }
   return parts.join("、");
 }
+/* 时段文案（v25 多段 / v28 排除段共用）：一段一行地拼成「22:00-08:00 周一至周五」。
+   fallbackWeekdays 只服务 v25 之前的老数据——那一段没有自己的星期，沿用全局掩码。 */
+function scheduleWindowListText(windows, fallbackWeekdays) {
+  const labels = windows.map(w => {
+    const start = scheduleClock(w.StartMinute), end = scheduleClock(w.EndMinute);
+    const span = start === end ? "全天" : `${start}-${end}`;
+    const days = scheduleWeekdayText(w.Weekdays == null ? fallbackWeekdays : w.Weekdays);
+    return days === "每天" ? span : `${span} ${days}`;
+  });
+  const parts = [labels.join("，")];
+  if (windows.some(w => Number(w.StartMinute) > Number(w.EndMinute))) parts.push("跨零点");
+  return parts.join(" · ");
+}
 function scheduleText(p) {
   const mode = p.ScheduleMode || "always";
+  let text = "不限";
   if (mode === "range") {
     const fmt = v => v ? new Date(Date.parse(v) + SCHEDULE_BJ_OFFSET).toISOString().slice(0, 16).replace("T", " ") : "不限";
-    return `${fmt(p.ScheduleStartUTC)} → ${fmt(p.ScheduleEndUTC)}`;
-  }
-  if (mode === "daily") {
+    text = `${fmt(p.ScheduleStartUTC)} → ${fmt(p.ScheduleEndUTC)}`;
+  } else if (mode === "daily") {
     // v25：一天可以有多段。老数据没有 ScheduleWindows，回落到单段列。
     const windows = Array.isArray(p.ScheduleWindows) && p.ScheduleWindows.length
       ? p.ScheduleWindows
       : [{ StartMinute: p.ScheduleStartMinute, EndMinute: p.ScheduleEndMinute }];
-    const labels = windows.map(w => {
-      const start = scheduleClock(w.StartMinute), end = scheduleClock(w.EndMinute);
-      const span = start === end ? "全天" : `${start}-${end}`;
-      // v25：星期跟着每段走。老数据的那一段没有 Weekdays，沿用全局掩码。
-      const days = scheduleWeekdayText(w.Weekdays == null ? p.ScheduleWeekdays : w.Weekdays);
-      return days === "每天" ? span : `${span} ${days}`;
-    });
-    const parts = [labels.join("，")];
-    if (windows.some(w => Number(w.StartMinute) > Number(w.EndMinute))) parts.push("跨零点");
-    return parts.join(" · ");
+    text = scheduleWindowListText(windows, p.ScheduleWeekdays);
   }
-  return "不限";
+  // 排除段（v28）：与生效方式正交，所以拼在后面而不是嵌进上面三种分支里。
+  const excludes = Array.isArray(p.ScheduleExcludeWindows) ? p.ScheduleExcludeWindows : [];
+  if (excludes.length) text += ` · 排除 ${scheduleWindowListText(excludes, 127)}`;
+  return text;
 }
 /* 时间段行（v25 多段）。start/end 是 "HH:MM"；起止相同 = 全天，start > end = 跨零点。
    mask 是**这一段自己的**星期（bit0=周一…bit6=周日）；0 与 127 都表示每天。 */
@@ -1211,27 +1218,35 @@ const scheduleWindowRowHTML = (start, end, mask) => {
   <button type="button" class="btn-ghost sched-del" onclick="removeScheduleWindow(this)" title="删除这一段" aria-label="删除这一段">×</button>
 </div>`;
 };
-window.addScheduleWindow = () => {
-  $("es-windows").insertAdjacentHTML("beforeend", scheduleWindowRowHTML("22:00", "08:00", 127));
-  syncScheduleWindowRemove();
+window.addScheduleWindow = (hostId = "es-windows", start = "22:00", end = "08:00") => {
+  const host = $(hostId);
+  if (!host) return;
+  host.insertAdjacentHTML("beforeend", scheduleWindowRowHTML(start, end, 127));
+  syncScheduleWindowRemove(host);
 };
 window.removeScheduleWindow = btn => {
-  const host = $("es-windows");
-  if (host.querySelectorAll(".sched-window").length <= 1) {
+  const row = btn.closest(".sched-window");
+  // 容器用 data-sched-host 标记：包含段与排除段共用同一套行模板，只有「能不能删空」
+  // 不同（包含段至少留一段，排除段可以一段都没有），这个差异写在 data-min-rows 上。
+  const host = row && row.closest("[data-sched-host]");
+  if (!row || !host) return;
+  if (host.dataset.minRows === "1" && host.querySelectorAll(".sched-window").length <= 1) {
     toast("至少保留一个时间段；不想限时段请把生效方式改成「不限」", "err");
     return;
   }
-  btn.closest(".sched-window").remove();
-  syncScheduleWindowRemove();
+  row.remove();
+  syncScheduleWindowRemove(host);
 };
-/* 只剩一段时把删除按钮置灰：比点下去才弹提示更省事。 */
-const syncScheduleWindowRemove = () => {
-  const rows = [...$("es-windows").querySelectorAll(".sched-window")];
+/* 只剩一段时把删除按钮置灰：比点下去才弹提示更省事。排除区没有下限，不置灰。 */
+const syncScheduleWindowRemove = host => {
+  if (!host) return;
+  const rows = [...host.querySelectorAll(".sched-window")];
+  const fixed = host.dataset.minRows === "1";
   rows.forEach(row => {
     const btn = row.querySelector("button");
     if (!btn) return;
-    btn.disabled = rows.length <= 1;
-    btn.style.opacity = rows.length <= 1 ? ".45" : "";
+    btn.disabled = fixed && rows.length <= 1;
+    btn.style.opacity = fixed && rows.length <= 1 ? ".45" : "";
   });
 };
 // 服务端存 UTC，datetime-local 没有时区概念，这里显式按北京时间来回换算。
@@ -1254,6 +1269,23 @@ window.syncScheduleFields = () => {
   $("es-range").hidden = mode !== "range";
   $("es-daily").hidden = mode !== "daily";
 };
+/* 收集一个时段容器里的所有行。label 用于报错指位（"第 " / "排除段 "）。
+   atLeastOne 只有包含段才要：排除段可以一段都没有。 */
+function collectScheduleWindows(hostId, label, atLeastOne) {
+  const rows = [...$(hostId).querySelectorAll(".sched-window")];
+  if (atLeastOne && !rows.length) throw new Error("至少保留一个时间段；不想限时段请选「不限」");
+  return rows.map((row, index) => {
+    const days = [...row.querySelectorAll(".sched-day input:checked")].map(el => Number(el.value));
+    // 一段一天都不选 = 这段永远不生效，几乎肯定是误操作；而「全天」有专门的
+    // 表达（起止相同），不该用空星期来表示。
+    if (!days.length) throw new Error(`${label}${index + 1} 至少要选一天，否则这一段永远不会生效`);
+    return {
+      start: row.querySelector(".sched-window-start").value || "00:00",
+      end: row.querySelector(".sched-window-end").value || "00:00",
+      weekdays: days,
+    };
+  });
+}
 window.editProviderSchedule = id => {
   const p = cache.providers.find(x => x.ID === id);
   if (!p) return;
@@ -1265,6 +1297,11 @@ window.editProviderSchedule = id => {
     : [{ StartMinute: p.ScheduleStartMinute, EndMinute: p.ScheduleEndMinute, Weekdays: p.ScheduleWeekdays }];
   const windowRows = windows
     .map(w => scheduleWindowRowHTML(scheduleClock(w.StartMinute), scheduleClock(w.EndMinute), w.Weekdays == null ? p.ScheduleWeekdays : w.Weekdays))
+    .join("");
+  // v28：排除段单独一块，三种生效方式下都显示——它与「什么时候可用」正交。
+  const excludes = Array.isArray(p.ScheduleExcludeWindows) ? p.ScheduleExcludeWindows : [];
+  const excludeRows = excludes
+    .map(w => scheduleWindowRowHTML(scheduleClock(w.StartMinute), scheduleClock(w.EndMinute), w.Weekdays))
     .join("");
   openEdit(`设置生效时段 #${id} · ${p.Name}`, `
     <div class="field"><label>生效方式</label><select id="es-mode" onchange="syncScheduleFields()">
@@ -1278,10 +1315,15 @@ window.editProviderSchedule = id => {
     </div>
     <div id="es-daily" ${mode === "daily" ? "" : "hidden"}>
       <div class="field"><label>时间段（北京时间，可加多段）</label>
-        <div id="es-windows">${windowRows}</div>
+        <div id="es-windows" data-sched-host data-min-rows="1">${windowRows}</div>
         <button type="button" class="btn-ghost btn-sm" onclick="addScheduleWindow()">+ 添加时段</button>
         <span class="hint">每段右侧的一二三是这一段自己的生效星期，取消不需要的天即可；起点含、终点不含，22:00 → 08:00 表示到次日八点，起止相同 = 全天；任一段命中即可用，跨零点时凌晨算作开始那天。</span>
       </div>
+    </div>
+    <div class="field" style="margin-top:14px"><label>排除时间段（可选）</label>
+      <div id="es-exclude" data-sched-host data-min-rows="0">${excludeRows}</div>
+      <button type="button" class="btn-ghost btn-sm" onclick="addScheduleWindow('es-exclude','02:00','04:00')">+ 添加排除时段</button>
+      <span class="hint">命中任一段即不可用，即使正处在生效时段内——适合「每天凌晨上游维护」这类固定停用窗口。它与上面的生效方式互不影响，三种方式都会先看排除；每段同样能单独选星期。起止时间相同等于全天排除（相当于停用），保存时会被拒绝。</span>
     </div>
   `, async () => {
     const picked = $("es-mode").value;
@@ -1294,25 +1336,17 @@ window.editProviderSchedule = id => {
     } else if (picked === "daily") {
       // v25：整体替换多段，每段带自己的星期。空输入按 00:00 处理，与「起止相同
       // = 全天」的语义一致。
-      const rows = [...$("es-windows").querySelectorAll(".sched-window")];
-      if (!rows.length) throw new Error("至少保留一个时间段；不想限时段请选「不限」");
-      body.ScheduleWindows = rows.map((row, index) => {
-        const days = [...row.querySelectorAll(".sched-day input:checked")].map(el => Number(el.value));
-        // 一段一天都不选 = 这段永远不生效，几乎肯定是误操作；而「全天」有专门的
-        // 表达（起止相同），不该用空星期来表示。
-        if (!days.length) throw new Error(`第 ${index + 1} 段至少要选一天；不想限时段请把生效方式改成「不限」`);
-        return {
-          start: row.querySelector(".sched-window-start").value || "00:00",
-          end: row.querySelector(".sched-window-end").value || "00:00",
-          weekdays: days,
-        };
-      });
+      body.ScheduleWindows = collectScheduleWindows("es-windows", "第 ", true);
     }
+    // v28：排除段跟着时段一起整段替换（后端的重建由 ScheduleMode 是否给出来触发），
+    // 空数组 = 清空排除段。
+    body.ScheduleExcludeWindows = collectScheduleWindows("es-exclude", "排除段 ", false);
     await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     loadProviders();
   });
   // 弹窗已插入 DOM：只有一段时先把它标成不可删，省得点了才被拒绝。
-  syncScheduleWindowRemove();
+  syncScheduleWindowRemove($("es-windows"));
+  syncScheduleWindowRemove($("es-exclude"));
 };
 /* ── 通用编辑弹窗 ── */
 function openEdit(title, bodyHTML, onsave) {

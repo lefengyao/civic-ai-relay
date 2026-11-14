@@ -669,7 +669,7 @@ func (s *Store) activeProviderIDs(ctx context.Context, ids []int64, now time.Tim
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows FROM providers WHERE id IN (`+placeholders+`)`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows,schedule_exclude_windows FROM providers WHERE id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -678,10 +678,12 @@ func (s *Store) activeProviderIDs(ctx context.Context, ids []int64, now time.Tim
 		var id int64
 		var schedule ProviderSchedule
 		var windowsRaw string
-		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays, &windowsRaw); err != nil {
+		var excludeRaw string
+		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays, &windowsRaw, &excludeRaw); err != nil {
 			return nil, err
 		}
 		schedule.Windows = decodeScheduleWindows(windowsRaw)
+		schedule.ExcludeWindows = decodeScheduleWindows(excludeRaw)
 		active[id] = schedule.ActiveAt(now)
 	}
 	return active, rows.Err()
