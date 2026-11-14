@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // 故障转移供应商（模型池）是与 providers 并列的第二类「供应商形式」：
@@ -374,33 +375,94 @@ func (s *Store) ReplaceGroupPools(ctx context.Context, groupID int64, poolIDs []
 	return tx.Commit()
 }
 
-// AuthorizedPoolEntries 把「至少一个成员对该 Key 可用」的启用池变成虚拟模型条目，
-// 追加到授权列表。它是 /v1/models 与管理端「接入信息」的共同口径：客户端能看到的
-// 池名，一定真的能调（且不会把未授权渠道里的成员暴露出去）。
+// AuthorizedPoolEntries 把「本 Key 的分组确实包含、且至少一个成员此刻可路由」的
+// 池变成虚拟模型条目，追加到授权列表。
+//
+// 这是池的唯一对外口径：池在 /v1/models 里只以**一个**名字出现，成员模型不单列。
+// 成员能在池内被路由，但不能按自己的名字直接调用 —— 否则客户端只要知道成员名
+// 就能绕过故障转移，池的成员清单也等于公开了（v0.14.1）。
+//
+// 成员「可路由」= 成员启用 + 模型启用且已定价 + 渠道启用 +（now 非零时）渠道在
+// 生效时段内。now 为零值表示「不按时段过滤」，管理台「接入信息」用这种口径。
 //
 // 虚拟条目刻意用负 ID + PoolID 标记：它绝不能被拿去做预留（ReserveRequest 要求
 // model_id > 0），Begin 会先解析成真实成员。
-func (s *Store) AuthorizedPoolEntries(ctx context.Context, authorized []Model) ([]Model, error) {
-	allowed := make(map[int64]bool, len(authorized))
+func (s *Store) AuthorizedPoolEntries(ctx context.Context, keyWhere string, keyArgs []any, authorized []Model, now time.Time) ([]Model, error) {
 	usedNames := make(map[string]bool, len(authorized))
 	for _, model := range authorized {
 		if model.ID > 0 {
-			allowed[model.ID] = true
 			usedNames[model.PublicName] = true
 		}
 	}
-	pools, err := s.queryPools(ctx, "WHERE p.enabled=1")
+	query := `SELECT p.id,p.name,m.provider_id
+		FROM client_keys k
+		JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 AND g.kind='aggregate'
+		JOIN group_pools gpl ON gpl.group_id=g.id
+		JOIN model_pools p ON p.id=gpl.pool_id AND p.enabled=1
+		JOIN model_pool_members pm ON pm.pool_id=p.id AND pm.enabled=1
+		JOIN models m ON m.id=pm.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL
+		JOIN providers pr ON pr.id=m.provider_id AND pr.enabled=1
+		WHERE ` + keyWhere + ` ORDER BY p.id,pm.sort_order,pm.model_id`
+	rows, err := s.db.QueryContext(ctx, query, keyArgs...)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Model, 0, len(pools))
-	for _, pool := range pools {
-		if usedNames[pool.Name] {
+	defer rows.Close()
+	type poolRow struct {
+		id   int64
+		name string
+	}
+	order := make([]poolRow, 0, 4)
+	index := make(map[int64]int, 4)
+	members := make(map[int64][]int64, 4)
+	seenProvider := make(map[int64]map[int64]bool, 4)
+	for rows.Next() {
+		var poolID, providerID int64
+		var name string
+		if err := rows.Scan(&poolID, &name, &providerID); err != nil {
+			return nil, err
+		}
+		if _, ok := index[poolID]; !ok {
+			index[poolID] = len(order)
+			order = append(order, poolRow{id: poolID, name: name})
+		}
+		if seenProvider[poolID] == nil {
+			seenProvider[poolID] = make(map[int64]bool, 2)
+		}
+		if !seenProvider[poolID][providerID] {
+			seenProvider[poolID][providerID] = true
+			members[poolID] = append(members[poolID], providerID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 时段过滤：一个池只有「至少一个成员此刻能路由」才对外可见，否则客户端会看到
+	// 一个必然失败的池名。
+	active := map[int64]bool{}
+	if !now.IsZero() && len(order) > 0 {
+		ids := make([]int64, 0, len(members))
+		for _, row := range order {
+			ids = append(ids, members[row.id]...)
+		}
+		active, err = s.activeProviderIDs(ctx, ids, now)
+		if err != nil {
+			return nil, err
+		}
+	}
+	out := make([]Model, 0, len(order))
+	for _, row := range order {
+		if usedNames[row.name] {
 			continue // 真实模型同名时以真实模型为准，避免 /v1/models 出现重复 ID
 		}
 		usable := false
-		for _, member := range pool.Members {
-			if member.Enabled && allowed[member.ModelID] {
+		for _, providerID := range members[row.id] {
+			if now.IsZero() {
+				usable = true
+				break
+			}
+			// 查不到渠道行时保守放行，与 filterByProviderSchedule 同口径。
+			if inWindow, known := active[providerID]; !known || inWindow {
 				usable = true
 				break
 			}
@@ -408,7 +470,40 @@ func (s *Store) AuthorizedPoolEntries(ctx context.Context, authorized []Model) (
 		if !usable {
 			continue
 		}
-		out = append(out, Model{ID: -pool.ID, PublicName: pool.Name, Enabled: true, PoolID: pool.ID})
+		out = append(out, Model{ID: -row.id, PublicName: row.name, Enabled: true, PoolID: row.id})
 	}
 	return out, nil
+}
+
+// PoolUsableModels 返回某池此刻真正可路由的成员模型，按池内优先级排序。
+//
+// 不再与该 Key 的授权模型求交：池的授权范围就是成员本身（组通过 group_pools
+// 引用池），求交反而会让「只挂在池里的成员」永远选不上。这里只校验成员自身能
+// 不能调：模型启用且已定价、渠道启用、渠道在生效时段内。
+func (s *Store) PoolUsableModels(ctx context.Context, poolID int64, now time.Time) ([]Model, error) {
+	if poolID <= 0 {
+		return nil, errors.New("pool ID is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled
+		FROM model_pools p
+		JOIN model_pool_members pm ON pm.pool_id=p.id AND pm.enabled=1
+		JOIN models m ON m.id=pm.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL
+		JOIN providers pr ON pr.id=m.provider_id AND pr.enabled=1
+		WHERE p.id=? AND p.enabled=1 ORDER BY pm.sort_order,pm.model_id`, poolID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Model, 0)
+	for rows.Next() {
+		m, err := scanModel(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return s.filterByProviderSchedule(ctx, out, now)
 }

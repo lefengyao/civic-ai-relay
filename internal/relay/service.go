@@ -339,29 +339,18 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		return nil, store.Model{}, ErrModelNotAllowed
 	}
 	// 普通模型 = 单候选，行为与升级前完全一致。
-	// 故障转移供应商：成员必须与该 Key 的授权模型求交 —— 授权列表本身已经过滤了
-	// 「组内渠道 / 渠道启用 / 模型启用 / 已定价」，所以候选里不会出现越权模型。
+	// 故障转移供应商：成员是池的内部候选，**不**出现在授权模型列表里（v0.14.1），
+	// 所以这里直接按池取候选，再与授权模型求交已经没有意义——池被组包含这件事
+	// 本身就是授权。候选只校验成员自身能不能调（启用/已定价/渠道启用/在时段内）。
 	// 预留永远落在真实成员上（虚拟池条目不能写账目）。
 	candidates := []store.Model{requested}
 	poolID := requested.PoolID
 	if poolID > 0 {
-		ids, err := s.store.PoolCandidateIDs(ctx, poolID)
+		members, err := s.store.PoolUsableModels(ctx, poolID, time.Now())
 		if err != nil {
 			return nil, store.Model{}, err
 		}
-		byID := make(map[int64]store.Model, len(models))
-		for _, m := range models {
-			if m.ID > 0 {
-				byID[m.ID] = m
-			}
-		}
-		candidates = make([]store.Model, 0, len(ids))
-		for _, id := range ids {
-			if m, ok := byID[id]; ok {
-				candidates = append(candidates, m)
-			}
-		}
-		candidates = orderPoolCandidates(candidates, s.pool.snapshot(), time.Now())
+		candidates = orderPoolCandidates(members, s.pool.snapshot(), time.Now())
 		if len(candidates) == 0 {
 			return nil, store.Model{}, ErrModelNotAllowed
 		}

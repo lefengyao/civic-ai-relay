@@ -172,9 +172,19 @@ func TestPublicModelsIncludePoolName(t *testing.T) {
 	if err != nil || len(models) != 1 {
 		t.Fatalf("models=%+v err=%v", models, err)
 	}
-	if _, err := fixture.Store.CreateModelPool(context.Background(), store.NewModelPool{
+	pool, err := fixture.Store.CreateModelPool(context.Background(), store.NewModelPool{
 		Name: "pool-x", Members: []store.PoolMemberInput{{ModelID: models[0].ID, Enabled: true}},
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 池要在 Key 的组里才算授权（v27），否则 /v1/models 不该出现它的名字。
+	// 夹具里只有一个组，Key 绑的就是它。
+	groups, err := fixture.Store.ListModelGroups(context.Background())
+	if err != nil || len(groups) != 1 {
+		t.Fatalf("groups=%+v err=%v", groups, err)
+	}
+	if err := fixture.Store.ReplaceGroupPools(context.Background(), groups[0].ID, []int64{pool.ID}); err != nil {
 		t.Fatal(err)
 	}
 	handler := NewPublicHandler(fixture.Service, 1<<20)

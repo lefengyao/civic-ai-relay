@@ -191,6 +191,10 @@ func TestModelPoolAuthorizedEntriesAndCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// v27：池必须被本组包含才对外可见（不再靠「成员在授权集合里」推断）。
+	if err := repo.ReplaceGroupPools(ctx, group.ID, []int64{pool.ID}); err != nil {
+		t.Fatal(err)
+	}
 	authorized, err := repo.AuthorizedModelsForKey(ctx, key.ID)
 	if err != nil {
 		t.Fatal(err)

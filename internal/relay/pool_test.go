@@ -59,7 +59,7 @@ func (f poolFactory) ForProvider(_ context.Context, id int64) (UpstreamClient, e
 }
 
 type poolIDs struct {
-	providerA, providerB, modelA, modelB, groupID int64
+	providerA, providerB, modelA, modelB, groupID, poolID int64
 }
 
 func poolRelayFixture(t *testing.T, clients map[int64]UpstreamClient) (*Service, *store.Store, store.ClientKey, poolIDs) {
@@ -114,9 +114,16 @@ func poolRelayFixture(t *testing.T, clients map[int64]UpstreamClient) (*Service,
 	if err := repo.SetKeyGroup(ctx, key.ID, group.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.CreateModelPool(ctx, store.NewModelPool{Name: "pool-model", Members: []store.PoolMemberInput{
+	pool, err := repo.CreateModelPool(ctx, store.NewModelPool{Name: "pool-model", Members: []store.PoolMemberInput{
 		{ModelID: ids.modelA, Enabled: true}, {ModelID: ids.modelB, Enabled: true},
-	}}); err != nil {
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids.poolID = pool.ID
+	// v27 起池是模型级成员：组要真的包含它（group_pools），池名才会出现在
+	// /v1/models 里、成员才会成为候选。
+	if err := repo.ReplaceGroupPools(ctx, group.ID, []int64{pool.ID}); err != nil {
 		t.Fatal(err)
 	}
 	settings := config.Settings{GlobalConcurrencyLimit: 4, RPMLimit: 30, MaxOutputTokens: 64}
@@ -279,19 +286,54 @@ func TestPoolDoesNotSwitchOnBadRequest(t *testing.T) {
 	}
 }
 
-func TestPoolRespectsGroupScope(t *testing.T) {
+// 池不在本组里就没有入口：池名既不出现在 /v1/models，也不能按名字调用。
+// 池的授权范围是**组包含它**这件事，与成员渠道归属哪个组无关（渠道可以不属于
+// 任何组，也可以属于别的组）。反过来，池里的成员也不能按自己的名字直接调用 ——
+// 对外只有池名一个入口，否则故障转移就形同虚设。
+func TestPoolRequiresGroupMembership(t *testing.T) {
 	first, second := &poolFakeClient{}, &poolFakeClient{}
 	service, repo, key, ids := poolRelayFixture(t, nil)
 	service.clients = poolFactory{clients: map[int64]UpstreamClient{ids.providerA: first, ids.providerB: second}}
-	// 分组只留 providerA：池里的 modelB 不在授权集合里，绝不能被打到。
-	if err := repo.ReplaceGroupProviders(context.Background(), ids.groupID, []int64{ids.providerA}); err != nil {
+	ctx := context.Background()
+	// 组不挂任何渠道，只保留池：这样 model-a 的唯一入口就是池名。
+	if err := repo.ReplaceGroupProviders(ctx, ids.groupID, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Chat(context.Background(), Request{Token: key.Token, Model: "pool-model", MaxTokens: 8}); err != nil {
+	if err := repo.ReplaceGroupPools(ctx, ids.groupID, nil); err != nil {
 		t.Fatal(err)
 	}
-	if first.calls != 1 || second.calls != 0 {
-		t.Fatalf("unauthorized member was called: %d/%d", first.calls, second.calls)
+	if _, err := service.Chat(ctx, Request{Token: key.Token, Model: "pool-model", MaxTokens: 8}); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("detached pool must not be callable, got %v", err)
+	}
+	if first.calls != 0 || second.calls != 0 {
+		t.Fatalf("detached pool must not reach upstream: %d/%d", first.calls, second.calls)
+	}
+	models, err := service.Models(ctx, key.Token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 0 {
+		t.Fatalf("detached pool must not be advertised: %+v", models)
+	}
+	// 挂回去：池名可用，成员名不可用。
+	if err := repo.ReplaceGroupPools(ctx, ids.groupID, []int64{ids.poolID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Chat(ctx, Request{Token: key.Token, Model: "model-a", MaxTokens: 8}); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("pool member must not be callable by its own name, got %v", err)
+	}
+	models, err = service.Models(ctx, key.Token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].PublicName != "pool-model" || models[0].PoolID != ids.poolID {
+		t.Fatalf("只应看到池名一个条目，实际：%+v", models)
+	}
+	if _, err := service.Chat(ctx, Request{Token: key.Token, Model: "pool-model", MaxTokens: 8}); err != nil {
+		t.Fatalf("attached pool should route: %v", err)
+	}
+	if first.calls != 1 {
+		t.Fatalf("pool request should reach the preferred member once, got %d", first.calls)
 	}
 }
 

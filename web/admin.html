@@ -408,7 +408,7 @@ details .card{margin-bottom:0}
       <div class="card">
         <div class="card-head"><h3>第二类供应商：单一模型 + 自动故障转移</h3></div>
         <p class="sub">每条记录只对应<b>一个对外模型名</b>（单一模型类别），下面挂已有供应商下的模型。客户端照常填这个模型名；成员出现连接失败、超时、5xx、429、上游模型下架等故障时，网关按优先级自动切到下一个可用成员，客户端无需改配置。</p>
-        <p class="sub">成员仍须满足原有授权链（模型已定价并启用、所属渠道在该客户端的分组内）；池名只对至少有一个成员可用的客户端显示。流式请求只在响应头之前切换，已开始输出后不会重发内容。请求账目记的是实际成功那个成员。</p>
+        <p class="sub">池名是<b>唯一对外入口</b>：成员模型不会单独出现在 <code>/v1/models</code>，也不能按自己的名字调用（会返回 model_not_allowed）。池名只对「分组确实包含它、且至少一个成员此刻可路由」的客户端显示。流式请求只在响应头之前切换，已开始输出后不会重发内容。请求账目记的是实际成功那个成员。</p>
         <div class="form-actions admin-only"><button class="btn" id="pool-add-btn">＋ 新建故障转移供应商</button></div>
       </div>
       <div class="card"><h3>故障转移供应商列表</h3><div id="pool-data"></div></div>
@@ -1656,7 +1656,8 @@ function openPoolEditor(pool) {
     <div class="field"><label>对外模型名（单一模型类别，客户端就填这个）</label><input id="pool-name" required value="${esc(poolDraft.name)}" placeholder="例如 claude-sonnet-4-5"></div>
     <p class="pm-hint">按优先级勾选已有供应商下的模型，<b>靠上的优先</b>；它故障时自动切到下一个可用成员。用 ↑↓ 调整顺序，「启用」可临时摘掉某个成员而不改变顺序。</p>
     <div id="pool-members"></div>
-    <p class="pm-hint">成员仍须满足原有授权链：模型已定价并启用、所属渠道在客户端分组内。只有满足条件的成员会被真正调用，池名也只对这些客户端可见。</p>
+    <p class="pm-hint">角色说明：池对外只有<b>一个</b>模型名，成员模型不会出现在客户端模型列表里，也不能按自己的名字调用。成员只要「模型已定价并启用、所属渠道启用」就会被真正调用；所属渠道在生效时段外时会自动跳过。</p>
+    <p class="pm-hint">要把池接到某个聚合组，去「聚合模型组」里勾选它（组编辑里有「包含的故障转移供应商」一栏）。池成员渠道归哪个组不影响这里。</p>
   `, async () => {
     const name = $("pool-name").value.trim();
     if (!name) throw new Error("请填写对外模型名");
@@ -1680,12 +1681,12 @@ async function loadPools() {
   $("pool-data").innerHTML = `<table><thead><tr><th>ID</th><th>对外模型名</th><th>成员（按优先级）</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
     cache.pools.map(p => {
       const members = (p.Members || []).map((m, i) => {
-        // 池能不能被客户端看到，取决于成员渠道有没有归组：这里直接写出来，
-        // 否则「建了池但调用不了」只能靠猜。
+        // 渠道归哪个组只是信息：池对外可见与否取决于「有没有聚合组勾选这个池」，
+        // 与渠道归属无关（v0.14.1），别让人误以为「渠道没归组 = 池不可用」。
         const owner = (cache.providers || []).find(x => x.ID === m.ProviderID);
-        const group = owner && owner.GroupID ? `属「${esc(owner.GroupName || ("#" + owner.GroupID))}」` : "所属渠道未加入任何模型组";
+        const group = owner && owner.GroupID ? `渠道属「${esc(owner.GroupName || ("#" + owner.GroupID))}」` : "渠道未加入任何组";
         return `<div class="pool-member-line"><span class="mono">${i + 1}.</span> ${esc(m.PublicName || ("#" + m.ModelID))} <span class="sub">${esc(m.ProviderName || "")} · ${group}</span> ${m.Enabled ? "" : `<span class="tag off">停用</span>`}</div>`;
-      }).join("") || `<span class="sub">无成员（客户端看不到此池）</span>`;
+      }).join("") || `<span class="sub">无成员（此池不会出现在客户端模型列表里）</span>`;
       return `<tr><td class="mono">${p.ID}</td><td><b>${esc(p.Name)}</b></td><td>${members}</td>
         <td><label class="switch"><input type="checkbox" ${p.Enabled ? "checked" : ""} onchange="togglePool(${p.ID},this)"><span class="track"></span></label></td>
         <td><button class="btn-ghost btn-sm" onclick="editPool(${p.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delPool(${p.ID})">删除</button></td></tr>`;

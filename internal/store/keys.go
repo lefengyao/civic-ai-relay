@@ -577,11 +577,12 @@ func (s *Store) AuthorizedModels(ctx context.Context, token string) ([]Model, er
 		return nil, errors.New("client token is required")
 	}
 	// 组管理渠道：授权模型 = Key 启用组内渠道下、已定价且启用的模型。
-	models, err := s.authorizedModels(ctx, "k.token_digest=? AND k.enabled=1", s.box.DigestBytes(token))
+	digest := s.box.DigestBytes(token)
+	models, err := s.authorizedModels(ctx, "k.token_digest=? AND k.enabled=1", digest)
 	if err != nil {
 		return nil, err
 	}
-	return s.withPoolEntries(ctx, models)
+	return s.withPoolEntries(ctx, "k.token_digest=? AND k.enabled=1", []any{digest}, models, time.Time{})
 }
 
 // AuthorizedModelsForKey 与 AuthorizedModels 同口径，但按 Key ID 查询：管理端
@@ -599,7 +600,7 @@ func (s *Store) AuthorizedModelsForKey(ctx context.Context, keyID int64) ([]Mode
 	if err != nil {
 		return nil, err
 	}
-	return s.withPoolEntries(ctx, models)
+	return s.withPoolEntries(ctx, "k.id=?", []any{keyID}, models, time.Time{})
 }
 
 // UsableModelsForKey 是「此刻真能用来发请求」的模型集合：授权模型再按供应商
@@ -620,7 +621,7 @@ func (s *Store) UsableModelsForKey(ctx context.Context, keyID int64, now time.Ti
 	if err != nil {
 		return nil, err
 	}
-	return s.withPoolEntries(ctx, models)
+	return s.withPoolEntries(ctx, "k.id=? AND k.enabled=1", []any{keyID}, models, now)
 }
 
 // filterByProviderSchedule 丢掉「所属渠道此刻不在生效时段」的模型。
@@ -629,7 +630,7 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 	if len(models) == 0 {
 		return models, nil
 	}
-	ids := make([]any, 0, len(models))
+	ids := make([]int64, 0, len(models))
 	seen := make(map[int64]bool, len(models))
 	for _, model := range models {
 		if model.ProviderID > 0 && !seen[model.ProviderID] {
@@ -640,24 +641,8 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 	if len(ids) == 0 {
 		return models, nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows FROM providers WHERE id IN (`+placeholders+`)`, ids...)
+	active, err := s.activeProviderIDs(ctx, ids, now)
 	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	active := make(map[int64]bool)
-	for rows.Next() {
-		var id int64
-		var schedule ProviderSchedule
-		var windowsRaw string
-		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays, &windowsRaw); err != nil {
-			return nil, err
-		}
-		schedule.Windows = decodeScheduleWindows(windowsRaw)
-		active[id] = schedule.ActiveAt(now)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	out := make([]Model, 0, len(models))
@@ -672,6 +657,36 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 	return out, nil
 }
 
+// activeProviderIDs 返回「此刻在生效时段内」的渠道 ID。查不到行的渠道不出现在
+// 结果里，调用方按「未知即放行」处理（删除与越权是两回事，别在这种地方兜底）。
+func (s *Store) activeProviderIDs(ctx context.Context, ids []int64, now time.Time) (map[int64]bool, error) {
+	active := make(map[int64]bool, len(ids))
+	if len(ids) == 0 {
+		return active, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,schedule_mode,schedule_start_utc,schedule_end_utc,schedule_start_minute,schedule_end_minute,schedule_weekdays,schedule_windows FROM providers WHERE id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var schedule ProviderSchedule
+		var windowsRaw string
+		if err := rows.Scan(&id, &schedule.Mode, &schedule.StartUTC, &schedule.EndUTC, &schedule.StartMinute, &schedule.EndMinute, &schedule.Weekdays, &windowsRaw); err != nil {
+			return nil, err
+		}
+		schedule.Windows = decodeScheduleWindows(windowsRaw)
+		active[id] = schedule.ActiveAt(now)
+	}
+	return active, rows.Err()
+}
+
 // authorizedModelsSelect 是「客户端实际能用哪些模型」的唯一口径：
 // Key 的唯一所属分组（client_keys.group_id，NULL = 未绑）→ 该分组可用的渠道 →
 // 渠道下已启用且已定价的模型 → 渠道本身启用。
@@ -684,9 +699,11 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 // （group_compositions）。只允许一层，成员关系在写入时已校验必须是 normal，
 // 所以这里不需要递归 CTE。
 //
-// 池来源（v27）：组直接包含的故障转移供应商，只授权**池里的成员模型**。这一条
-// 刻意不经过 providers：池是模型集合，勾一个池不该把成员渠道下别的模型一起放出，
-// 也不该改动渠道归属（渠道可能属于别的组）。
+// 池来源（v27）**不在**这条 SQL 里：组包含的故障转移供应商对外只有一个名字，
+// 成员模型是内部候选（见 AuthorizedPoolEntries / PoolUsableModels）。把成员模型
+// 也塞进这里，客户端就会在 /v1/models 里一次看到「池名 + 池里每个成员」，等于
+// 没做故障转移——v0.14.0 就是这么漏的。成员单独调不通（model_not_allowed），
+// 只能通过池名进来。
 //
 // 公共 /v1/models 与管理端「接入信息」共用这一份 SQL，避免两处判断漂移出
 // 「客户端报 404、管理台却显示已授权」这类最难查的问题。
@@ -699,10 +716,6 @@ const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name
 		JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
 		JOIN group_providers gp ON gp.group_id=gc.child_group_id
 		JOIN models m ON m.provider_id=gp.provider_id
-	UNION
-	SELECT gpl.group_id AS group_id, pm.model_id AS model_id
-		FROM group_pools gpl
-		JOIN model_pool_members pm ON pm.pool_id=gpl.pool_id AND pm.enabled=1
 ) eff ON eff.group_id=g.id JOIN models m ON m.id=eff.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
 
 func (s *Store) authorizedModels(ctx context.Context, where string, args ...any) ([]Model, error) {
@@ -724,11 +737,14 @@ func (s *Store) authorizedModels(ctx context.Context, where string, args ...any)
 }
 
 // withPoolEntries 追加故障转移供应商（池）的虚拟条目：池与真实模型共用
-// /v1/models 这一份口径，只在「至少一个成员确实对该 Key 可用」时才列出来。
-// 虚拟条目排在真实模型之后，Begin 里先匹配真实模型，即便历史数据里出现同名
-// 也不会产生歧义。
-func (s *Store) withPoolEntries(ctx context.Context, models []Model) ([]Model, error) {
-	pools, err := s.AuthorizedPoolEntries(ctx, models)
+// /v1/models 这一份口径，只在「本 Key 的分组确实包含该池，且至少一个成员此刻
+// 可路由」时才列出来。虚拟条目排在真实模型之后，Begin 里先匹配真实模型，即便
+// 历史数据里出现同名也不会产生歧义。
+//
+// keyWhere 是主查询的 Key 过滤条件（token_digest / id），必须带 k. 前缀；
+// now 为零值时不按渠道生效时段过滤（管理台「接入信息」用这种口径）。
+func (s *Store) withPoolEntries(ctx context.Context, keyWhere string, keyArgs []any, models []Model, now time.Time) ([]Model, error) {
+	pools, err := s.AuthorizedPoolEntries(ctx, keyWhere, keyArgs, models, now)
 	if err != nil {
 		return nil, err
 	}
