@@ -100,6 +100,8 @@ relay 的公共接口**不返回 CORS 头**（`OPTIONS /v1/models` 直接 405）
 | 400 | `model_required` / `messages_required` | 请求体问题：缺 `model` 或缺 `messages` |
 | 400 | `model_not_allowed` | 模型名写错，或该模型没授权给这个 Key（不在所属分组的渠道下 / 未定价 / 未启用）。用 `/v1/models` 校对名字 |
 | 404 | `not_found` | Base URL 少了 `/v1`，或用了未实现的端点 |
+| 400 | `invalid_request` | 请求体不是合法 JSON（`message` 会带具体位置）。这是客户端序列化的问题 |
+| 413 | `request_too_large` | **请求体超过服务端上限**（`MAX_BODY_MB`，默认 8 MB；`message` 里写着实际值）。常见原因：图片/文件被 base64 塞进 messages、把整段历史或整份文档贴进 prompt。**重试没有意义**，要么缩包，要么让运维调大 `MAX_BODY_MB`（管理台保存即生效）。被拒的请求会计入 RPM，也会出现在管理台「请求」列表里（状态「拒绝」） |
 | 429 | `rate_limit_exceeded` | 全局或该 Key 的并发到顶 |
 | 429 | `rpm_exceeded` | 超过 `RPM_LIMIT`（滚动一分钟） |
 | 429 | `token_quota_exceeded` / `amount_quota_exceeded` | 管理端的 5 小时 / 当日 / 本周额度用满。**这是欠费，不是服务坏了**，不要重试；等窗口轮换或在管理台调大限额后自动恢复 |

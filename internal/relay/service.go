@@ -144,6 +144,34 @@ func (s *Service) Models(ctx context.Context, token, appID string) ([]store.Mode
 
 // PreviewProviderModels fetches the upstream model catalog for a provider via
 // the configured client factory, without importing anything.
+// RecordIngestRejection 为「还没读到请求体就被拒绝」的请求补一条账目线索。
+//
+// 这类拒绝发生在鉴权之前或之中：解析不出模型，也可能认不出 Key。这里只**尽力**
+// 识别 Key —— 禁用或过期的 Key 照样记下来，那往往正是需要排查的对象；认不出来
+// 就记成匿名（key_id 为 NULL）。它不写 key_reservations、不扣额度，纯粹为了让
+// 管理台能看见「在门口被挡下的人」。
+func (s *Service) RecordIngestRejection(ctx context.Context, requestID, token, appID, protocol, errorCode string) error {
+	if s == nil || s.store == nil {
+		return errors.New("relay service unavailable")
+	}
+	keyID := int64(0)
+	if key, err := s.store.AuthenticateClientKey(ctx, strings.TrimSpace(token)); err == nil {
+		keyID = key.ID
+	} else if publicID := strings.TrimSpace(appID); publicID != "" {
+		if key, err := s.store.AuthenticateClientApp(ctx, publicID); err == nil {
+			keyID = key.ID
+		}
+	}
+	return s.store.RecordRejectedRequest(ctx, store.RejectedRequest{
+		RequestID:    requestID,
+		KeyID:        keyID,
+		Protocol:     protocol,
+		ErrorCode:    errorCode,
+		FailureStage: "ingest",
+		StartedAt:    time.Now(),
+	})
+}
+
 func (s *Service) PreviewProviderModels(ctx context.Context, providerID int64) ([]string, error) {
 	if s == nil || s.clients == nil {
 		return nil, errors.New("relay service unavailable")

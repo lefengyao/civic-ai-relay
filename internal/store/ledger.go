@@ -649,6 +649,52 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	}, nil
 }
 
+// RejectedRequest 描述一条在「读请求体」阶段就被拒绝、从未进入预留流程的请求。
+//
+// 这类请求没有通过鉴权校验（也可能根本没带凭据）、没有模型、没有渠道，所以除
+// request_id 外全部可空。它不参与配额与计费（金额恒为 0，也没有 key_reservations
+// 行），存在的意义只有可观测性：客户端收到 400/413 而账本一片空白时，运维既不
+// 知道发生了什么，也不知道是谁在发。
+type RejectedRequest struct {
+	RequestID string
+	// KeyID 为 0 表示没能识别出对应的密钥（凭据无效或未携带），落库为 NULL。
+	KeyID        int64
+	Protocol     string
+	ErrorCode    string
+	FailureStage string
+	StartedAt    time.Time
+}
+
+// RecordRejectedRequest 把「门口就被挡下」的请求记进 requests 表（status='rejected'）。
+//
+// 它刻意不写 key_reservations：没有预留就谈不上释放，而且并发与额度统计只认
+// 那张表，不会因为这类行而误判「有请求在跑」。requests 表的行会参与 RPM 计数，
+// 这是想要的行为 —— 反复发超大包的人本来就该被限速。
+func (s *Store) RecordRejectedRequest(ctx context.Context, in RejectedRequest) error {
+	requestID := strings.TrimSpace(in.RequestID)
+	if requestID == "" {
+		return errors.New("request ID is required")
+	}
+	started := in.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	stage := strings.TrimSpace(in.FailureStage)
+	if stage == "" {
+		stage = "ingest"
+	}
+	var keyID any
+	if in.KeyID > 0 {
+		keyID = in.KeyID
+	}
+	created := started.UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO requests(request_id,key_id,status,streamed,billing_date_bj,created_at_utc,finished_at_utc,error_code,failure_stage,protocol) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		requestID, keyID, "rejected", 0, billingDate(started), created, created,
+		strings.TrimSpace(in.ErrorCode), stage, strings.TrimSpace(in.Protocol))
+	return err
+}
+
 func (s *Store) CancelRequest(ctx context.Context, reservationID int64, status string, httpStatus int) error {
 	if reservationID <= 0 {
 		return errors.New("reservation ID is required")

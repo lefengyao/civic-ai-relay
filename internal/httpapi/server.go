@@ -45,6 +45,11 @@ func NewServerWithAdmission(service *relay.Service, maxBodyBytes int64, admit, s
 	if concrete, ok := public.(*PublicHandler); ok {
 		concrete.SetAdmission(admit)
 		concrete.SetStreamAdmission(streamAdmit)
+		// MAX_BODY_MB 走热源：管理台保存后逐请求读取新上限，与 CORS 一样不需要
+		// 重启容器。传 nil 时 PublicHandler 会回落到启动时传入的值。
+		if settings != nil {
+			concrete.SetBodyLimitSource(func() int64 { return settings().MaxBodyBytes })
+		}
 	}
 	mux := http.NewServeMux()
 	registerHealth(mux, service)

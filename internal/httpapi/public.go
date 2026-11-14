@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"civic-ai-relay/internal/logging"
 	"civic-ai-relay/internal/relay"
@@ -18,6 +20,9 @@ import (
 type PublicHandler struct {
 	service      *relay.Service
 	maxBodyBytes int64
+	// bodyLimit 是 maxBodyBytes 的实时来源（MAX_BODY_MB 热更新）。非 nil 时
+	// 逐请求取值，管理台保存设置后立即生效，不必重启容器。
+	bodyLimit func() int64
 	// admission 在接受公共对话请求前调用（如 RSS 软保护），非 nil 且返回
 	// 错误时以 503 拒绝；管理端不受影响。
 	admission func() error
@@ -38,6 +43,81 @@ func (h *PublicHandler) SetAdmission(fn func() error) { h.admission = fn }
 
 // SetStreamAdmission 注册流式过程中的周期检查（例如 memory.Guard.StreamContinue）。
 func (h *PublicHandler) SetStreamAdmission(fn func() error) { h.streamAdmission = fn }
+
+// SetBodyLimitSource 注册请求体上限的实时来源。传 nil 或返回非正值时回落到
+// 启动时传入的 maxBodyBytes，不会把上限意外变成 0（那等于拒绝一切请求）。
+func (h *PublicHandler) SetBodyLimitSource(source func() int64) { h.bodyLimit = source }
+
+func (h *PublicHandler) effectiveMaxBodyBytes() int64 {
+	if h.bodyLimit != nil {
+		if limit := h.bodyLimit(); limit > 0 {
+			return limit
+		}
+	}
+	if h.maxBodyBytes > 0 {
+		return h.maxBodyBytes
+	}
+	return 8 * 1024 * 1024
+}
+
+// decodeJSONObject 读取并解析请求体，失败时**已经写好响应**，调用方直接返回。
+//
+// 超限与语法错误必须分开报：`http.MaxBytesReader` 触发的错误原文是
+// "http: request body too large"，如果也塞进 "not valid JSON" 里，客户端会以为
+// 自己发的 JSON 有语法问题 —— 实际是包太大，改法完全不同（缩包或调上限）。
+// 两种失败都会留痕：一条 WARN 日志 + requests 表里一行 status='rejected'，
+// 否则客户端报错、管理台却什么都查不到。
+func (h *PublicHandler) decodeJSONObject(w http.ResponseWriter, r *http.Request, token, appID string) (map[string]any, bool) {
+	limit := h.effectiveMaxBodyBytes()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	var payload map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		status, code := http.StatusBadRequest, "invalid_request"
+		detail := "request body is not valid JSON: " + err.Error()
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status, code = http.StatusRequestEntityTooLarge, "request_too_large"
+			detail = fmt.Sprintf("request body exceeds the %s limit; reduce the payload (large attachments or history) or raise MAX_BODY_MB on the server", humanBytes(limit))
+		}
+		h.rejectIngest(r, token, appID, code)
+		logging.Warnf("rejected request id=%s path=%s status=%d code=%s content_length=%d remote=%s limit_bytes=%d",
+			requestIDFromContext(r.Context()), r.URL.Path, status, code, r.ContentLength, remoteHost(r.RemoteAddr), limit)
+		writeErrorDetail(w, status, code, detail)
+		return nil, false
+	}
+	return payload, true
+}
+
+// rejectIngest 尽力把被拒请求记进账本。请求上下文可能已被客户端取消（读到一半
+// 就断开），所以断开取消信号但保留超时，避免这条记录跟着一起丢。
+func (h *PublicHandler) rejectIngest(r *http.Request, token, appID, code string) {
+	if h.service == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+	defer cancel()
+	if err := h.service.RecordIngestRejection(ctx, requestIDFromContext(r.Context()), token, appID, protocolForPath(r.URL.Path), code); err != nil {
+		logging.Warnf("record rejected request id=%s failed: %v", requestIDFromContext(r.Context()), err)
+	}
+}
+
+// humanBytes 把字节数写成人类可读的规模，用于错误提示（24 MB / 512 KB）。
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	value := float64(n)
+	for _, suffix := range []string{"KB", "MB", "GB"} {
+		value /= unit
+		if value < unit || suffix == "GB" {
+			return fmt.Sprintf("%.0f %s", value, suffix)
+		}
+	}
+	return fmt.Sprintf("%d B", n)
+}
 
 // ServeHTTP normalizes the request path before dispatching. Both
 // "/v1/chat/completions" and the variants clients actually send in the wild
@@ -116,12 +196,8 @@ func (h *PublicHandler) chatCompletions(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
-	var payload map[string]any
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&payload); err != nil {
-		writeErrorDetail(w, http.StatusBadRequest, "invalid_request", "request body is not valid JSON: "+err.Error())
+	payload, ok := h.decodeJSONObject(w, r, token, appID)
+	if !ok {
 		return
 	}
 	if sid := strings.TrimSpace(r.Header.Get(upstream.SessionIDHeader)); sid != "" {

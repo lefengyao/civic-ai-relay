@@ -1,6 +1,56 @@
-# 变更记录（v0.3.4 → v0.15.1）
+# 变更记录（v0.3.4 → v0.15.2）
 
 只记「改了什么、为什么」与「当时存在的问题」，不逐个列代码。更早的版本见 git 历史。
+
+---
+
+## v0.15.2 — 请求体超限不再伪装成「JSON 语法错误」，且必须留痕
+
+**问题**
+
+线上客户端报：
+
+```
+400 invalid_request: request body is not valid JSON: http: request body too large
+```
+
+三处都不对：
+
+1. **码与状态错**：`http: request body too large` 是 `http.MaxBytesReader` 触发的
+   体积超限，与 JSON 语法无关。被统一包进 `invalid_request` 后，客户端会去检查
+   自己的序列化代码，实际该做的是缩包或调上限。应为 **413 `request_too_large`**。
+2. **管理台完全看不到**：解析失败发生在 `chatCompletions` 入口，还没进
+   `relay.Service.Chat`（`ReserveRequest` 才写 `requests` 表）。于是客户端收到
+   400/413，而「请求」列表、用量分析里一条记录都没有 —— 连是谁在发、发了多大
+   都查不到。
+3. **容器日志也没有**：访问日志只在 `LOG_LEVEL=DEBUG` 输出，生产是 `INFO`。
+   整个 4xx 类别在这台机器上是静音的。
+
+顺带发现 `MAX_BODY_MB` 是启动时固化的：管理台改完、保存成功、界面也显示新值，
+但下一个请求仍按旧上限判定，必须重启容器 —— 与 `CORS_ALLOWED_ORIGINS` 等
+「保存即生效」的配置不一致。
+
+**改法**
+
+- 两处入口（`/v1/chat/completions`、`/v1/responses`）合并到一个
+  `decodeJSONObject`：用 `errors.As(err, *http.MaxBytesError)` 区分超限与语法错误。
+  超限 → 413 `request_too_large`，`message` 带上实际生效的上限（`24 MB`）并点名
+  `MAX_BODY_MB`；语法错误 → 400 `invalid_request`，行为不变。
+- 两种失败都走 `rejectIngest`：
+  - 账本写一行 `status=rejected`、`failure_stage=ingest`、`error_code` 为具体原因。
+    **不写 `key_reservations`**，所以不占并发、不扣额度；`key_id` 尽力识别
+    （禁用/过期的 Key 也照记，那往往正是要查的对象），认不出就 NULL。
+  - 打一条 **WARN**（不受 `LOG_LEVEL` 影响），带 request_id / 路径 / 状态码 /
+    Content-Length / 来源 / 上限。**不记请求体** —— 提示词仍是用户隐私。
+- `MAX_BODY_MB` 接进设置热源：`PublicHandler` 逐请求读取上限，管理台保存即生效。
+  来源返回 0 或负数时回落到启动值，不会把上限意外变成「拒绝一切」。
+- 管理台请求列表的「诊断」列对入口拒绝显示中文（`请求体超过上限（request_too_large）`），
+  不再只有生码。前端本就有 `rejected` 的状态标签、筛选与堆叠图颜色，此前从没用上。
+
+**注意**
+
+`requests` 表的行会参与 RPM 计数。被拒请求现在也计入 —— 这是有意的：反复发超大包
+的人本来就该被限速。并发与额度统计只认 `key_reservations`，不受影响。
 
 ---
 

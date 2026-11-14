@@ -1076,6 +1076,14 @@ function statusTag(s) {
 }
 function modelName(id) { const m = cache.models.find(x => x.ID === id); return m ? esc(m.PublicName) : (id ? "#" + id : "—"); }
 function providerName(id) { const p = cache.providers.find(x => x.ID === id); return p ? esc(p.Name) : (id ? "#" + id : "—"); }
+/* 入口拒绝（读请求体阶段就被挡下）没有模型也没有渠道，账本里只有错误码；
+   单看 request_too_large 很难和「客户端 JSON 写错了」区分开，这里补一句中文。 */
+const INGEST_ERROR_TEXT = { request_too_large: "请求体超过上限", invalid_request: "请求体不是合法 JSON" };
+function requestDetailText(r) {
+  const label = r.failure_stage === "ingest" ? INGEST_ERROR_TEXT[r.error_code] : "";
+  if (label) return `${label}（${r.error_code}）`;
+  return r.error_code || r.failure_stage || r.incomplete_reason || "—";
+}
 function renderRequests(list, target) {
   if (!list.length) { $(target).innerHTML = `<div class="empty">暂无请求记录</div>`; return; }
   // 只读主体没有供应商页面，渠道列也一并收起来——否则隐藏的只是入口，渠道名
@@ -1084,14 +1092,17 @@ function renderRequests(list, target) {
   $(target).innerHTML = `<table><thead><tr><th>时间</th><th>Request ID</th><th>模型</th>${showProvider ? "<th>渠道</th>" : ""}<th>协议</th><th>状态</th><th>Token</th><th>金额</th><th>上游码</th><th>诊断</th></tr></thead><tbody>` +
     list.map(r => {
       const requestID = String(r.request_id || "");
-      const detail = r.error_code || r.failure_stage || r.incomplete_reason || "—";
+      const detail = requestDetailText(r);
       const token = `${fmtNum(r.input_tokens)} / ${fmtNum(r.output_tokens)}`;
       const tokenSummary = `${fmtNum((r.input_tokens || 0) + (r.output_tokens || 0))} total · 缓存 ${fmtNum(r.cached_input_tokens)}`;
       const duration = r.duration_ms == null ? "—" : `${fmtNum(r.duration_ms)}ms`;
+      // 入口拒绝没有上游、也没有用量来源，`unknown · —` 只会让人多看一眼；
+      // 直接说明它没进转发流程，比两个占位符有用。
+      const subline = r.failure_stage === "ingest" ? "入口拒绝 · 未进入转发" : `${r.usage_source || "unknown"} · ${duration}`;
       const requestCell = target === "request-data"
         ? `<button class="btn-ghost btn-sm request-detail" data-request-id="${esc(encodeURIComponent(requestID))}">${esc(requestID || "—")}</button>`
         : esc(requestID || "—");
-      return `<tr><td class="mono">${esc(fmtTime(r.created_at_utc))}</td><td class="mono">${requestCell}</td><td>${modelName(r.model_id)}</td>${showProvider ? `<td>${providerName(r.provider_id)}</td>` : ""}<td class="mono">${esc(r.protocol || "chat")}</td><td>${statusTag(r.status)}</td><td class="mono">${token}<div class="sub">${esc(tokenSummary)}</div></td><td>${fmtYuan(r.amount_microyuan)}</td><td class="mono">${r.upstream_status ?? "—"}</td><td><span class="mono">${esc(detail)}</span><div class="sub">${esc(r.usage_source || "unknown")} · ${esc(duration)}</div></td></tr>`;
+      return `<tr><td class="mono">${esc(fmtTime(r.created_at_utc))}</td><td class="mono">${requestCell}</td><td>${modelName(r.model_id)}</td>${showProvider ? `<td>${providerName(r.provider_id)}</td>` : ""}<td class="mono">${esc(r.protocol || "chat")}</td><td>${statusTag(r.status)}</td><td class="mono">${token}<div class="sub">${esc(tokenSummary)}</div></td><td>${fmtYuan(r.amount_microyuan)}</td><td class="mono">${r.upstream_status ?? "—"}</td><td><span class="mono">${esc(detail)}</span><div class="sub">${esc(subline)}</div></td></tr>`;
     }).join("") +
     `</tbody></table>`;
 }

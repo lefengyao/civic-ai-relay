@@ -46,12 +46,8 @@ func (h *PublicHandler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
-	var body map[string]any
-	decoder := json.NewDecoder(r.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&body); err != nil {
-		writeErrorDetail(w, http.StatusBadRequest, "invalid_request", "request body is not valid JSON: "+err.Error())
+	body, ok := h.decodeJSONObject(w, r, token, appID)
+	if !ok {
 		return
 	}
 	if sid := strings.TrimSpace(r.Header.Get(upstream.SessionIDHeader)); sid != "" {
