@@ -293,6 +293,7 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 	// error types whose messages are deliberately safe for clients.
 	detail := "request could not be completed"
 	var quota *store.QuotaError
+	var keyConcurrency *relay.KeyConcurrencyError
 	var upstreamErr *upstream.Error
 	switch {
 	case errors.Is(err, relay.ErrUnauthorized):
@@ -307,8 +308,17 @@ func (h *PublicHandler) writeServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, relay.ErrSettlementUnavailable):
 		status, code = http.StatusServiceUnavailable, "settlement_unavailable"
 		detail = "request settlement is temporarily unavailable"
-	case errors.Is(err, relay.ErrGlobalConcurrencyExceeded), errors.Is(err, relay.ErrKeyConcurrencyExceeded):
+	case errors.Is(err, relay.ErrGlobalConcurrencyExceeded):
+		// 与 Key 并发分开说：一个是「整个网关满了」，一个是「你这把 Key 满了」，
+		// 处置方向完全不同（等一等 / 找管理员调大这把 Key 的上限）。
 		status, code = http.StatusTooManyRequests, "rate_limit_exceeded"
+		detail = "网关并发已满，请稍后重试"
+	case errors.As(err, &keyConcurrency):
+		status, code = http.StatusTooManyRequests, "rate_limit_exceeded"
+		detail = keyConcurrency.Detail()
+	case errors.Is(err, relay.ErrKeyConcurrencyExceeded):
+		status, code = http.StatusTooManyRequests, "rate_limit_exceeded"
+		detail = "该 Key 并发已满，请等前面的请求结束后重试"
 	case errors.Is(err, relay.ErrInvalidRequest):
 		status, code = http.StatusBadRequest, "invalid_request"
 	case errors.As(err, &quota):

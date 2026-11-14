@@ -409,7 +409,7 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 	}
 	if !s.keys.TryAcquire(key.ID, key.ConcurrencyLimit) {
 		s.global.Release()
-		return nil, store.Model{}, ErrKeyConcurrencyExceeded
+		return nil, store.Model{}, &KeyConcurrencyError{Key: key.Name, Active: s.keys.Active(key.ID), Limit: key.ConcurrencyLimit}
 	}
 	stringFields := make([]string, 0, len(req.Messages)+2)
 	for _, message := range req.Messages {
@@ -446,7 +446,9 @@ func (s *Service) Begin(ctx context.Context, req Request) (*Lease, store.Model, 
 		s.global.Release()
 		var quota *store.QuotaError
 		if errors.As(err, &quota) && quota.Code == "concurrency_exceeded" {
-			return nil, store.Model{}, ErrKeyConcurrencyExceeded
+			// 事务内的持久化判定：进程重启后内存名额清零，但账本里还有在跑的
+			// 预留，这一道必须兜住（多副本部署时也是它保证跨进程不超发）。
+			return nil, store.Model{}, &KeyConcurrencyError{Key: key.Name, Active: int(quota.Used), Limit: int(quota.Limit)}
 		}
 		return nil, store.Model{}, err
 	}

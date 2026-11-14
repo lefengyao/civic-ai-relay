@@ -1489,6 +1489,12 @@ func (h *AdminHandler) keysList(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, 500, "usage_error")
 		return
 	}
+	// 并发占用与额度用量分开取：并发只数 status='reserved'，与流水用量不是一回事。
+	activeByKey, err := h.repo.ActiveReservationsByKey(r.Context())
+	if err != nil {
+		writeAdminError(w, 500, "usage_error")
+		return
+	}
 	// 消耗口径与限额检查一致：所有预留（含未结算）都计入
 	now := time.Now().UTC()
 	items := make([]map[string]any, 0, len(data))
@@ -1505,7 +1511,8 @@ func (h *AdminHandler) keysList(w http.ResponseWriter, r *http.Request) {
 			"AuthMode": authMode, "PublicID": k.PublicID,
 			"GroupID": k.GroupID,
 			"Enabled": k.Enabled, "ConcurrencyLimit": k.ConcurrencyLimit,
-			"TokenLimit": k.TokenLimit, "AmountLimitMicroyuan": k.AmountLimitMicroyuan,
+			"ActiveConcurrency": activeByKey[k.ID],
+			"TokenLimit":        k.TokenLimit, "AmountLimitMicroyuan": k.AmountLimitMicroyuan,
 			"DisabledReason":      k.DisabledReason,
 			"UsedTokens":          stat.Tokens,
 			"UsedAmountMicroyuan": stat.AmountMicroyuan,

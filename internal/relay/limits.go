@@ -93,6 +93,12 @@ func (ks *KeyGates) TryAcquire(keyID int64, limit int) bool {
 	if entry == nil {
 		entry = &keyGate{gate: NewGate(limit)}
 		ks.gates[keyID] = entry
+	} else {
+		// 管理台改了这把 Key 的并发上限：闸门必须立刻跟着走。旧实现只在 gate
+		// 首次创建时取 limit，之后一直用旧值——调大上限后仍被旧值挡着，调小
+		// 上限后又能多放几个进来，直到这把 Key 的请求全部结束、entry 被回收
+		// 才生效。上限是运维即时生效的手段，不能滞后到「恰好没人在跑」那一刻。
+		entry.gate.SetLimit(limit)
 	}
 	entry.refs++
 	ks.mu.Unlock()

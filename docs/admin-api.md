@@ -120,7 +120,7 @@
 | `key_token_quota_exceeded` | Key 的 Token 总额度已用满 |
 | `key_amount_quota_exceeded` | Key 的金额总额度已用满 |
 | `rpm_exceeded` | 超过 `RPM_LIMIT`（滚动一分钟） |
-| `rate_limit_exceeded` | 全局并发或 Key 并发达到上限 |
+| `rate_limit_exceeded` | 全局并发或 Key 并发达到上限（`message` 会区分是哪一个；Key 并发带 Key 名、在跑数与上限） |
 | `group_concurrency_exceeded` | 该组自己的并发上限已满（v26） |
 
 `error.message` 形如（`error.detail` 还会带上**分组名与 ID**，一眼看出是哪一组的额度咬住了）：
@@ -128,6 +128,25 @@
 ```
 token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，限额 5,000,000，分组「团队A」#3）。当前处于欠费状态，请等待窗口轮换或在管理台调大限额
 ```
+
+#### 并发上限：全局 / Key / 分组（三道闸）
+
+同一时刻能跑几笔请求由三道**互相独立**的闸决定，任何一道满都返回 429，不要把它们的数字
+换算成同一尺度：
+
+| 闸 | 配置位置 | 计数口径 | 满时的错误 |
+|---|---|---|---|
+| 全局 | `GLOBAL_CONCURRENCY_LIMIT` | relay 进程内的在途请求（含等待结算的） | 429 `rate_limit_exceeded`，`message` =「网关并发已满，请稍后重试」 |
+| Key | `client_keys.concurrency_limit`（最小 1） | 账本里该 Key 的 `status='reserved'` 行数；relay 内存计数器先挡一道，事务内再数一次兜底 | 429 `rate_limit_exceeded`，`message` =「Key「名字」并发已满（在跑 N，上限 M），请等前面的请求结束后重试」 |
+| 分组 | `model_groups.concurrency_limit`（`NULL`/0 = 不限） | 账本里 `source_group_id` 为该组且 `status='reserved'` 的行数 | 429 `group_concurrency_exceeded`，`message` 带组名与两个数字 |
+
+- 三道闸都在**准入阶段**判定：被拒的请求不会调用上游，也不产生费用（账目行都没写入）。
+- Key 与分组两道的计数与插入在同一个 `BEGIN IMMEDIATE` 事务里完成（先数后插），不会超发；
+  relay 的内存计数器只负责快速失败，**不是**唯一依据（重启后内存清零，靠事务内那次兜底）。
+- 管理台改了 Key 或分组的并发上限会**立刻生效**：分组下一次预留就按新值判定；Key 的内存
+  计数器每次取名额都会同步当前上限（调大立即放行，调小只拦新请求，不中断在跑的）。
+- 分组并发在 `source_group_id` 上计数，所以成员组的渠道被聚合组调用时占的是**成员组**的名额；
+  聚合组自有渠道的请求占聚合组自己的名额。这与额度扣减同口径。
 
 #### 分组并发上限（v26）
 
@@ -425,8 +444,11 @@ curl http://<relay>:8000/v1/chat/completions \
 - `UsedTokens`：已消耗 Token 总数
 - `UsedAmountMicroyuan`：已消耗金额（微元，已计入分组倍率）
 - `RequestCount`：请求次数
+- `ConcurrencyLimit`：该 Key 的并发上限（最小 1，没有「不限」）
+- `ActiveConcurrency`：此刻在跑的请求数（`status='reserved'` 的行数），与并发闸门同口径，
+  管理台据此显示「在跑 / 上限」，满额标红
 
-金额限额传参单位为**元**（`money_limit_yuan_total`），存储单位为微元（`AmountLimitMicroyuan`）。达到任一总配额后 Key 自动停用，`DisabledReason = quota_exhausted`。
+金额限额传参单位为**元**（`money_limit_yuan_total`），存储单位为微元（`AmountLimitMicroyuan`）。达到任一总配额后新请求会被拒（429 `key_token_quota_exceeded` / `key_amount_quota_exceeded`），**Key 不会自动停用**，调大限额或窗口轮换后自动恢复。
 
 ### 请求记录
 

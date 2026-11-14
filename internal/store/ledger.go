@@ -486,7 +486,10 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 		return rollback(err)
 	}
 	if active >= concurrency {
-		return rollback(&QuotaError{Code: "concurrency_exceeded"})
+		// 带上在跑数与上限：Key 并发与分组并发是两道独立的闸，只给一个
+		// concurrency_exceeded 的话，运维分不清是谁挡的、该调哪一个。
+		return rollback(&QuotaError{Code: "concurrency_exceeded", Scope: "concurrency", Metric: "requests",
+			Used: int64(active), Limit: int64(concurrency)})
 	}
 	// 未绑分组的密钥没有可授权的模型：与「模型不在组内」同一个错误出口。
 	// 顺序不能动——停用/并发的错误优先级保持与旧版一致。
@@ -666,6 +669,27 @@ func (s *Store) OccupiedTokens(ctx context.Context, startedAt time.Time) int64 {
 	started := startedAt.UTC().Format(time.RFC3339Nano)
 	_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_tokens+charged_tokens),0) FROM key_reservations WHERE request_id IS NOT NULL AND status IN ('reserved','completed','failed','aborted') AND julianday(created_at_utc)>=julianday(?,'-5 hours') AND julianday(created_at_utc)<=julianday(?)`, started, started).Scan(&total)
 	return total
+}
+
+// ActiveReservationsByKey 返回每把 Key「此刻在跑」的请求数（status='reserved'）。
+//
+// 口径与并发判定完全一致——管理台显示的数字必须就是闸门看的那个数字，否则
+// 「界面显示 0 / 4、请求却被 429」会让人怀疑限额没生效。
+func (s *Store) ActiveReservationsByKey(ctx context.Context) (map[int64]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key_id,count(*) FROM key_reservations WHERE status='reserved' GROUP BY key_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	active := make(map[int64]int64)
+	for rows.Next() {
+		var keyID, count int64
+		if err := rows.Scan(&keyID, &count); err != nil {
+			return nil, err
+		}
+		active[keyID] = count
+	}
+	return active, rows.Err()
 }
 
 func (s *Store) RecentRequests(ctx context.Context, limit int) ([]map[string]any, error) {

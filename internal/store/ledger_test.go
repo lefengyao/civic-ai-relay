@@ -151,6 +151,10 @@ func TestConcurrentReservationsRespectKeyConcurrency(t *testing.T) {
 		if !errors.As(err, &quota) || quota.Code != "concurrency_exceeded" {
 			t.Fatalf("unexpected rejection: %v", err)
 		}
+		// 拒绝原因必须带数字：公共接口靠它拼「在跑 1，上限 1」的文案。
+		if quota.Used != 1 || quota.Limit != 1 {
+			t.Fatalf("quota numbers = %d/%d, want 1/1", quota.Used, quota.Limit)
+		}
 		rejected++
 	}
 	if succeeded != 1 || rejected != 1 {

@@ -305,10 +305,10 @@ details .card{margin-bottom:0}
     <nav id="nav">
       <button data-view="overview" class="active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>运行概览</button>
       <button data-view="analytics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 6-7"/><circle cx="7" cy="14" r="1"/><circle cx="11" cy="10" r="1"/><circle cx="14" cy="13" r="1"/><circle cx="20" cy="6" r="1"/></svg>用量分析</button>
-      <button data-view="providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><circle cx="6" cy="7.5" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="16.5" r="1" fill="currentColor" stroke="none"/></svg>供应商</button>
+      <button data-view="providers" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><circle cx="6" cy="7.5" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="16.5" r="1" fill="currentColor" stroke="none"/></svg>供应商</button>
       <button data-view="pools" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h9a4 4 0 0 1 4 4v1"/><path d="M4 17h9a4 4 0 0 0 4-4v-1"/><path d="m17 4 3 3-3 3"/><path d="m17 14 3 3-3 3"/></svg>故障转移供应商</button>
       <button data-view="aggregates" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>聚合模型组</button>
-      <button data-view="groups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 8.5L10.5 15.5M16.5 8.5L13.5 15.5M9 6h6"/></svg>成员组</button>
+      <button data-view="groups" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M7.5 8.5L10.5 15.5M16.5 8.5L13.5 15.5M9 6h6"/></svg>成员组</button>
       <button data-view="keys" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M11 12L21 2M17 6l3 3M14 9l2 2"/></svg>客户端 Key</button>
       <button data-view="requests"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>请求日志</button>
       <button data-view="plugins" class="admin-only"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3v3a3 3 0 0 1-3 3H3v6h3a3 3 0 0 1 3 3v3h6v-3a3 3 0 0 1 3-3h3V9h-3a3 3 0 0 1-3-3V3H9Z"/></svg>WASM 插件</button>
@@ -367,7 +367,7 @@ details .card{margin-bottom:0}
     </section>
 
     <!-- 供应商 -->
-    <section id="view-providers" class="view">
+    <section id="view-providers" class="view admin-only">
       <details class="add-box admin-only"><summary>＋ 添加供应商</summary>
         <div class="card"><form id="provider-form">
           <div class="form-grid">
@@ -394,7 +394,7 @@ details .card{margin-bottom:0}
     </section>
 
     <!-- 成员组：只提供「渠道 + 额度」，不对外。Key 只能绑聚合模型组（v23）。 -->
-    <section id="view-groups" class="view">
+    <section id="view-groups" class="view admin-only">
       <p class="view-hint">成员组 = <b>一组渠道 + 一份独立额度</b>，它<b>不能直接对外调用</b>——客户端 Key 只能绑定聚合模型组。把成员组加进聚合组之后，它的渠道与模型才会对外提供，而一笔请求会同时消耗成员组与聚合组两边的额度。</p>
       <details class="add-box admin-only"><summary>＋ 创建成员组</summary>
         <div class="card"><form id="group-form">
@@ -473,7 +473,7 @@ details .card{margin-bottom:0}
           <div class="field"><label>Request ID</label><input name="request_id" placeholder="精确匹配"></div>
           <div class="field"><label>状态</label><select name="status"><option value="">全部状态</option><option value="completed">完成</option><option value="failed">失败</option><option value="aborted">中止</option><option value="rejected">拒绝</option><option value="reserved">进行中</option></select></div>
           <div class="field"><label>协议</label><select name="protocol"><option value="">全部协议</option><option value="chat">chat</option><option value="responses">responses</option></select></div>
-          <div class="field"><label>渠道 ID</label><input name="provider_id" inputmode="numeric" placeholder="例如 1"></div>
+          <div class="field admin-only"><label>渠道 ID</label><input name="provider_id" inputmode="numeric" placeholder="例如 1"></div>
           <div class="field"><label>模型 ID</label><input name="model_id" inputmode="numeric" placeholder="例如 1"></div>
           <div class="field"><label>开始时间（RFC3339）</label><input name="from" placeholder="2026-01-01T00:00:00Z"></div>
           <div class="field"><label>结束时间（RFC3339）</label><input name="to" placeholder="2026-01-02T00:00:00Z"></div>
@@ -609,7 +609,16 @@ function logout(message) {
   openLogin();
   if (message) toast(message, "err");
 }
+/* 只读主体（客户端密钥）只能进导航上没有 .admin-only 的视图。
+   导航项本身已由 CSS 隐藏，这里再按同一份标记挡一道：否则换个入口
+   （控制台里一次 showView、以后加的快捷链接）就能把管理员视图渲染出来。 */
+function viewAllowed(view) {
+  if (isAdmin) return true;
+  const btn = document.querySelector(`[data-view="${view}"]`);
+  return !btn || !btn.classList.contains("admin-only");
+}
 function showView(view) {
+  if (!viewAllowed(view)) view = "overview";
   currentView = view;
   document.querySelectorAll("[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === view));
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + view));
@@ -686,6 +695,8 @@ const loaders = {
 };
 async function refreshView(v) {
   if (!scope) return; // 未登录：停在登录页，不去打接口
+  // 只读主体被挡在管理员视图外时回落到概览（overview 恒允许，不会二次递归）。
+  if (!viewAllowed(v)) { showView("overview"); return; }
   $("page-title").textContent = titles[v][0];
   $("page-sub").textContent = titles[v][1];
   try { await loaders[v](); } catch (e) { if (e.message !== "认证失败") toast(e.message, "err"); }
@@ -786,15 +797,16 @@ function renderMyUsage(me) {
     statCard("累计 Token", fmtNum(me.used_tokens), me.token_limit ? `总量限额 ${fmtNum(me.token_limit)}` : "总量不限", pct(me.used_tokens, me.token_limit)) +
     statCard("累计金额", fmtYuan(me.used_microyuan), me.amount_limit_microyuan ? `总量限额 ${fmtYuan(me.amount_limit_microyuan)}` : "总量不限", pct(me.used_microyuan, me.amount_limit_microyuan)) +
     statCard("请求数", fmtNum(me.requests), "含进行中的预留", null) +
-    statCard("并发 / 可用模型", `${fmtNum(me.concurrency_limit)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(me.authorized_models)} 个模型</span>`, "超过并发会排队等待", null) +
+    statCard("并发 / 可用模型", `${fmtNum(me.concurrency_limit)} <span style="font-size:13px;color:var(--muted)">/ ${fmtNum(me.authorized_models)} 个模型</span>`, "超过并发直接 429，不排队；前面的请求结束即恢复", null) +
     statCard("有效期", esc(expiry), esc(expiryHint), null) +
     `</div>`;
 }
 async function loadOverview() {
   const picked = isAdmin && $("overview-group") ? $("overview-group").value : "";
   const d = await apiJSON("/admin/api/overview" + (picked ? "?group_id=" + encodeURIComponent(picked) : ""));
-  await ensureGroups();
-  ensureNameCaches();
+  if (isAdmin) await ensureGroups(); // 只有管理员的分组下拉用得到全量组列表
+  // 必须等名称缓存就位再渲染，否则首屏的最近请求会把模型显示成「#1」。
+  await ensureNameCaches();
   setSvc(true, "服务正常");
   renderOverviewScope(d);
   const g = d.group || null;
@@ -1008,7 +1020,7 @@ function renderAnalyticsGroupPicker() {
 }
 async function loadAnalytics() {
   try { if (!cache.models.length) await ensureModels(); } catch {}
-  await ensureGroups();
+  if (isAdmin) await ensureGroups(); // 只读主体的分组筛选由服务端锁定，不拉全量组
   renderAnalyticsModelPicker();
   renderAnalyticsGroupPicker();
   const filters = new FormData($("analytics-filters"));
@@ -1037,7 +1049,10 @@ function modelName(id) { const m = cache.models.find(x => x.ID === id); return m
 function providerName(id) { const p = cache.providers.find(x => x.ID === id); return p ? esc(p.Name) : (id ? "#" + id : "—"); }
 function renderRequests(list, target) {
   if (!list.length) { $(target).innerHTML = `<div class="empty">暂无请求记录</div>`; return; }
-  $(target).innerHTML = `<table><thead><tr><th>时间</th><th>Request ID</th><th>模型</th><th>渠道</th><th>协议</th><th>状态</th><th>Token</th><th>金额</th><th>上游码</th><th>诊断</th></tr></thead><tbody>` +
+  // 只读主体没有供应商页面，渠道列也一并收起来——否则隐藏的只是入口，渠道名
+  // 仍会从概览和日志里成列出现。
+  const showProvider = isAdmin;
+  $(target).innerHTML = `<table><thead><tr><th>时间</th><th>Request ID</th><th>模型</th>${showProvider ? "<th>渠道</th>" : ""}<th>协议</th><th>状态</th><th>Token</th><th>金额</th><th>上游码</th><th>诊断</th></tr></thead><tbody>` +
     list.map(r => {
       const requestID = String(r.request_id || "");
       const detail = r.error_code || r.failure_stage || r.incomplete_reason || "—";
@@ -1047,13 +1062,16 @@ function renderRequests(list, target) {
       const requestCell = target === "request-data"
         ? `<button class="btn-ghost btn-sm request-detail" data-request-id="${esc(encodeURIComponent(requestID))}">${esc(requestID || "—")}</button>`
         : esc(requestID || "—");
-      return `<tr><td class="mono">${esc(fmtTime(r.created_at_utc))}</td><td class="mono">${requestCell}</td><td>${modelName(r.model_id)}</td><td>${providerName(r.provider_id)}</td><td class="mono">${esc(r.protocol || "chat")}</td><td>${statusTag(r.status)}</td><td class="mono">${token}<div class="sub">${esc(tokenSummary)}</div></td><td>${fmtYuan(r.amount_microyuan)}</td><td class="mono">${r.upstream_status ?? "—"}</td><td><span class="mono">${esc(detail)}</span><div class="sub">${esc(r.usage_source || "unknown")} · ${esc(duration)}</div></td></tr>`;
+      return `<tr><td class="mono">${esc(fmtTime(r.created_at_utc))}</td><td class="mono">${requestCell}</td><td>${modelName(r.model_id)}</td>${showProvider ? `<td>${providerName(r.provider_id)}</td>` : ""}<td class="mono">${esc(r.protocol || "chat")}</td><td>${statusTag(r.status)}</td><td class="mono">${token}<div class="sub">${esc(tokenSummary)}</div></td><td>${fmtYuan(r.amount_microyuan)}</td><td class="mono">${r.upstream_status ?? "—"}</td><td><span class="mono">${esc(detail)}</span><div class="sub">${esc(r.usage_source || "unknown")} · ${esc(duration)}</div></td></tr>`;
     }).join("") +
     `</tbody></table>`;
 }
-/* 概览与日志页需要 models/providers 缓存来解析名称，缺失时补拉（失败不阻塞） */
+/* 概览与日志页需要 models/providers 缓存来解析名称，缺失时补拉（失败不阻塞）。
+   只读主体不展示渠道（供应商页面已隐藏），所以不拉供应商清单：少一次全量请求，
+   也少一份能被翻出来的渠道名。 */
 async function ensureNameCaches() {
   try { if (!cache.models.length) await ensureModels(); } catch {}
+  if (!isAdmin) return;
   try { if (!cache.providers.length) cache.providers = (await apiJSON("/admin/api/providers")).data || []; } catch {}
 }
 
@@ -1936,7 +1954,8 @@ async function loadAggregates() {
   cache.groups = d.data || [];
   try { if (!cache.models.length) await ensureModels(); } catch {}
   // 同 loadGroups：渠道归属必须是最新的，否则勾选列表会把别组的渠道当成可选。
-  try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
+  // 只读主体看不到成员组与渠道，相关列也不渲染，所以没必要拉供应商清单。
+  if (isAdmin) { try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {} }
   try { cache.groupHealth = (await apiJSON("/admin/api/groups/health")).data || {}; } catch {}
   renderAggregateChecks();
   const list = cache.groups.filter(g => g.Kind === "aggregate");
@@ -1944,7 +1963,10 @@ async function loadAggregates() {
     $("agg-data").innerHTML = `<div class="empty">还没有聚合模型组。<b>客户端 Key 只能绑定聚合模型组</b>：它把若干成员组（或自有渠道）合并成一个对外服务的组。</div>`;
     return;
   }
-  $("agg-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th><th>成员组</th><th>渠道</th><th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
+  // 只读主体看不到成员组 / 供应商页面，这两列（成员组名与渠道数）也一并不渲染：
+  // 后端对密钥主体本就把 Members 抹空，继续渲染会稳定显示「未包含任何组」——看着像故障。
+  const showTopology = isAdmin;
+  $("agg-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th>${showTopology ? "<th>成员组</th><th>渠道</th>" : ""}<th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
     list.map(g => {
       const members = g.Members || [];
       const memberCell = members.length
@@ -1956,7 +1978,7 @@ async function loadAggregates() {
       const ops = isAdmin
         ? `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button> <button class="btn-ghost btn-sm" onclick="monitorGroup(${g.ID},this)">检测</button> <button class="btn-ghost btn-sm" onclick="editAggregate(${g.ID})">查看 / 编辑</button> <button class="btn-danger btn-sm" onclick="delAggregate(${g.ID})">删除</button>`
         : `<button class="btn-ghost btn-sm" onclick="groupOverview(${g.ID})">概览</button>`;
-      return `<tr><td class="mono">${g.ID}</td><td class="provider-name" style="min-width:110px"><b>${esc(g.Name)}</b></td><td class="mono">×${((g.RateMilli || 1000) / 1000).toFixed(2)}</td><td style="min-width:140px">${memberCell}</td><td class="mono">${providerCount}</td><td style="white-space:nowrap">${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td style="white-space:nowrap">${aggregateQuotaCell(g)}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td class="sched-cell" style="white-space:nowrap">${ops}</td></tr>`;
+      return `<tr><td class="mono">${g.ID}</td><td class="provider-name" style="min-width:110px"><b>${esc(g.Name)}</b></td><td class="mono">×${((g.RateMilli || 1000) / 1000).toFixed(2)}</td>${showTopology ? `<td style="min-width:140px">${memberCell}</td><td class="mono">${providerCount}</td>` : ""}<td style="white-space:nowrap">${g.Enabled ? `<span class="tag ok">启用</span>` : `<span class="tag off">停用</span>`}</td><td style="white-space:nowrap">${aggregateQuotaCell(g)}</td><td>${monitorCell(cache.groupHealth[g.ID])}</td><td class="sched-cell" style="white-space:nowrap">${ops}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
 $("agg-form").onsubmit = async e => {
@@ -2092,6 +2114,15 @@ async function loadKeys() {
       const tokenOver = k.TokenLimit != null && k.TokenLimit > 0 && usedTokens >= k.TokenLimit;
       const amountOver = k.AmountLimitMicroyuan != null && k.AmountLimitMicroyuan > 0 && usedAmount >= k.AmountLimitMicroyuan;
       const overdrawn = tokenOver || amountOver;
+      // 并发上限与分组列表同口径：在跑数来自账本里 status='reserved' 的行，
+      // 满额标红。Key 的并发上限最小是 1（没有「不限」），所以只分三档。
+      const activeConc = Number(k.ActiveConcurrency || 0);
+      const concLimit = Number(k.ConcurrencyLimit || 0);
+      const concCell = concLimit <= 0
+        ? `<span style="color:var(--muted)">不限${activeConc ? `（在跑 ${activeConc}）` : ""}</span>`
+        : activeConc >= concLimit
+          ? `<span class="tag err" title="名额已满：新请求会被 429 拒绝，等前面的请求结束即恢复">${activeConc} / ${concLimit} 已满</span>`
+          : `<span class="tag ${activeConc / concLimit >= 0.8 ? "warn" : "ok"}" title="在跑 / 上限">${activeConc} / ${concLimit}</span>`;
       const tp = pct(usedTokens, k.TokenLimit), ap = pct(usedAmount, k.AmountLimitMicroyuan);
       const usageCell = (used, limit, fmt, p, over) =>
         `${fmt(used)} <span style="color:var(--muted)">/ ${limit == null || limit <= 0 ? "不限" : fmt(limit)}</span>` +
@@ -2102,7 +2133,7 @@ async function loadKeys() {
         ? `<span class="tag ok" style="margin-bottom:3px">应用标识</span><div class="token-hint">${esc(k.PublicID || "")}</div>`
         : `${k.TokenLabel ? esc(k.TokenLabel) : `<span style="color:var(--muted)">未记录</span>`}<div class="token-hint" id="hint-${k.ID}" title="密钥脱敏缩略，明文仅在创建/重置时显示一次">…</div>`}
       </td>
-      <td>${k.ConcurrencyLimit}</td>
+      <td>${concCell}</td>
       <td>${usageCell(usedTokens, k.TokenLimit, fmtNum, tp, tokenOver)}</td>
       <td>${usageCell(usedAmount, k.AmountLimitMicroyuan, fmtYuan, ap, amountOver)}</td>
       <td class="mono">${k.RequestCount || 0}</td>
