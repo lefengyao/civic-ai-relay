@@ -85,3 +85,52 @@ func TestAnalyticsCalendarRangeUsesBeijingDaysAndZeroFills(t *testing.T) {
 		t.Fatalf("calendar range metadata = %#v", data)
 	}
 }
+
+// 密钥主体的用量分析按 Key 收窄：同组其他密钥、别的分组的请求都不能计入。
+// 原先只按 group_id 裁，聚合组下所有密钥的消耗会一起出现（生产只有一个
+// 聚合组时，密钥使用方看到的就是全站用量）。
+func TestAnalyticsScopesToSingleKey(t *testing.T) {
+	repo, key, model, group := newReservationFixture(t, 100000, 100000000)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	other, err := repo.CreateClientKey(ctx, NewClientKey{Name: "same-group-other", ConcurrencyLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetKeyGroup(ctx, other.ID, group.ID); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(id string, keyID, groupID int64, tokens int64) {
+		t.Helper()
+		if _, err := repo.db.ExecContext(ctx, `INSERT INTO requests(request_id,key_id,model_id,provider_id,status,input_tokens,output_tokens,amount_microyuan,created_at_utc,group_id) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			id, keyID, model.ID, 1, "completed", tokens, 0, tokens*100, now.Add(-time.Hour).Format(time.RFC3339Nano), groupID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("analytics-mine", key.ID, group.ID, 10)
+	seed("analytics-other-key", other.ID, group.ID, 20)
+
+	scoped, err := repo.Analytics(ctx, now, AnalyticsFilter{Days: 7, Bucket: "day", Metric: "tokens", KeyID: key.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models := scoped["models"].([]map[string]any); len(models) != 1 || models[0]["count"] != int64(1) || models[0]["tokens"] != int64(10) {
+		t.Fatalf("key-scoped models = %#v", models)
+	}
+	var total int64
+	for _, point := range scoped["series"].([]map[string]any) {
+		total += point["tokens"].(int64)
+	}
+	if total != 10 {
+		t.Fatalf("key-scoped tokens = %d, want 10", total)
+	}
+
+	// 同一分组、不限 Key：两条都算进来 —— 说明差异确实来自 KeyID 而不只是时间窗。
+	groupWide, err := repo.Analytics(ctx, now, AnalyticsFilter{Days: 7, Bucket: "day", Metric: "tokens", GroupID: group.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models := groupWide["models"].([]map[string]any); len(models) != 1 || models[0]["count"] != int64(2) || models[0]["tokens"] != int64(30) {
+		t.Fatalf("group-scoped models = %#v", models)
+	}
+}

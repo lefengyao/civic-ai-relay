@@ -305,8 +305,8 @@ func (h *AdminHandler) analytics(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	sub := subjectOf(r)
 	filter := store.AnalyticsFilter{FromDate: query.Get("from_date"), ToDate: query.Get("to_date"), Bucket: query.Get("bucket"), Metric: query.Get("metric"), Status: query.Get("status")}
-	// 分组范围由主体决定，不接受密钥主体用 query 参数扩大：管理员可用 ?group_id=N
-	// 切换视角（0/空 = 全站），密钥主体永远只能是自己那个分组。
+	// 范围由主体决定，不接受密钥主体用 query 参数扩大：管理员可用 ?group_id=N
+	// 切换视角（0/空 = 全站），密钥主体永远只能是自己的 Key。
 	if sub.Admin {
 		if raw := strings.TrimSpace(query.Get("group_id")); raw != "" {
 			id, err := strconv.ParseInt(raw, 10, 64)
@@ -317,12 +317,11 @@ func (h *AdminHandler) analytics(w http.ResponseWriter, r *http.Request) {
 			filter.GroupID = id
 		}
 	} else {
-		if sub.GroupID == 0 {
-			// 未绑分组：没有可统计的范围，返回空串而不是全站数据。
-			writeAdminErrorDetail(w, 400, "group_unbound", "this key is not bound to any model group")
-			return
-		}
-		filter.GroupID = sub.GroupID
+		// 与请求日志、"我的用量"同口径：只看自己这把密钥。
+		// 早先按「自己所属分组」统计，聚合组下同组其他密钥的消耗也会一并出现 ——
+		// 对密钥使用方来说这就是「全部用量」（只存在一个聚合组时等同于全站）。
+		filter.KeyID = sub.KeyID
+		filter.GroupID = 0
 	}
 	if raw := query.Get("days"); raw != "" {
 		days, err := strconv.Atoi(raw)

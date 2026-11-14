@@ -38,8 +38,12 @@ type AnalyticsFilter struct {
 	ModelIDs []int64
 	Status   string
 	// GroupID 非 0 时只统计归属该分组的请求（账目行上的 group_id）。
-	// 0 表示全量；密钥主体由 handler 填成自己所属的分组。
+	// 0 表示全量；管理员用 ?group_id 收窄时填。
 	GroupID int64
+	// KeyID 非 0 时只统计这把密钥发出的请求。
+	// 密钥主体由 handler 填成自己的 Key —— 与请求日志、"我的用量"同口径：
+	// 用量分析是「我这把密钥花了多少」，不是「同组所有密钥花了多少」。
+	KeyID int64
 }
 
 type RequestPage struct {

@@ -31,6 +31,8 @@ input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--a
 #login-screen{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:var(--bg);z-index:50}
 #login-screen.on{display:flex}
 body.readonly .admin-only{display:none!important}
+/* 反向标记：只有密钥主体才看得见的说明（例如用量分析的统计范围）。 */
+body:not(.readonly) .readonly-only{display:none!important}
 /* 密钥主体（客户端密钥登录）看得见请求日志，但看不到任何写入口；admin-only 已覆盖大部分，
    这里再收掉只有管理员才该点的几个全局动作。 */
 body.mode-key #monitor-all,body.mode-key #monitor-state{display:none!important}
@@ -282,6 +284,9 @@ details .card{margin-bottom:0}
 .pool-order{width:22px;text-align:center;color:var(--accent);font-weight:600}
 .pool-enable{display:flex;align-items:center;gap:4px;white-space:nowrap;font-size:12px;color:var(--muted)}
 .pool-member-line{padding:2px 0;font-size:12.5px}
+/* 组编辑里的「按池快速勾选」：池只是成员渠道的组合，点一下等于勾上它所有渠道。 */
+.pool-shortcuts{margin-top:10px;border:1px dashed var(--border);border-radius:8px;padding:6px 8px}
+.pool-shortcuts-title{font-size:12.5px;color:var(--muted);margin:2px 0 6px}
 </style>
 </head>
 <body>
@@ -347,6 +352,7 @@ details .card{margin-bottom:0}
           <div class="field"><label for="analytics-metric">统计指标</label><select name="metric" id="analytics-metric"><option value="requests">请求次数</option><option value="amount">消费金额</option><option value="tokens">Token 用量</option></select></div>
           <div class="field"><label for="analytics-status">请求状态</label><select name="status" id="analytics-status"><option value="all">全部状态</option><option value="completed">成功</option><option value="failed">失败</option><option value="aborted">中止</option><option value="rejected">拒绝</option><option value="reserved">进行中</option></select></div>
           <div class="field admin-only" id="analytics-group-field"><label for="analytics-group">分组</label><select id="analytics-group" name="group_id"><option value="">全部分组</option></select></div>
+          <div class="field readonly-only" id="analytics-scope-field"><label>统计范围</label><span id="analytics-scope-note" style="font-size:13px">本密钥</span><span class="hint">只统计这把密钥发出的请求，不含同组其他密钥</span></div>
           <div class="field analytics-model-picker" id="analytics-model-picker"><label id="analytics-model-label">模型</label><button type="button" class="analytics-model-trigger" id="analytics-model-trigger" aria-labelledby="analytics-model-label analytics-model-summary" aria-haspopup="listbox" aria-expanded="false"><span id="analytics-model-summary">全部模型</span><span aria-hidden="true">▾</span></button><div class="analytics-model-menu" id="analytics-model-menu" role="listbox" aria-labelledby="analytics-model-label" aria-multiselectable="true" hidden></div></div>
           <div class="field"><label for="analytics-chart-type">趋势样式</label><select id="analytics-chart-type" aria-label="趋势图类型"><option value="line">曲线</option><option value="stacked">状态堆叠</option></select></div>
           <button class="btn btn-sm" type="submit">查询</button>
@@ -1020,13 +1026,17 @@ function renderAnalyticsGroupPicker() {
 }
 async function loadAnalytics() {
   try { if (!cache.models.length) await ensureModels(); } catch {}
-  if (isAdmin) await ensureGroups(); // 只读主体的分组筛选由服务端锁定，不拉全量组
+  if (isAdmin) await ensureGroups(); // 只读主体的统计范围由服务端锁定为「本密钥」，不拉全量组
   renderAnalyticsModelPicker();
   renderAnalyticsGroupPicker();
+  if (!isAdmin) {
+    const note = $("analytics-scope-note"), group = scope && scope.group_name;
+    if (note) note.textContent = group ? `本密钥 · 组「${group}」` : "本密钥";
+  }
   const filters = new FormData($("analytics-filters"));
   const params = new URLSearchParams();
-  // group_id 由主体决定，不走表单：密钥主体若把为空的分组传给服务端没有意义，
-  // 而管理员的选择必须显式带上。
+  // group_id 由主体决定，不走表单：密钥主体的范围在服务端是「自己的 Key」，
+  // 传分组既扩大不了也收窄不了；管理员的选择必须显式带上。
   for (const [name, value] of filters.entries()) if (name !== "model_id" && name !== "group_id") params.append(name, value);
   if (isAdmin && $("analytics-group").value) params.set("group_id", $("analytics-group").value);
   for (const id of selectedAnalyticsModelIDs) params.append("model_id", id);
@@ -1329,6 +1339,40 @@ function providerChecksHTML(list, selected, ownGroupId, emptyText) {
   }).join("") + `</div>`;
 }
 const checkedIds = container => [...container.querySelectorAll(".check-list input:checked")].map(i => Number(i.dataset.id));
+
+/* 故障转移供应商（池）没有独立的渠道身份：它的成员就是几条已有渠道。
+   组要「选池」，等价于把池成员的渠道一起勾上——授权、额度、并发仍按渠道所属组
+   记账，不引入第二种成员类型。这里只做快捷勾选，并在渠道被别的组占用时点明冲突。 */
+function poolShortcutHTML(targetId) {
+  const pools = (cache.pools || []).filter(p => p.Enabled);
+  if (!pools.length) return "";
+  return `<div class="pool-shortcuts"><div class="pool-shortcuts-title">按故障转移供应商快速勾选（池 = 它的成员渠道，不额外占额度）</div>` +
+    pools.map(p => {
+      const members = (p.Members || []).filter(m => m.Enabled);
+      const names = [...new Set(members.map(m => m.ProviderName).filter(Boolean))];
+      const channels = new Set(members.map(m => m.ProviderID).filter(Boolean)).size;
+      return `<div class="pool-row"><div class="pool-pick"><b>${esc(p.Name)}</b><span class="pool-provider">${esc(names.join("、") || "无可用成员")} · ${channels} 个渠道</span></div><button type="button" class="btn-ghost btn-sm" data-pool-add="${p.ID}" data-pool-target="${targetId}">加入本组</button></div>`;
+    }).join("") + `</div>`;
+}
+document.addEventListener("click", event => {
+  const btn = event.target.closest("[data-pool-add]");
+  if (!btn) return;
+  event.preventDefault();
+  const pool = (cache.pools || []).find(p => String(p.ID) === btn.dataset.poolAdd);
+  const target = document.getElementById(btn.dataset.poolTarget);
+  if (!pool || !target) return;
+  const blocked = new Set(), added = [];
+  for (const member of pool.Members || []) {
+    if (!member.Enabled) continue;
+    const input = target.querySelector(`input[data-id="${member.ProviderID}"]`);
+    if (!input) continue; // 渠道已停用，不在候选清单里
+    if (input.disabled) { blocked.add(member.ProviderName || ("#" + member.ProviderID)); continue; }
+    if (!input.checked) { input.checked = true; input.dispatchEvent(new Event("change", { bubbles: true })); added.push(member.ProviderName); }
+  }
+  if (blocked.size) toast(`池「${pool.Name}」的渠道「${[...blocked].join("、")}」已属于其他分组，请先从那个组移除`, "err");
+  else if (added.length) toast(`已把「${pool.Name}」的 ${added.length} 个渠道勾进本组`, "ok");
+  else toast(`「${pool.Name}」的渠道已全部在本组`, "ok");
+});
 function closeEditModal() {
   $("edit-modal").classList.remove("on");
   $("edit-modal").querySelector(".modal-box").style.width = "560px";
@@ -1618,7 +1662,13 @@ async function loadPools() {
   if (!cache.pools.length) { $("pool-data").innerHTML = `<div class="empty">还没有故障转移供应商，点击上方按钮新建</div>`; return; }
   $("pool-data").innerHTML = `<table><thead><tr><th>ID</th><th>对外模型名</th><th>成员（按优先级）</th><th>状态</th><th>操作</th></tr></thead><tbody>` +
     cache.pools.map(p => {
-      const members = (p.Members || []).map((m, i) => `<div class="pool-member-line"><span class="mono">${i + 1}.</span> ${esc(m.PublicName || ("#" + m.ModelID))} <span class="sub">${esc(m.ProviderName || "")}</span> ${m.Enabled ? "" : `<span class="tag off">停用</span>`}</div>`).join("") || `<span class="sub">无成员（客户端看不到此池）</span>`;
+      const members = (p.Members || []).map((m, i) => {
+        // 池能不能被客户端看到，取决于成员渠道有没有归组：这里直接写出来，
+        // 否则「建了池但调用不了」只能靠猜。
+        const owner = (cache.providers || []).find(x => x.ID === m.ProviderID);
+        const group = owner && owner.GroupID ? `属「${esc(owner.GroupName || ("#" + owner.GroupID))}」` : "所属渠道未加入任何模型组";
+        return `<div class="pool-member-line"><span class="mono">${i + 1}.</span> ${esc(m.PublicName || ("#" + m.ModelID))} <span class="sub">${esc(m.ProviderName || "")} · ${group}</span> ${m.Enabled ? "" : `<span class="tag off">停用</span>`}</div>`;
+      }).join("") || `<span class="sub">无成员（客户端看不到此池）</span>`;
       return `<tr><td class="mono">${p.ID}</td><td><b>${esc(p.Name)}</b></td><td>${members}</td>
         <td><label class="switch"><input type="checkbox" ${p.Enabled ? "checked" : ""} onchange="togglePool(${p.ID},this)"><span class="track"></span></label></td>
         <td><button class="btn-ghost btn-sm" onclick="editPool(${p.ID})">编辑</button> <button class="btn-danger btn-sm" onclick="delPool(${p.ID})">删除</button></td></tr>`;
@@ -1640,7 +1690,7 @@ $("pool-add-btn").onclick = () => openPoolEditor(null);
 function renderGroupChecks() {
   const okProviders = cache.providers.filter(p => p.Enabled);
   $("group-model-checks").innerHTML = providerChecksHTML(okProviders, [], null,
-    "暂无启用中的供应商（渠道），请先在「供应商」页创建");
+    "暂无启用中的供应商（渠道），请先在「供应商」页创建") + poolShortcutHTML("group-model-checks");
 }
 /* ── 分组可用性监测 ──────────────────────────────────────────
    状态由后端判定，这里只负责呈现。区分「配置不可用」和「上游不可达」是刻意的：
@@ -1708,6 +1758,8 @@ async function loadGroups() {
   // 归属要新鲜：组内渠道勾选靠 p.GroupID 判断「是否已在别组」，过期缓存会把
   // 别组的渠道显示成可选，保存时才失败。
   try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
+  // 组里可以「按池快速勾选」，池清单也要新鲜（新建/停用的池不能留旧值）。
+  try { cache.pools = (await apiJSON("/admin/api/pools")).data || cache.pools; } catch {}
   // 监测结果取不到不该挡住分组列表本身，失败就退化成「尚未检测」
   let health = { data: {}, monitor_enabled: false, monitor_interval_ms: 0 };
   try { health = await apiJSON("/admin/api/groups/health"); } catch {}
@@ -1829,6 +1881,7 @@ window.editGroup = async id => {
   try { await ensureModels(); } catch {}
   // 归属缓存要新鲜：一个渠道只属于一个组，过期缓存会把别组的渠道显示成可选。
   try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
+  try { cache.pools = (await apiJSON("/admin/api/pools")).data || cache.pools; } catch {}
   let memberIds = [];
   try { memberIds = (await apiJSON("/admin/api/groups/" + id + "/providers")).data || []; } catch {}
   const okProviders = cache.providers.filter(p => p.Enabled);
@@ -1868,7 +1921,7 @@ window.editGroup = async id => {
         <span class="hint">只约束「由本组渠道承接」的请求：名额满了发出去的请求直接 429（在跑 ${Number(g.ActiveConcurrency || 0)} 个）。与全局并发上限各判各的——全局先超同样是超限，两者不需要互相比大小。</span>
       </div>
     </div>
-    <div class="field" style="margin-top:14px"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label>${providerChecksHTML(okProviders, memberIds, id, "暂无启用中的渠道")}</div>
+    <div class="field" id="eg-provider-checks" style="margin-top:14px"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label>${providerChecksHTML(okProviders, memberIds, id, "暂无启用中的渠道")}${poolShortcutHTML("eg-provider-checks")}</div>
     ${offMembers.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${offMembers.length} 个已停用的成员渠道保存后将被移除</p>` : ""}
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${detail}</div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="eg-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该成员组</label>
@@ -1937,7 +1990,7 @@ function renderAggregateChecks() {
     candidates.map(g => ({ id: g.ID, label: `${g.Name}（${g.Providers || 0} 个渠道${g.Enabled ? "" : "，已停用"}）` })),
     [], "还没有成员组（可到「成员组」页创建）");
   const providers = (cache.providers || []).filter(p => p.Enabled);
-  $("agg-provider-checks").innerHTML = providerChecksHTML(providers, [], null, "暂无启用中的渠道");
+  $("agg-provider-checks").innerHTML = providerChecksHTML(providers, [], null, "暂无启用中的渠道") + poolShortcutHTML("agg-provider-checks");
 }
 /* 聚合组的额度紧张标记与模型组同口径：三个主窗口里最紧的那个。 */
 function aggregateQuotaCell(g) {
@@ -1956,6 +2009,8 @@ async function loadAggregates() {
   // 同 loadGroups：渠道归属必须是最新的，否则勾选列表会把别组的渠道当成可选。
   // 只读主体看不到成员组与渠道，相关列也不渲染，所以没必要拉供应商清单。
   if (isAdmin) { try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {} }
+  // 池清单用于「按故障转移供应商快速勾选」。
+  try { cache.pools = (await apiJSON("/admin/api/pools")).data || cache.pools; } catch {}
   try { cache.groupHealth = (await apiJSON("/admin/api/groups/health")).data || {}; } catch {}
   renderAggregateChecks();
   const list = cache.groups.filter(g => g.Kind === "aggregate");
@@ -2006,6 +2061,7 @@ window.editAggregate = async id => {
   // 归属是「一个渠道只属于一个组」，缓存一旦过期就会把已归别的组的渠道显示成可选，
   // 保存时才失败。这里多一次 GET 换一份准确的归属，值。
   try { cache.providers = (await apiJSON("/admin/api/providers")).data || cache.providers; } catch {}
+  try { cache.pools = (await apiJSON("/admin/api/pools")).data || cache.pools; } catch {}
   let ownProviderIds = [];
   try { ownProviderIds = (await apiJSON("/admin/api/groups/" + id + "/providers")).data || []; } catch {}
   const memberIds = (g.MemberIDs || []).slice();
@@ -2036,7 +2092,7 @@ window.editAggregate = async id => {
       ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}</p>` : ""}
     </div>
     <div class="field" style="margin-top:14px"><label>包含的成员组（可选，只允许一层）</label><div id="ag-member-checks">${checkListHTML(memberItems, memberIds, "还没有成员组（可到「成员组」页创建）")}</div></div>
-    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${providerChecksHTML((cache.providers || []).filter(p => p.Enabled), ownProviderIds, id, "暂无启用中的渠道")}</div></div>
+    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${providerChecksHTML((cache.providers || []).filter(p => p.Enabled), ownProviderIds, id, "暂无启用中的渠道")}${poolShortcutHTML("ag-provider-checks")}</div></div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="ag-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该聚合模型组</label>
   `, async () => {
     const numOrNull = (key, micro) => {

@@ -8,6 +8,21 @@ import (
 	"time"
 )
 
+// appendAnalyticsScope 把可见性裁剪条件拼到统计 WHERE 上。
+// 趋势图与模型分布两段 SQL 必须共用同一套条件，否则图上的总量与下面的
+// 模型明细会在同一屏里互相矛盾（一个按 Key、一个按分组时最明显）。
+func appendAnalyticsScope(where string, args []any, filter AnalyticsFilter) (string, []any) {
+	if filter.KeyID > 0 {
+		where += ` AND r.key_id=?`
+		args = append(args, filter.KeyID)
+	}
+	if filter.GroupID > 0 {
+		where += ` AND r.group_id=?`
+		args = append(args, filter.GroupID)
+	}
+	return where, args
+}
+
 // Analytics aggregates request metadata for the admin dashboard. It never reads
 // prompts or response bodies, and every dimension is bounded to 30 days.
 func (s *Store) Analytics(ctx context.Context, now time.Time, filter AnalyticsFilter) (map[string]any, error) {
@@ -94,10 +109,7 @@ func (s *Store) Analytics(ctx context.Context, now time.Time, filter AnalyticsFi
 	}
 	where := `r.created_at_utc>=? AND r.created_at_utc<=?`
 	args := []any{fromText, toText}
-	if filter.GroupID > 0 {
-		where += ` AND r.group_id=?`
-		args = append(args, filter.GroupID)
-	}
+	where, args = appendAnalyticsScope(where, args, filter)
 	if len(modelIDs) > 0 {
 		where += ` AND r.model_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(modelIDs)), ",") + `)`
 		for _, id := range modelIDs {
@@ -197,10 +209,7 @@ func (s *Store) Analytics(ctx context.Context, now time.Time, filter AnalyticsFi
 
 	modelWhere := `r.created_at_utc>=? AND r.created_at_utc<=?`
 	modelArgs := []any{fromText, toText}
-	if filter.GroupID > 0 {
-		modelWhere += ` AND r.group_id=?`
-		modelArgs = append(modelArgs, filter.GroupID)
-	}
+	modelWhere, modelArgs = appendAnalyticsScope(modelWhere, modelArgs, filter)
 	if filter.Status != "" && filter.Status != "all" {
 		modelWhere += ` AND r.status=?`
 		modelArgs = append(modelArgs, filter.Status)
