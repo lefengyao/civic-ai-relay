@@ -294,6 +294,86 @@ func (s *Store) PoolCandidateIDs(ctx context.Context, poolID int64) ([]int64, er
 	return out, rows.Err()
 }
 
+// GroupPoolIDs 返回聚合组直接包含的故障转移供应商（池）ID（v27）。
+func (s *Store) GroupPoolIDs(ctx context.Context, groupID int64) ([]int64, error) {
+	if groupID <= 0 {
+		return nil, errors.New("group ID is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT pool_id FROM group_pools WHERE group_id=? ORDER BY pool_id`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceGroupPools 全量替换聚合组包含的池。
+//
+// 池是**模型级**成员：这里只写 group_pools，绝不碰 group_providers。同一个渠道
+// 可以既属于别的组、又被本组的池引用——渠道归属不变，本组拿到的只是池里那几个
+// 模型的调用权（authorizedModelsSelect 的第三个分支）。
+//
+// 只允许聚合组：成员组不对外，Key 绑不上它，把池挂上去没有任何入口。
+func (s *Store) ReplaceGroupPools(ctx context.Context, groupID int64, poolIDs []int64) error {
+	if groupID <= 0 {
+		return errors.New("group ID is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var kind string
+	var groupEnabled int
+	if err := tx.QueryRowContext(ctx, `SELECT kind,enabled FROM model_groups WHERE id=?`, groupID).Scan(&kind, &groupEnabled); err != nil {
+		return err
+	}
+	if kind != GroupKindAggregate {
+		return errors.New("只有聚合模型组可以包含故障转移供应商")
+	}
+	if groupEnabled != 1 {
+		return errors.New("分组已停用，启用后才能调整故障转移供应商")
+	}
+	seen := make(map[int64]struct{}, len(poolIDs))
+	for _, id := range poolIDs {
+		if id <= 0 {
+			return errors.New("invalid pool ID")
+		}
+		if _, ok := seen[id]; ok {
+			return errors.New("duplicate pool ID")
+		}
+		seen[id] = struct{}{}
+		var name string
+		var enabled int
+		if err := tx.QueryRowContext(ctx, `SELECT name,enabled FROM model_pools WHERE id=?`, id).Scan(&name, &enabled); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("故障转移供应商 #%d 不存在", id)
+			}
+			return err
+		}
+		if enabled != 1 {
+			return fmt.Errorf("故障转移供应商「%s」已停用，停用的池不能入组", name)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM group_pools WHERE group_id=?`, groupID); err != nil {
+		return err
+	}
+	for _, id := range poolIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO group_pools(group_id,pool_id) VALUES (?,?)`, groupID, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // AuthorizedPoolEntries 把「至少一个成员对该 Key 可用」的启用池变成虚拟模型条目，
 // 追加到授权列表。它是 /v1/models 与管理端「接入信息」的共同口径：客户端能看到的
 // 池名，一定真的能调（且不会把未授权渠道里的成员暴露出去）。

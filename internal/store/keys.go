@@ -541,6 +541,7 @@ func (s *Store) ValidateKeyGroup(ctx context.Context, groupID int64) error {
 //
 // 渠道来源与授权口径一致（v22）：聚合组既认自有渠道，也认成员组的渠道，否则
 // 从成员组来的模型会被算回默认倍率，和预留事务里的报价（永远取绑定组的倍率）打架。
+// 池成员（v27）同理：它可能挂在别的组的渠道上，但计费倍率永远取 Key 绑定的组。
 func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (int64, error) {
 	if keyID <= 0 || modelID <= 0 {
 		return DefaultGroupRateMilli, errors.New("key and model IDs are required")
@@ -550,6 +551,7 @@ func (s *Store) KeyModelRateMilli(ctx context.Context, keyID, modelID int64) (in
 		SELECT 1 FROM models m WHERE m.id=? AND (
 			EXISTS(SELECT 1 FROM group_providers gp WHERE gp.group_id=g.id AND gp.provider_id=m.provider_id)
 			OR EXISTS(SELECT 1 FROM group_compositions gc JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal' JOIN group_providers gp2 ON gp2.group_id=gc.child_group_id WHERE gc.parent_group_id=g.id AND gp2.provider_id=m.provider_id)
+			OR EXISTS(SELECT 1 FROM group_pools gpl JOIN model_pool_members pm ON pm.pool_id=gpl.pool_id AND pm.model_id=m.id AND pm.enabled=1 WHERE gpl.group_id=g.id)
 		)
 	)`, keyID, modelID).Scan(&rate)
 	if err != nil {
@@ -682,16 +684,26 @@ func (s *Store) filterByProviderSchedule(ctx context.Context, models []Model, no
 // （group_compositions）。只允许一层，成员关系在写入时已校验必须是 normal，
 // 所以这里不需要递归 CTE。
 //
+// 池来源（v27）：组直接包含的故障转移供应商，只授权**池里的成员模型**。这一条
+// 刻意不经过 providers：池是模型集合，勾一个池不该把成员渠道下别的模型一起放出，
+// 也不该改动渠道归属（渠道可能属于别的组）。
+//
 // 公共 /v1/models 与管理端「接入信息」共用这一份 SQL，避免两处判断漂移出
 // 「客户端报 404、管理台却显示已授权」这类最难查的问题。
 const authorizedModelsSelect = `SELECT DISTINCT m.id,m.provider_id,m.public_name,m.upstream_name,m.input_price_microyuan,m.output_price_microyuan,m.cached_input_price_microyuan,m.enabled FROM client_keys k JOIN model_groups g ON g.id=k.group_id AND g.enabled=1 AND g.kind='aggregate' JOIN (
-	SELECT gp.group_id AS group_id, gp.provider_id AS provider_id FROM group_providers gp
+	SELECT gp.group_id AS group_id, m.id AS model_id
+		FROM group_providers gp JOIN models m ON m.provider_id=gp.provider_id
 	UNION
-	SELECT gc.parent_group_id AS group_id, gp.provider_id AS provider_id
+	SELECT gc.parent_group_id AS group_id, m.id AS model_id
 		FROM group_compositions gc
 		JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
 		JOIN group_providers gp ON gp.group_id=gc.child_group_id
-) eff ON eff.group_id=g.id JOIN models m ON m.provider_id=eff.provider_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
+		JOIN models m ON m.provider_id=gp.provider_id
+	UNION
+	SELECT gpl.group_id AS group_id, pm.model_id AS model_id
+		FROM group_pools gpl
+		JOIN model_pool_members pm ON pm.pool_id=gpl.pool_id AND pm.enabled=1
+) eff ON eff.group_id=g.id JOIN models m ON m.id=eff.model_id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL JOIN providers p ON p.id=m.provider_id AND p.enabled=1 WHERE `
 
 func (s *Store) authorizedModels(ctx context.Context, where string, args ...any) ([]Model, error) {
 	rows, err := s.db.QueryContext(ctx, authorizedModelsSelect+where+" ORDER BY m.id", args...)

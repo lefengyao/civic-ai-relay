@@ -459,6 +459,23 @@ var migrations = []migration{
 		`ALTER TABLE model_groups ADD COLUMN concurrency_limit INTEGER`,
 		`CREATE INDEX idx_key_reservations_source_status ON key_reservations(source_group_id, status)`,
 	}},
+	// v27：聚合组可以直接包含「故障转移供应商」（池），并且**只授权池里的模型**。
+	//
+	// 旧做法是让运维在组里勾选池，前端就把池成员的**渠道**勾进 group_providers——
+	// 那是渠道级授权：渠道下所有模型都随之进组，和「这个池只声明了这几个模型互为
+	// 备份」的语义完全不符（勾一个池，把渠道原分组的一堆模型也放了出来）。
+	//
+	// 池本来就是模型集合（model_pool_members），所以在组与池之间建一条模型级的
+	// 关系即可：授权范围 = 池成员模型，与渠道归属无关，也不改动 group_providers。
+	// 渠道归属仍归原组，池只是「把这些模型借给本组用」。
+	{version: 27, statements: []string{
+		`CREATE TABLE group_pools (
+			group_id INTEGER NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+			pool_id INTEGER NOT NULL REFERENCES model_pools(id) ON DELETE CASCADE,
+			PRIMARY KEY (group_id, pool_id)
+		)`,
+		`CREATE INDEX idx_group_pools_pool ON group_pools(pool_id)`,
+	}},
 }
 
 func (s *Store) applySchema(ctx context.Context) error {

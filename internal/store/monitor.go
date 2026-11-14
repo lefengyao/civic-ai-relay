@@ -88,7 +88,8 @@ type GroupMonitorResult struct {
 
 // GroupMonitorTargets 一次查出所有分组及其渠道构成，供监测循环使用。
 // 渠道来源与授权口径一致（v22）：聚合组除了自己挂的渠道，还包括成员组的渠道，
-// 否则聚合组会出现「有模型但探活显示 0 个渠道」的假象。
+// 否则聚合组会出现「有模型但探活显示 0 个渠道」的假象。v27 起还包括组直接包含的
+// 池的成员渠道——只挂了一个池的聚合组同样要能探活，否则会显示「配置不可用」。
 func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT g.id,g.name,g.enabled,p.id,COALESCE(p.name,''),COALESCE(p.enabled,0),
 		(SELECT COUNT(*) FROM models m WHERE m.provider_id=p.id AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL),
@@ -102,6 +103,11 @@ func (s *Store) GroupMonitorTargets(ctx context.Context) ([]GroupMonitorTarget, 
 				FROM group_compositions gc
 				JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
 				JOIN group_providers gp ON gp.group_id=gc.child_group_id
+			UNION
+			SELECT gpl.group_id AS group_id, m.provider_id AS provider_id
+				FROM group_pools gpl
+				JOIN model_pool_members pm ON pm.pool_id=gpl.pool_id AND pm.enabled=1
+				JOIN models m ON m.id=pm.model_id
 		) eff ON eff.group_id=g.id
 		LEFT JOIN providers p ON p.id=eff.provider_id
 		ORDER BY g.id, p.id`)

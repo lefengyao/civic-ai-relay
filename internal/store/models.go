@@ -142,6 +142,10 @@ type ModelGroup struct {
 	// Members / MemberIDs 仅在聚合组上非空：它包含的成员组。
 	MemberIDs []int64
 	Members   []ModelGroupBrief
+	// PoolIDs 是聚合组直接包含的故障转移供应商（v27）。池是**模型级**成员：
+	// 授权的范围就是池里那几个模型，不碰 group_providers，也不会把渠道下别的
+	// 模型一起带进来——这正是它和「自有渠道」的区别。
+	PoolIDs []int64
 	// Providers 是组「自己能直接用的渠道数」：成员组 = 自己挂的渠道，聚合组
 	// 只算自有渠道，不含成员组带来的（成员组各自有计数）。
 	Providers int
@@ -796,6 +800,31 @@ func (s *Store) ListModelGroups(ctx context.Context) ([]ModelGroup, error) {
 			}
 		}
 	}
+	// 池成员关系同样一次取全（v27）。池是模型级成员，回前端只给 ID，
+	// 名字由管理台用已有的池清单映射——池改名后列表不必等下一次刷新。
+	pools := make(map[int64][]int64)
+	rows3, err := s.db.QueryContext(ctx, `SELECT group_id,pool_id FROM group_pools ORDER BY group_id,pool_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows3.Close()
+	for rows3.Next() {
+		var groupID, poolID int64
+		if err := rows3.Scan(&groupID, &poolID); err != nil {
+			return nil, err
+		}
+		pools[groupID] = append(pools[groupID], poolID)
+	}
+	if err := rows3.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if list, ok := pools[out[i].ID]; ok {
+			out[i].PoolIDs = list
+		} else {
+			out[i].PoolIDs = []int64{}
+		}
+	}
 	return out, nil
 }
 
@@ -844,6 +873,14 @@ func (s *Store) GetModelGroup(ctx context.Context, id int64) (ModelGroup, error)
 		for _, m := range members {
 			g.MemberIDs = append(g.MemberIDs, m.ID)
 		}
+		pools, err := s.GroupPoolIDs(ctx, id)
+		if err != nil {
+			return ModelGroup{}, err
+		}
+		g.PoolIDs = pools
+	}
+	if g.PoolIDs == nil {
+		g.PoolIDs = []int64{}
 	}
 	return g, nil
 }

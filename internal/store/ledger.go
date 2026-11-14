@@ -513,6 +513,10 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 	// source_group_id 是「真正提供该模型的组」，额度要在它身上也扣一份——这是
 	// 老板明确要求的「两个组都扣」。它同时落库到 requests / key_reservations，
 	// 让成员组的概览与额度判定用同一口径。
+	//
+	// v27 补一个分支：模型可能只是通过**池**被本组引用（组直接包含故障转移供应商），
+	// 它的渠道还归别的组、甚至不属于任何组。那种情况下没有「提供组」可扣，就记在
+	// 绑定组自己头上——客户消耗的是本组的额度，这才是额度该管的东西。
 	var inputPrice, outputPrice, cachedPrice, rate sql.NullInt64
 	var sourceGroupID int64
 	if err := conn.QueryRowContext(ctx, `SELECT m.input_price_microyuan,m.output_price_microyuan,COALESCE(m.cached_input_price_microyuan,m.input_price_microyuan),g.rate_milli,
@@ -521,7 +525,11 @@ func (s *Store) ReserveRequest(ctx context.Context, in ReserveInput) (RequestRes
 			  AND (gp.group_id=g.id OR EXISTS(
 				SELECT 1 FROM group_compositions gc
 				JOIN model_groups cg ON cg.id=gc.child_group_id AND cg.enabled=1 AND cg.kind='normal'
-				WHERE gc.parent_group_id=g.id AND gc.child_group_id=gp.group_id))),0)
+				WHERE gc.parent_group_id=g.id AND gc.child_group_id=gp.group_id))),
+			(SELECT g.id WHERE EXISTS(
+				SELECT 1 FROM group_pools gpl JOIN model_pool_members pm
+				ON pm.pool_id=gpl.pool_id AND pm.model_id=m.id AND pm.enabled=1
+				WHERE gpl.group_id=g.id)),0)
 		FROM models m JOIN providers p ON p.id=m.provider_id AND p.enabled=1 JOIN model_groups g ON g.id=? AND g.enabled=1
 		WHERE m.id=? AND m.enabled=1 AND m.input_price_microyuan IS NOT NULL AND m.output_price_microyuan IS NOT NULL`, groupID, in.ModelID).
 		Scan(&inputPrice, &outputPrice, &cachedPrice, &rate, &sourceGroupID); err != nil {

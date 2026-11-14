@@ -400,6 +400,16 @@ func writeGroupProviderError(w http.ResponseWriter, err error) {
 	writeAdminErrorDetail(w, 400, "group_invalid", err.Error())
 }
 
+// writeGroupPoolError 对应 group_pools 的写入（v27）。池不存在给 404，其余
+// （组不是聚合组、池已停用、重复 ID）给 400，都带可直接读懂的中文 detail。
+func writeGroupPoolError(w http.ResponseWriter, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeAdminError(w, 404, "not_found")
+		return
+	}
+	writeAdminErrorDetail(w, 400, "pool_invalid", err.Error())
+}
+
 // writeDeleteResult reports the outcome of a delete, mapping "row missing" to
 // 404 so operators can tell an unknown ID apart from a failed delete.
 func writeDeleteResult(w http.ResponseWriter, err error) {
@@ -1034,6 +1044,9 @@ func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 		ProviderIDs []int64  `json:"provider_ids"`
 		// GroupIDs 只在聚合组上有意义：它包含的普通模型组。
 		GroupIDs []int64 `json:"group_ids"`
+		// PoolIDs 是聚合组直接包含的故障转移供应商（v27）。池是模型级成员，
+		// 与 provider_ids 互不替代：渠道 = 整条渠道的模型，池 = 池里那几个模型。
+		PoolIDs []int64 `json:"pool_ids"`
 		// ConcurrencyLimit 并发上限（v26）：0 或缺省 = 不限。与全局并发上限
 		// 各判各的，不做「必须小于全局」这类联动校验。
 		ConcurrencyLimit *int64 `json:"concurrency_limit"`
@@ -1046,6 +1059,9 @@ func (h *AdminHandler) groupCreate(w http.ResponseWriter, r *http.Request) {
 		ConcurrencyLimit: p.ConcurrencyLimit})
 	if err == nil {
 		err = h.repo.ReplaceGroupProviders(r.Context(), g.ID, p.ProviderIDs)
+	}
+	if err == nil && len(p.PoolIDs) > 0 {
+		err = h.repo.ReplaceGroupPools(r.Context(), g.ID, p.PoolIDs)
 	}
 	if err != nil {
 		// 失败就把已经建出来的组删掉，避免留下一个「创建时报错、列表里却多出来」
@@ -1126,9 +1142,11 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 		// 「这个组是聚合组、有几个成员」，不回传别组的名字与倍率。
 		members := any(g.Members)
 		memberIDs := any(g.MemberIDs)
+		poolIDs := any(g.PoolIDs)
 		if !subjectOf(r).Admin {
 			members = []any{}
 			memberIDs = []int64{}
+			poolIDs = []int64{}
 		}
 		items = append(items, map[string]any{
 			"ID": g.ID, "Name": g.Name, "Kind": g.Kind, "Enabled": g.Enabled, "RateMilli": g.RateMilli,
@@ -1137,6 +1155,7 @@ func (h *AdminHandler) groupsList(w http.ResponseWriter, r *http.Request) {
 			"ParentCount":     g.ParentCount,
 			"Members":         members,
 			"MemberIDs":       memberIDs,
+			"PoolIDs":         poolIDs,
 			"TokenLimit5H":    g.TokenLimit5H,
 			"AmountLimit5H":   g.AmountLimit5H,
 			"TokenLimitDaily": g.TokenLimitDaily, "AmountLimitDaily": g.AmountLimitDaily,
@@ -1400,6 +1419,42 @@ func (h *AdminHandler) groupItem(w http.ResponseWriter, r *http.Request, raw str
 			}
 			if err := h.repo.ReplaceGroupProviders(r.Context(), id, p.ProviderIDs); err != nil {
 				writeGroupProviderError(w, err)
+				return
+			}
+			writeJSON(w, 200, map[string]any{"ok": true})
+			return
+		}
+	}
+	if len(parts) == 2 && parts[1] == "pools" {
+		// 池成员与渠道成员是两套关系（v27）：这条只写 group_pools，不动渠道归属。
+		// 组不存在时同样先判，别让运维拿到一句「sql: no rows in result set」。
+		if _, err := h.repo.GetModelGroup(r.Context(), id); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeAdminError(w, 404, "not_found")
+				return
+			}
+			writeAdminError(w, 500, "store_error")
+			return
+		}
+		if r.Method == http.MethodGet {
+			ids, err := h.repo.GroupPoolIDs(r.Context(), id)
+			if err != nil {
+				writeAdminError(w, 400, "group_invalid")
+				return
+			}
+			writeJSON(w, 200, map[string]any{"data": ids})
+			return
+		}
+		if r.Method == http.MethodPut {
+			var p struct {
+				PoolIDs []int64 `json:"pool_ids"`
+			}
+			if json.NewDecoder(r.Body).Decode(&p) != nil {
+				writeAdminError(w, 400, "invalid_request")
+				return
+			}
+			if err := h.repo.ReplaceGroupPools(r.Context(), id, p.PoolIDs); err != nil {
+				writeGroupPoolError(w, err)
 				return
 			}
 			writeJSON(w, 200, map[string]any{"ok": true})

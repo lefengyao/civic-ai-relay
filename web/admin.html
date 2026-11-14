@@ -136,6 +136,8 @@ tbody tr:hover{background:#f8faff}
 .tag.ok{background:var(--green-soft);color:var(--green)}
 .tag.off{background:#eef0f4;color:var(--muted)}
 .tag.warn{background:var(--amber-soft);color:var(--amber)}
+/* 聚合组列表里「池」是模型级成员，用主色区分于绿色的成员组（整条渠道）。 */
+.tag.pool{background:var(--accent-soft);color:var(--accent)}
 .tag.err{background:var(--red-soft);color:var(--red)}
 
 /* ── 开关 ─────────────────────────── */
@@ -300,9 +302,6 @@ details .card{margin-bottom:0}
 .pool-order{width:22px;text-align:center;color:var(--accent);font-weight:600}
 .pool-enable{display:flex;align-items:center;gap:4px;white-space:nowrap;font-size:12px;color:var(--muted)}
 .pool-member-line{padding:2px 0;font-size:12.5px}
-/* 组编辑里的「按池快速勾选」：池只是成员渠道的组合，点一下等于勾上它所有渠道。 */
-.pool-shortcuts{margin-top:10px;border:1px dashed var(--border);border-radius:8px;padding:6px 8px}
-.pool-shortcuts-title{font-size:12.5px;color:var(--muted);margin:2px 0 6px}
 </style>
 </head>
 <body>
@@ -443,7 +442,7 @@ details .card{margin-bottom:0}
 
     <!-- 聚合模型组：唯一可被 Key 绑定的组（对外服务）。它 = 自有渠道 ∪ 成员组渠道。 -->
     <section id="view-aggregates" class="view">
-      <p class="view-hint"><b>聚合模型组是唯一对外服务的组</b>：客户端 Key 只能绑定这里的组。它由「自有渠道（可选）」和「成员组（可选）」组成，两者都没有时这个组拿不到任何模型。一笔请求会<b>同时消耗本组与真正提供模型的成员组的额度</b>，任一窗口用满都会拒绝新请求。</p>
+      <p class="view-hint"><b>聚合模型组是唯一对外服务的组</b>：客户端 Key 只能绑定这里的组。它由「自有渠道（可选）」「成员组（可选）」与「故障转移供应商（可选）」组成，三者都没有时这个组拿不到任何模型。自有渠道与成员组按<b>整条渠道</b>授权；故障转移供应商只授权<b>池里勾选的那几个模型</b>。一笔请求会<b>同时消耗本组与真正提供模型的成员组的额度</b>，任一窗口用满都会拒绝新请求。</p>
       <details class="add-box admin-only"><summary>＋ 创建聚合模型组</summary>
         <div class="card"><form id="agg-form">
           <div class="form-grid">
@@ -452,7 +451,8 @@ details .card{margin-bottom:0}
           </div>
           <div class="field"><label>包含的成员组（可选）—— 成员组的渠道与模型会一并授权给绑定本组的 Key</label><div id="agg-group-checks"></div></div>
           <div class="field" style="margin-top:12px"><label>自有渠道（可选）—— 只想挂几个渠道时用它，不必先建成员组</label><div id="agg-provider-checks"></div></div>
-          <p style="color:var(--muted);font-size:12.5px;margin:8px 0 0">成员组与自有渠道<b>至少要选一个</b>，否则这个组拿不到任何模型。聚合组只允许包含成员组（不支持多层嵌套），它自己拥有独立的倍率与九项额度。</p>
+          <div class="field" style="margin-top:12px"><label>包含的故障转移供应商（可选）—— <b>只授权池里勾选的那几个模型</b>，不会把渠道原分组的其他模型带进来</label><div id="agg-pool-checks"></div><p class="hint" id="agg-pool-hint" style="margin:6px 0 0"></p></div>
+          <p style="color:var(--muted);font-size:12.5px;margin:8px 0 0">成员组、自有渠道、故障转移供应商<b>至少要选一个</b>，否则这个组拿不到任何模型。聚合组只允许包含成员组（不支持多层嵌套），它自己拥有独立的倍率与九项额度。</p>
           <div class="form-actions"><button class="btn">创建聚合模型组</button></div>
         </form></div>
       </details>
@@ -1356,38 +1356,39 @@ function providerChecksHTML(list, selected, ownGroupId, emptyText) {
 }
 const checkedIds = container => [...container.querySelectorAll(".check-list input:checked")].map(i => Number(i.dataset.id));
 
-/* 故障转移供应商（池）没有独立的渠道身份：它的成员就是几条已有渠道。
-   组要「选池」，等价于把池成员的渠道一起勾上——授权、额度、并发仍按渠道所属组
-   记账，不引入第二种成员类型。这里只做快捷勾选，并在渠道被别的组占用时点明冲突。 */
-function poolShortcutHTML(targetId) {
-  const pools = (cache.pools || []).filter(p => p.Enabled);
-  if (!pools.length) return "";
-  return `<div class="pool-shortcuts"><div class="pool-shortcuts-title">按故障转移供应商快速勾选（池 = 它的成员渠道，不额外占额度）</div>` +
-    pools.map(p => {
-      const members = (p.Members || []).filter(m => m.Enabled);
-      const names = [...new Set(members.map(m => m.ProviderName).filter(Boolean))];
-      const channels = new Set(members.map(m => m.ProviderID).filter(Boolean)).size;
-      return `<div class="pool-row"><div class="pool-pick"><b>${esc(p.Name)}</b><span class="pool-provider">${esc(names.join("、") || "无可用成员")} · ${channels} 个渠道</span></div><button type="button" class="btn-ghost btn-sm" data-pool-add="${p.ID}" data-pool-target="${targetId}">加入本组</button></div>`;
-    }).join("") + `</div>`;
+/* 故障转移供应商（池）是**模型级**成员（v27）：勾中一个池，本组只拿到池里的那几个
+   模型 —— 渠道仍归它原来的组，渠道下别的模型不会跟着进来。这与「自有渠道」正好相反，
+   所以两栏必须分开列，别让人以为勾池等于勾渠道（v0.13.3 就是这么误导的）。 */
+function poolChecksHTML(pools, selected, emptyText) {
+  if (!pools.length) return `<span style="color:var(--muted);font-size:13px">${esc(emptyText)}</span>`;
+  return `<div class="check-list">` + pools.map(p => {
+    const on = selected.includes(p.ID);
+    const n = new Set((p.Members || []).filter(m => m.Enabled).map(m => m.ModelID)).size;
+    const off = p.Enabled ? "" : `<span style="color:var(--muted)">（已停用）</span>`;
+    return `<label class="check-item ${on ? "on" : ""}"><input type="checkbox" data-id="${p.ID}" value="${p.ID}" ${on ? "checked" : ""} onchange="this.closest('.check-item').classList.toggle('on',this.checked)"><span>${esc(p.Name)}<span style="color:var(--muted)">（${n} 个模型）</span>${off}</span></label>`;
+  }).join("") + `</div>`;
 }
-document.addEventListener("click", event => {
-  const btn = event.target.closest("[data-pool-add]");
-  if (!btn) return;
-  event.preventDefault();
-  const pool = (cache.pools || []).find(p => String(p.ID) === btn.dataset.poolAdd);
-  const target = document.getElementById(btn.dataset.poolTarget);
-  if (!pool || !target) return;
-  const blocked = new Set(), added = [];
-  for (const member of pool.Members || []) {
-    if (!member.Enabled) continue;
-    const input = target.querySelector(`input[data-id="${member.ProviderID}"]`);
-    if (!input) continue; // 渠道已停用，不在候选清单里
-    if (input.disabled) { blocked.add(member.ProviderName || ("#" + member.ProviderID)); continue; }
-    if (!input.checked) { input.checked = true; input.dispatchEvent(new Event("change", { bubbles: true })); added.push(member.ProviderName); }
+
+/* 池只授权池内模型；但同一个渠道若又被勾进「自有渠道」，渠道是整条授权的，池的模型
+   范围就没意义了。当场点出来，比事后发现「怎么多出一堆模型」好查得多。 */
+function refreshAggregatePoolHint(poolBoxId, providerBoxId, hintId) {
+  const poolBox = $(poolBoxId), providerBox = $(providerBoxId), hint = $(hintId);
+  if (!poolBox || !providerBox || !hint) return;
+  const own = new Set([...providerBox.querySelectorAll("input[data-id]:checked")].map(i => Number(i.dataset.id)));
+  const lines = [];
+  for (const input of poolBox.querySelectorAll("input[data-id]:checked")) {
+    const pool = (cache.pools || []).find(p => p.ID === Number(input.dataset.id));
+    if (!pool) continue;
+    const hit = [...new Set((pool.Members || []).filter(m => m.Enabled && own.has(m.ProviderID)).map(m => m.ProviderName))];
+    if (hit.length) lines.push(`池「${pool.Name}」的渠道 ${hit.join("、")} 同时也勾在「自有渠道」里 —— 渠道是整条授权的，本组会连带拿到这些渠道下的所有模型。要让它只放池里的模型，请从自有渠道里去掉它们。`);
   }
-  if (blocked.size) toast(`池「${pool.Name}」的渠道「${[...blocked].join("、")}」已属于其他分组，请先从那个组移除`, "err");
-  else if (added.length) toast(`已把「${pool.Name}」的 ${added.length} 个渠道勾进本组`, "ok");
-  else toast(`「${pool.Name}」的渠道已全部在本组`, "ok");
+  hint.innerHTML = lines.map(l => `<span style="color:var(--amber)">⚠ ${esc(l)}</span>`).join("<br>");
+}
+document.addEventListener("change", event => {
+  const cb = event.target;
+  if (!(cb instanceof HTMLInputElement) || cb.type !== "checkbox") return;
+  if (cb.closest("#agg-pool-checks, #agg-provider-checks")) refreshAggregatePoolHint("agg-pool-checks", "agg-provider-checks", "agg-pool-hint");
+  if (cb.closest("#ag-pool-checks, #ag-provider-checks")) refreshAggregatePoolHint("ag-pool-checks", "ag-provider-checks", "ag-pool-hint");
 });
 function closeEditModal() {
   $("edit-modal").classList.remove("on");
@@ -1705,8 +1706,9 @@ $("pool-add-btn").onclick = () => openPoolEditor(null);
 /* ── 成员组（渠道池：组内挂供应商，不在本组对外；被聚合组包含后才授权模型） ── */
 function renderGroupChecks() {
   const okProviders = cache.providers.filter(p => p.Enabled);
+  // 成员组只认渠道：池是对外模型名，它的成员关系挂在聚合组上（v27）。
   $("group-model-checks").innerHTML = providerChecksHTML(okProviders, [], null,
-    "暂无启用中的供应商（渠道），请先在「供应商」页创建") + poolShortcutHTML("group-model-checks");
+    "暂无启用中的供应商（渠道），请先在「供应商」页创建");
 }
 /* ── 分组可用性监测 ──────────────────────────────────────────
    状态由后端判定，这里只负责呈现。区分「配置不可用」和「上游不可达」是刻意的：
@@ -1937,7 +1939,7 @@ window.editGroup = async id => {
         <span class="hint">只约束「由本组渠道承接」的请求：名额满了发出去的请求直接 429（在跑 ${Number(g.ActiveConcurrency || 0)} 个）。与全局并发上限各判各的——全局先超同样是超限，两者不需要互相比大小。</span>
       </div>
     </div>
-    <div class="field" id="eg-provider-checks" style="margin-top:14px"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label>${providerChecksHTML(okProviders, memberIds, id, "暂无启用中的渠道")}${poolShortcutHTML("eg-provider-checks")}</div>
+    <div class="field" id="eg-provider-checks" style="margin-top:14px"><label>包含的供应商（渠道）——渠道下所有已定价启用模型随组授权</label>${providerChecksHTML(okProviders, memberIds, id, "暂无启用中的渠道")}</div>
     ${offMembers.length ? `<p style="color:var(--amber);font-size:12.5px;margin:6px 0 0">⚠ ${offMembers.length} 个已停用的成员渠道保存后将被移除</p>` : ""}
     <div style="margin-top:14px"><h4 style="margin:0 0 4px">成员渠道的模型与计价</h4>${detail}</div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="eg-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该成员组</label>
@@ -2006,7 +2008,9 @@ function renderAggregateChecks() {
     candidates.map(g => ({ id: g.ID, label: `${g.Name}（${g.Providers || 0} 个渠道${g.Enabled ? "" : "，已停用"}）` })),
     [], "还没有成员组（可到「成员组」页创建）");
   const providers = (cache.providers || []).filter(p => p.Enabled);
-  $("agg-provider-checks").innerHTML = providerChecksHTML(providers, [], null, "暂无启用中的渠道") + poolShortcutHTML("agg-provider-checks");
+  $("agg-provider-checks").innerHTML = providerChecksHTML(providers, [], null, "暂无启用中的渠道");
+  $("agg-pool-checks").innerHTML = poolChecksHTML((cache.pools || []).filter(p => p.Enabled), [], "还没有故障转移供应商（可到「故障转移供应商」页创建）");
+  refreshAggregatePoolHint("agg-pool-checks", "agg-provider-checks", "agg-pool-hint");
 }
 /* 聚合组的额度紧张标记与模型组同口径：三个主窗口里最紧的那个。 */
 function aggregateQuotaCell(g) {
@@ -2037,11 +2041,18 @@ async function loadAggregates() {
   // 只读主体看不到成员组 / 供应商页面，这两列（成员组名与渠道数）也一并不渲染：
   // 后端对密钥主体本就把 Members 抹空，继续渲染会稳定显示「未包含任何组」——看着像故障。
   const showTopology = isAdmin;
-  $("agg-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th>${showTopology ? "<th>成员组</th><th>渠道</th>" : ""}<th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
+  $("agg-data").innerHTML = `<table><thead><tr><th>ID</th><th>组名</th><th>倍率</th>${showTopology ? "<th>成员组 / 池</th><th>渠道</th>" : ""}<th>状态</th><th>额度</th><th>可用性</th><th>操作</th></tr></thead><tbody>` +
     list.map(g => {
       const members = g.Members || [];
-      const memberCell = members.length
-        ? members.map(m => `<span class="tag ${m.Enabled ? "ok" : "off"}" title="成员组，自带 ${m.Providers || 0} 个渠道">${esc(m.Name)}</span>`).join(" ")
+      // 池是模型级成员，标签单独一种颜色（tag 无 ok/off 后缀），避免和成员组混淆：
+      // 成员组 = 整条渠道，池 = 只有池里那几个模型。
+      const poolChips = (g.PoolIDs || [])
+        .map(id => (cache.pools || []).find(p => p.ID === id))
+        .filter(Boolean)
+        .map(p => `<span class="tag pool" title="故障转移供应商：只授权池内模型">池·${esc(p.Name)}</span>`)
+        .join(" ");
+      const memberCell = members.length || poolChips
+        ? members.map(m => `<span class="tag ${m.Enabled ? "ok" : "off"}" title="成员组，自带 ${m.Providers || 0} 个渠道">${esc(m.Name)}</span>`).join(" ") + (poolChips ? ` ${poolChips}` : "")
         : `<span style="color:var(--muted)">未包含任何组</span>`;
       // 渠道数：自有 + 各成员组的。同一个渠道被多个成员组引用时会重复计数，
       // 这里只作规模参考，精确清单在「查看 / 编辑」里。
@@ -2057,13 +2068,15 @@ $("agg-form").onsubmit = async e => {
   const form = new FormData(e.target);
   const groupIds = [...$("agg-group-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
   const providerIds = [...$("agg-provider-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
-  // 成员组与自有渠道至少要有一个：两个都空的组拿不到任何模型，建出来只会是死组。
-  if (!groupIds.length && !providerIds.length) { toast("至少要包含一个成员组，或直接勾选几个自有渠道", "err"); return; }
+  const poolIds = [...$("agg-pool-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
+  // 成员组、自有渠道、池至少要有一个：全空的组拿不到任何模型，建出来只会是死组。
+  if (!groupIds.length && !providerIds.length && !poolIds.length) { toast("至少要包含一个成员组、一个自有渠道，或一个故障转移供应商", "err"); return; }
   try {
     await apiJSON("/admin/api/groups", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       name: form.get("name"), kind: "aggregate", rate: parseFloat(form.get("rate")) || 1,
       group_ids: groupIds,
       provider_ids: providerIds,
+      pool_ids: poolIds,
     }) });
     toast("聚合模型组已创建", "ok");
     e.target.reset();
@@ -2080,6 +2093,8 @@ window.editAggregate = async id => {
   try { cache.pools = (await apiJSON("/admin/api/pools")).data || cache.pools; } catch {}
   let ownProviderIds = [];
   try { ownProviderIds = (await apiJSON("/admin/api/groups/" + id + "/providers")).data || []; } catch {}
+  let ownPoolIds = [];
+  try { ownPoolIds = (await apiJSON("/admin/api/groups/" + id + "/pools")).data || []; } catch {}
   const memberIds = (g.MemberIDs || []).slice();
   const candidates = cache.groups.filter(x => x.Kind !== "aggregate");
   const memberItems = candidates.map(x => ({ id: x.ID, label: `${x.Name}（${x.Providers || 0} 个渠道${x.Enabled ? "" : "，已停用"}）` }));
@@ -2108,7 +2123,8 @@ window.editAggregate = async id => {
       ${g.PeriodLimitStart ? `<p style="color:var(--muted);font-size:12.5px;margin:6px 0 0">周期起点：${esc(fmtTime(g.PeriodLimitStart))}</p>` : ""}
     </div>
     <div class="field" style="margin-top:14px"><label>包含的成员组（可选，只允许一层）</label><div id="ag-member-checks">${checkListHTML(memberItems, memberIds, "还没有成员组（可到「成员组」页创建）")}</div></div>
-    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${providerChecksHTML((cache.providers || []).filter(p => p.Enabled), ownProviderIds, id, "暂无启用中的渠道")}${poolShortcutHTML("ag-provider-checks")}</div></div>
+    <div class="field" style="margin-top:12px"><label>自有渠道（可选）</label><div id="ag-provider-checks">${providerChecksHTML((cache.providers || []).filter(p => p.Enabled), ownProviderIds, id, "暂无启用中的渠道")}</div></div>
+    <div class="field" style="margin-top:12px"><label>包含的故障转移供应商（可选）—— <b>只授权池里勾选的那几个模型</b>，不附带渠道下其他模型</label><div id="ag-pool-checks">${poolChecksHTML((cache.pools || []).filter(p => p.Enabled), ownPoolIds, "还没有故障转移供应商（可到「故障转移供应商」页创建）")}</div><p class="hint" id="ag-pool-hint" style="margin:6px 0 0"></p></div>
     <label class="switch-row" style="margin-top:10px"><label class="switch"><input id="ag-enabled" type="checkbox" ${g.Enabled ? "checked" : ""}><span class="track"></span></label>启用该聚合模型组</label>
   `, async () => {
     const numOrNull = (key, micro) => {
@@ -2120,10 +2136,12 @@ window.editAggregate = async id => {
     };
     const picked = [...$("ag-member-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
     const ownProviders = [...$("ag-provider-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
-    if (!picked.length && !ownProviders.length) throw new Error("至少要包含一个成员组，或保留至少一个自有渠道");
-    // 先写成员与渠道：它们失败时不应该留下「改了一半」的名称/额度。
+    const ownPools = [...$("ag-pool-checks").querySelectorAll("input:checked")].map(i => Number(i.dataset.id));
+    if (!picked.length && !ownProviders.length && !ownPools.length) throw new Error("至少要包含一个成员组，或保留至少一个自有渠道 / 故障转移供应商");
+    // 先写成员、渠道与池：它们失败时不应该留下「改了一半」的名称/额度。
     await apiJSON("/admin/api/groups/" + id + "/members", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group_ids: picked }) });
     await apiJSON("/admin/api/groups/" + id + "/providers", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider_ids: ownProviders }) });
+    await apiJSON("/admin/api/groups/" + id + "/pools", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pool_ids: ownPools }) });
     await apiJSON("/admin/api/groups/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       name: $("ag-name").value.trim(), rate: parseFloat($("ag-rate").value) || 1, enabled: $("ag-enabled").checked,
       token_limit_5h: numOrNull("t5h", false), amount_limit_5h: numOrNull("a5h", true),
@@ -2134,6 +2152,7 @@ window.editAggregate = async id => {
     }) });
     loadAggregates();
   });
+  refreshAggregatePoolHint("ag-pool-checks", "ag-provider-checks", "ag-pool-hint");
 };
 window.delAggregate = id => {
   const g = cache.groups.find(x => x.ID === id);
