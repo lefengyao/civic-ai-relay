@@ -169,6 +169,9 @@ details .card{margin-bottom:0}
    列宽全固定，不让 flex 自由伸缩 —— 否则输入框会抢空间把星期格压扁，
    两行内容一样却宽度不同（同一张表里最显眼的那种不齐）。 */
 #es-windows,#es-exclude{margin:0 0 10px}
+/* 两个容器都允许删空（删除自己那一段不再置灰），空的时候给一句话，
+   否则一片空白看着像渲染失败。 */
+#es-windows:empty::before,#es-exclude:empty::before{content:"还没有时间段，点下面的按钮添加";display:block;color:var(--muted);font-size:12px;padding:3px 0 7px}
 .sched-window{display:grid;grid-template-columns:88px 14px 88px auto 1fr;align-items:center;column-gap:8px;margin-bottom:8px}
 .sched-window input[type=time]{width:100%;height:36px;padding:0 6px;font-size:13.5px;box-sizing:border-box}
 /* 时间输入框内部由浏览器排版：把时钟图标贴紧文字，别让中间空出一大片。 */
@@ -1222,33 +1225,11 @@ window.addScheduleWindow = (hostId = "es-windows", start = "22:00", end = "08:00
   const host = $(hostId);
   if (!host) return;
   host.insertAdjacentHTML("beforeend", scheduleWindowRowHTML(start, end, 127));
-  syncScheduleWindowRemove(host);
 };
-window.removeScheduleWindow = btn => {
-  const row = btn.closest(".sched-window");
-  // 容器用 data-sched-host 标记：包含段与排除段共用同一套行模板，只有「能不能删空」
-  // 不同（包含段至少留一段，排除段可以一段都没有），这个差异写在 data-min-rows 上。
-  const host = row && row.closest("[data-sched-host]");
-  if (!row || !host) return;
-  if (host.dataset.minRows === "1" && host.querySelectorAll(".sched-window").length <= 1) {
-    toast("至少保留一个时间段；不想限时段请把生效方式改成「不限」", "err");
-    return;
-  }
-  row.remove();
-  syncScheduleWindowRemove(host);
-};
-/* 只剩一段时把删除按钮置灰：比点下去才弹提示更省事。排除区没有下限，不置灰。 */
-const syncScheduleWindowRemove = host => {
-  if (!host) return;
-  const rows = [...host.querySelectorAll(".sched-window")];
-  const fixed = host.dataset.minRows === "1";
-  rows.forEach(row => {
-    const btn = row.querySelector("button");
-    if (!btn) return;
-    btn.disabled = fixed && rows.length <= 1;
-    btn.style.opacity = fixed && rows.length <= 1 ? ".45" : "";
-  });
-};
+// 两个容器都允许删到空：包含段的「至少一段」由保存时的 collectScheduleWindows 校验，
+// 不在这里拦。之前把最后一段的删除按钮置灰，副作用是 always/range 渠道切到 daily 时
+// 会留下一段删不掉的 00:00-00:00，看起来像必填的默认值。
+window.removeScheduleWindow = btn => btn.closest(".sched-window")?.remove();
 // 服务端存 UTC，datetime-local 没有时区概念，这里显式按北京时间来回换算。
 const bjInputValue = iso => {
   if (!iso) return "";
@@ -1273,7 +1254,7 @@ window.syncScheduleFields = () => {
    atLeastOne 只有包含段才要：排除段可以一段都没有。 */
 function collectScheduleWindows(hostId, label, atLeastOne) {
   const rows = [...$(hostId).querySelectorAll(".sched-window")];
-  if (atLeastOne && !rows.length) throw new Error("至少保留一个时间段；不想限时段请选「不限」");
+  if (atLeastOne && !rows.length) throw new Error("还没有时间段，请先点「+ 添加时段」；不限时段请选「不限」");
   return rows.map((row, index) => {
     const days = [...row.querySelectorAll(".sched-day input:checked")].map(el => Number(el.value));
     // 一段一天都不选 = 这段永远不生效，几乎肯定是误操作；而「全天」有专门的
@@ -1292,9 +1273,17 @@ window.editProviderSchedule = id => {
   const mode = p.ScheduleMode || "always";
   // v25：多段，每段带自己的星期。老数据只有一对起止分钟 + 一个全局星期，
   // 就当作唯一的一段（并沿用那份全局星期）显示，保存后自然升级成多段格式。
+  //
+  // 但 always/range 的这两个列本来就是 0，照着回显会凭空造出一段
+  // 00:00-00:00（= 全天）：它和「不限」完全等价，却会让用户以为已经配了
+  // 时段，一保存就把渠道固化成 daily——库里从此存在两种等价表达，列表标签
+  // 也从「不限」变成「全天」，排查时得先反应过来它们是一回事。所以只有
+  // 本来就是 daily 的渠道才回显，其余一律从空容器开始。
   const windows = Array.isArray(p.ScheduleWindows) && p.ScheduleWindows.length
     ? p.ScheduleWindows
-    : [{ StartMinute: p.ScheduleStartMinute, EndMinute: p.ScheduleEndMinute, Weekdays: p.ScheduleWeekdays }];
+    : mode === "daily"
+      ? [{ StartMinute: p.ScheduleStartMinute, EndMinute: p.ScheduleEndMinute, Weekdays: p.ScheduleWeekdays }]
+      : [];
   const windowRows = windows
     .map(w => scheduleWindowRowHTML(scheduleClock(w.StartMinute), scheduleClock(w.EndMinute), w.Weekdays == null ? p.ScheduleWeekdays : w.Weekdays))
     .join("");
@@ -1315,13 +1304,13 @@ window.editProviderSchedule = id => {
     </div>
     <div id="es-daily" ${mode === "daily" ? "" : "hidden"}>
       <div class="field"><label>时间段（北京时间，可加多段）</label>
-        <div id="es-windows" data-sched-host data-min-rows="1">${windowRows}</div>
+        <div id="es-windows">${windowRows}</div>
         <button type="button" class="btn-ghost btn-sm" onclick="addScheduleWindow()">+ 添加时段</button>
-        <span class="hint">每段右侧的一二三是这一段自己的生效星期，取消不需要的天即可；起点含、终点不含，22:00 → 08:00 表示到次日八点，起止相同 = 全天；任一段命中即可用，跨零点时凌晨算作开始那天。</span>
+        <span class="hint">每段右侧的一二三是这一段自己的生效星期，取消不需要的天即可；起点含、终点不含，22:00 → 08:00 表示到次日八点，起止相同 = 全天；任一段命中即可用，跨零点时凌晨算作开始那天。全天请直接选「不限」，不要用一段 00:00-00:00 来表示。</span>
       </div>
     </div>
     <div class="field" style="margin-top:14px"><label>排除时间段（可选）</label>
-      <div id="es-exclude" data-sched-host data-min-rows="0">${excludeRows}</div>
+      <div id="es-exclude">${excludeRows}</div>
       <button type="button" class="btn-ghost btn-sm" onclick="addScheduleWindow('es-exclude','02:00','04:00')">+ 添加排除时段</button>
       <span class="hint">命中任一段即不可用，即使正处在生效时段内——适合「每天凌晨上游维护」这类固定停用窗口。它与上面的生效方式互不影响，三种方式都会先看排除；每段同样能单独选星期。起止时间相同等于全天排除（相当于停用），保存时会被拒绝。</span>
     </div>
@@ -1344,9 +1333,6 @@ window.editProviderSchedule = id => {
     await apiJSON("/admin/api/providers/" + id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     loadProviders();
   });
-  // 弹窗已插入 DOM：只有一段时先把它标成不可删，省得点了才被拒绝。
-  syncScheduleWindowRemove($("es-windows"));
-  syncScheduleWindowRemove($("es-exclude"));
 };
 /* ── 通用编辑弹窗 ── */
 function openEdit(title, bodyHTML, onsave) {

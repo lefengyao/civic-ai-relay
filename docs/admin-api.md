@@ -193,7 +193,10 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
 约定与坑：
 
 - `schedule_weekdays` 是位掩码：bit0=周一 … bit6=周日。`0` 与 `127` 都表示每天。
-- `daily` 起止相同 = 全天（只受星期约束）。
+- `daily` 起止相同 = 全天（只受星期约束）。**但若这一段同时覆盖每天（`weekdays` 省略或全选），
+  整条 `daily` 等价于「不限」，保存时会归一成 `always`**（v0.15.1）：否则库里会同时存在两种
+  等价表达，列表标签一个显示「不限」一个显示「全天」。只覆盖某一天的全天段（如「周一全天」）
+  对其它日子仍有约束，保持 `daily`。
 
 #### 多段时段（v25）
 
@@ -220,6 +223,7 @@ token_quota_exceeded: 5 小时窗口Token已用满（已用 5,000,000 tokens，�
   但周二 22:00 起的就不算周一了。这条对每一段独立生效。
 - `ScheduleWindows` 缺省（字段不出现）= 走 `ScheduleDailyStart/End` + `ScheduleWeekdays`
   的单段老写法；显式传 `[]` 会被拒绝（避免「清空所有段」静默变成全天）。
+  前端也不再预填 `00:00-00:00` 占位段：容器可以为空，保存时才校验。
 - 存库时 `schedule_windows` 存 JSON；同时把**第一段**（含它的星期）写回
   `schedule_start_minute` / `schedule_end_minute` / `schedule_weekdays`，这样回滚到
   旧版本后至少还留着一段，不会整条渠道变成「全天可用」。

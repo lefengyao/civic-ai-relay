@@ -215,6 +215,16 @@ func NormalizeProviderSchedule(in ProviderScheduleInput) (ProviderSchedule, erro
 		if err != nil {
 			return ProviderSchedule{}, err
 		}
+		// 只要有一段是「全天 + 每天」（起止相同、星期全选），daily 这层约束就整体
+		// 落空了，和「不限」完全等价。归一成 always，而不是原样存成 daily：
+		// 否则库里会同时存在两种等价表达，列表标签一个显示「不限」一个显示「全天」，
+		// 排查「这条渠道为什么被判定成 daily」时得先绕一圈才反应过来是一回事。
+		// 注意只认「每天」：只覆盖周一的全天段对其它日子仍有约束，不能降级。
+		for _, window := range windows {
+			if window.StartMinute == window.EndMinute && (window.Weekdays == 0 || window.Weekdays&providerWeekdaysAll == providerWeekdaysAll) {
+				return ProviderSchedule{Mode: ProviderScheduleAlways, ExcludeWindows: exclude}, nil
+			}
+		}
 		// 第一段同步写进单段列（含它自己的星期）：旧版本回滚后仍能看到一个能用的
 		// 时段，而不是整条渠道被读成「00:00-00:00 全天」。
 		return ProviderSchedule{

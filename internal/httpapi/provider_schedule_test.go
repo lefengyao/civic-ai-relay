@@ -282,3 +282,42 @@ func TestAdminProviderScheduleExcludeWindows(t *testing.T) {
 		t.Fatalf("全天排除应被拒: %d %s", bad.Code, bad.Body.String())
 	}
 }
+
+// v0.15.1：daily 里「一段覆盖全天 + 每天」等于没限时段，保存后必须落成 always，
+// 而不是库里多出一条与「不限」等价的 daily。管理台列表也就不会在「不限」和
+// 「全天」两种说法之间摇摆。
+func TestAdminProviderScheduleAllDayDegradesToAlways(t *testing.T) {
+	handler, adminKey := adminFixture(t)
+	created := adminRequest(t, handler, http.MethodPost, "/admin/api/providers", adminKey, map[string]any{
+		"name": "allday", "base_url": "https://allday.example", "api_key": "k",
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create = %d: %s", created.Code, created.Body.String())
+	}
+	var base struct {
+		Data struct {
+			ID int64 `json:"ID"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &base); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := adminRequest(t, handler, http.MethodPut, "/admin/api/providers/"+itoa(base.Data.ID), adminKey, map[string]any{
+		"ScheduleMode":    "daily",
+		"ScheduleWindows": []map[string]any{{"start": "00:00", "end": "00:00"}},
+	})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", updated.Code, updated.Body.String())
+	}
+	var after providerExcludeResponse
+	if err := json.Unmarshal(updated.Body.Bytes(), &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Data.ScheduleMode != store.ProviderScheduleAlways {
+		t.Fatalf("全天段应归一成 always，得到 %q", after.Data.ScheduleMode)
+	}
+	if !after.Data.ScheduleActive {
+		t.Fatal("归一成 always 后应始终可用")
+	}
+}

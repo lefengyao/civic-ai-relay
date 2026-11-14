@@ -130,12 +130,63 @@ func TestNormalizeProviderSchedule(t *testing.T) {
 	})
 
 	t.Run("全选星期等于每天", func(t *testing.T) {
-		schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "daily", Weekdays: []int{1, 2, 3, 4, 5, 6, 7}})
+		// 用非全天时段：00:00-00:00 会被归一成 always（见下一个子测试），
+		// 那样看不到星期掩码。
+		schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "daily", DailyStart: "09:00", DailyEnd: "10:00", Weekdays: []int{1, 2, 3, 4, 5, 6, 7}})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if schedule.Weekdays != providerWeekdaysAll {
 			t.Fatalf("weekdays=%d", schedule.Weekdays)
+		}
+	})
+
+	// v0.15.1：全天段不再作为 daily 存下来。「起止相同 + 每天」整条约束等于空转，
+	// 与「不限」等价；两种表达并存会让列表标签在「不限」和「全天」之间摇摆，
+	// 排查时还要先反应过来是一回事。
+	t.Run("全天段归一成不限", func(t *testing.T) {
+		schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{Mode: "daily"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if schedule.Mode != ProviderScheduleAlways || len(schedule.Windows) != 0 {
+			t.Fatalf("daily 全天应降级为 always，得到 %+v", schedule)
+		}
+		// 多段里只要有一段覆盖全天，其余段全是冗余，同样降级。
+		schedule, err = NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode: "daily",
+			Windows: []ScheduleWindowInput{
+				{Start: "22:00", End: "08:00"},
+				{Start: "00:00", End: "00:00"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if schedule.Mode != ProviderScheduleAlways {
+			t.Fatalf("含全天段的 daily 应降级，得到 %+v", schedule)
+		}
+		// 只覆盖某一天的全天段对其它日子仍有约束，不能降级。
+		schedule, err = NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode:    "daily",
+			Windows: []ScheduleWindowInput{{Start: "00:00", End: "00:00", Weekdays: []int{1}}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if schedule.Mode != ProviderScheduleDaily || len(schedule.Windows) != 1 {
+			t.Fatalf("只覆盖周一的全天段应保持 daily，得到 %+v", schedule)
+		}
+		// 排除段与生效方式正交：降级成 always 时不能把排除段丢掉。
+		schedule, err = NormalizeProviderSchedule(ProviderScheduleInput{
+			Mode:           "daily",
+			ExcludeWindows: []ScheduleWindowInput{{Start: "02:00", End: "04:00"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if schedule.Mode != ProviderScheduleAlways || len(schedule.ExcludeWindows) != 1 {
+			t.Fatalf("降级后仍应保留排除段，得到 %+v", schedule)
 		}
 	})
 }
@@ -617,29 +668,35 @@ func TestProviderSchedulePerWindowWeekdays(t *testing.T) {
 }
 
 // 归一化要把每段的星期各自解析出来，空列表 = 这段每天生效。
+// 全天段只放在周一：每天的全天段会被降级成 always（见 TestNormalizeProviderSchedule），
+// 那样就没有多段可看了。
 func TestNormalizeSchedulePerWindowWeekdays(t *testing.T) {
 	schedule, err := NormalizeProviderSchedule(ProviderScheduleInput{
 		Mode: "daily",
 		Windows: []ScheduleWindowInput{
 			{Start: "22:00", End: "08:00", Weekdays: []int{1, 2, 3, 4, 5}},
-			{Start: "00:00", End: "00:00"},
+			{Start: "00:00", End: "00:00", Weekdays: []int{1}},
+			{Start: "12:00", End: "13:00"},
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(schedule.Windows) != 2 {
+	if len(schedule.Windows) != 3 {
 		t.Fatalf("windows = %+v", schedule.Windows)
 	}
-	// 排序后整天段在前：00:00-00:00（每天），然后 22:00-08:00（工作日）。
-	if schedule.Windows[0].Weekdays != providerWeekdaysAll {
-		t.Fatalf("未指定星期的段应等于每天：%+v", schedule.Windows[0])
+	// 按开始分钟排序：00:00（周一全天）、12:00（每天）、22:00（工作日夜间）。
+	if schedule.Windows[0].Weekdays != 1<<0 {
+		t.Fatalf("周一全天段的掩码 = %07b", schedule.Windows[0].Weekdays)
 	}
-	if schedule.Windows[1].Weekdays != 1<<0|1<<1|1<<2|1<<3|1<<4 {
-		t.Fatalf("工作日掩码 = %07b", schedule.Windows[1].Weekdays)
+	if schedule.Windows[1].Weekdays != providerWeekdaysAll {
+		t.Fatalf("未指定星期的段应等于每天：%+v", schedule.Windows[1])
+	}
+	if schedule.Windows[2].Weekdays != 1<<0|1<<1|1<<2|1<<3|1<<4 {
+		t.Fatalf("工作日掩码 = %07b", schedule.Windows[2].Weekdays)
 	}
 	// 单段列回写第一段（含它的星期），回滚到旧版本后行为仍然一致。
-	if schedule.StartMinute != 0 || schedule.EndMinute != 0 || schedule.Weekdays != providerWeekdaysAll {
+	if schedule.StartMinute != 0 || schedule.EndMinute != 0 || schedule.Weekdays != 1<<0 {
 		t.Fatalf("单段列 = %d-%d/%07b", schedule.StartMinute, schedule.EndMinute, schedule.Weekdays)
 	}
 
